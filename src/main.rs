@@ -19,7 +19,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crate::app::{AppState, JobEvent, JobOutcome};
 use crate::error::AppResult;
 use crate::input::UserAction;
-use crate::model::{JobKind, RemarksSummary};
+use crate::model::{AppPage, JobKind, RemarksSummary};
 use crate::runner::RunnerConfig;
 
 #[derive(Parser, Debug)]
@@ -84,10 +84,8 @@ fn main() -> AppResult<()> {
     let mut app = AppState::new(benchmarks);
     let (job_tx, job_rx) = mpsc::channel::<JobEvent>();
 
-    ratatui::run(move |mut terminal| {
-        run_app(&mut terminal, &mut app, &runner_config, &job_tx, &job_rx)
-    })
-    .map_err(|e| anyhow!("terminal run failed: {e}"))?;
+    ratatui::run(move |terminal| run_app(terminal, &mut app, &runner_config, &job_tx, &job_rx))
+        .map_err(|e| anyhow!("terminal run failed: {e}"))?;
 
     Ok(())
 }
@@ -115,21 +113,36 @@ fn run_app(
 
             match input::map_key_event(key) {
                 UserAction::Quit => break Ok(()),
-                UserAction::MoveUp => app.select_prev(),
-                UserAction::MoveDown => app.select_next(),
-                UserAction::CycleProfile => app.cycle_profile(),
-                UserAction::SwitchTab => app.switch_tab(),
-                UserAction::ClearSession => app.clear_session(),
-                UserAction::Build => {
-                    maybe_spawn_job(app, config, job_tx, JobKind::Build);
-                }
-                UserAction::Run => {
-                    maybe_spawn_job(app, config, job_tx, JobKind::Run);
-                }
-                UserAction::BuildAndRun => {
-                    maybe_spawn_job(app, config, job_tx, JobKind::BuildAndRun);
-                }
                 UserAction::None => {}
+                action => match app.page {
+                    AppPage::BenchmarkList => match action {
+                        UserAction::MoveUp => app.select_prev(),
+                        UserAction::MoveDown => app.select_next(),
+                        UserAction::OpenBenchmarkPage => app.open_selected_benchmark_page(),
+                        UserAction::Build | UserAction::Run | UserAction::BuildAndRun => {
+                            app.set_status_message("Open benchmark page with Enter to run jobs");
+                        }
+                        _ => {}
+                    },
+                    AppPage::BenchmarkDetail => match action {
+                        UserAction::BackToBenchmarkList => app.back_to_benchmark_list(),
+                        UserAction::CycleProfile => app.cycle_profile(),
+                        UserAction::SwitchTab => app.switch_tab(),
+                        UserAction::ClearSession => app.clear_session(),
+                        UserAction::PrevOptimizationStep => app.select_prev_step(),
+                        UserAction::NextOptimizationStep => app.select_next_step(),
+                        UserAction::Build => {
+                            maybe_spawn_job(app, config, job_tx, JobKind::Build);
+                        }
+                        UserAction::Run => {
+                            maybe_spawn_job(app, config, job_tx, JobKind::Run);
+                        }
+                        UserAction::BuildAndRun => {
+                            maybe_spawn_job(app, config, job_tx, JobKind::BuildAndRun);
+                        }
+                        _ => {}
+                    },
+                },
             }
         }
     }
@@ -183,12 +196,14 @@ fn maybe_spawn_job(
                     Vec::new()
                 };
 
+                let optimization_steps = parser::group_optimization_steps(&remarks);
                 let summary = RemarksSummary::from_entries(&remarks);
                 let outcome = JobOutcome {
                     benchmark: benchmark.name,
                     profile,
                     loop_results,
                     remarks,
+                    optimization_steps,
                     remarks_summary: summary,
                 };
                 let _ = tx.send(JobEvent::Finished(Ok(outcome)));

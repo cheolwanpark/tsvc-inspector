@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use regex::Regex;
 
 use crate::error::AppResult;
-use crate::model::{LoopResult, RemarkEntry, RemarkKind};
+use crate::model::{LoopResult, OptimizationStep, RemarkEntry, RemarkKind};
 
 pub fn parse_tsvc_stdout(stdout: &str) -> Vec<LoopResult> {
     let row_re = Regex::new(r"^\s*([A-Za-z0-9]+)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$")
@@ -119,14 +120,9 @@ pub fn parse_opt_remarks(path: &Path) -> AppResult<Vec<RemarkEntry>> {
             }
         }
 
-        let pass_value = pass.unwrap_or_default();
-        if pass_value != "loop-vectorize" {
-            continue;
-        }
-
         entries.push(RemarkEntry {
             kind,
-            pass: pass_value,
+            pass: pass.unwrap_or_default(),
             name: name.unwrap_or_default(),
             file,
             line,
@@ -136,6 +132,48 @@ pub fn parse_opt_remarks(path: &Path) -> AppResult<Vec<RemarkEntry>> {
     }
 
     Ok(entries)
+}
+
+pub fn group_optimization_steps(entries: &[RemarkEntry]) -> Vec<OptimizationStep> {
+    let mut steps = Vec::new();
+    let mut step_by_pass = HashMap::<String, usize>::new();
+
+    for (remark_idx, entry) in entries.iter().enumerate() {
+        let pass_name = if entry.pass.trim().is_empty() {
+            String::from("(unknown-pass)")
+        } else {
+            entry.pass.clone()
+        };
+
+        let step_idx = if let Some(idx) = step_by_pass.get(&pass_name).copied() {
+            idx
+        } else {
+            let idx = steps.len();
+            steps.push(OptimizationStep {
+                pass: pass_name.clone(),
+                total: 0,
+                passed: 0,
+                missed: 0,
+                analysis: 0,
+                other: 0,
+                remark_indices: Vec::new(),
+            });
+            step_by_pass.insert(pass_name, idx);
+            idx
+        };
+
+        let step = &mut steps[step_idx];
+        step.total += 1;
+        match entry.kind {
+            RemarkKind::Passed => step.passed += 1,
+            RemarkKind::Missed => step.missed += 1,
+            RemarkKind::Analysis => step.analysis += 1,
+            RemarkKind::Other => step.other += 1,
+        }
+        step.remark_indices.push(remark_idx);
+    }
+
+    steps
 }
 
 fn parse_kind(header: &str) -> RemarkKind {
@@ -172,7 +210,7 @@ S122	 1.25 		32164.490281733
     }
 
     #[test]
-    fn parses_loop_vectorize_remarks() {
+    fn parses_all_remarks() {
         let sample = r#"
 --- !Passed
 Pass:            loop-vectorize
@@ -205,10 +243,57 @@ Name:            Hoisted
         fs::write(&path, sample).expect("sample remark file should be writable");
 
         let entries = parse_opt_remarks(&path).expect("remarks should parse");
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].name, "Vectorized");
         assert_eq!(entries[1].kind, RemarkKind::Missed);
+        assert_eq!(entries[2].pass, "licm");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn groups_optimization_steps_by_pass_in_first_seen_order() {
+        let entries = vec![
+            RemarkEntry {
+                kind: RemarkKind::Passed,
+                pass: String::from("licm"),
+                name: String::from("Hoisted"),
+                file: None,
+                line: None,
+                function: None,
+                message: None,
+            },
+            RemarkEntry {
+                kind: RemarkKind::Missed,
+                pass: String::from("loop-vectorize"),
+                name: String::from("MissedDetails"),
+                file: None,
+                line: None,
+                function: None,
+                message: None,
+            },
+            RemarkEntry {
+                kind: RemarkKind::Analysis,
+                pass: String::from("licm"),
+                name: String::from("LoadClobbered"),
+                file: None,
+                line: None,
+                function: None,
+                message: None,
+            },
+        ];
+
+        let steps = group_optimization_steps(&entries);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].pass, "licm");
+        assert_eq!(steps[0].total, 2);
+        assert_eq!(steps[0].passed, 1);
+        assert_eq!(steps[0].analysis, 1);
+        assert_eq!(steps[0].remark_indices, vec![0, 2]);
+
+        assert_eq!(steps[1].pass, "loop-vectorize");
+        assert_eq!(steps[1].total, 1);
+        assert_eq!(steps[1].missed, 1);
+        assert_eq!(steps[1].remark_indices, vec![1]);
     }
 }

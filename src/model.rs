@@ -9,6 +9,13 @@ pub struct BenchmarkItem {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppPage {
+    BenchmarkList,
+    BenchmarkDetail,
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompileProfile {
     O3Remarks,
     O3NoVec,
@@ -115,6 +122,17 @@ pub struct RemarkEntry {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OptimizationStep {
+    pub pass: String,
+    pub total: usize,
+    pub passed: usize,
+    pub missed: usize,
+    pub analysis: usize,
+    pub other: usize,
+    pub remark_indices: Vec<usize>,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct RemarksSummary {
     pub total_loop_vectorize: usize,
@@ -165,6 +183,7 @@ pub struct RunSession {
     pub benchmark: String,
     pub loop_results: Vec<LoopResult>,
     pub remarks: Vec<RemarkEntry>,
+    pub optimization_steps: Vec<OptimizationStep>,
     pub remarks_summary: RemarksSummary,
     pub logs: Vec<String>,
     pub status: SessionStatus,
@@ -177,6 +196,7 @@ impl RunSession {
             benchmark,
             loop_results: Vec::new(),
             remarks: Vec::new(),
+            optimization_steps: Vec::new(),
             remarks_summary: RemarksSummary::default(),
             logs: Vec::new(),
             status: SessionStatus::Running,
@@ -186,21 +206,21 @@ impl RunSession {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightTab {
-    Remarks,
+    StepDetails,
     BuildLog,
 }
 
 impl RightTab {
     pub fn next(self) -> Self {
         match self {
-            Self::Remarks => Self::BuildLog,
-            Self::BuildLog => Self::Remarks,
+            Self::StepDetails => Self::BuildLog,
+            Self::BuildLog => Self::StepDetails,
         }
     }
 
     pub fn index(self) -> usize {
         match self {
-            Self::Remarks => 0,
+            Self::StepDetails => 0,
             Self::BuildLog => 1,
         }
     }
