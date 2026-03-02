@@ -3,9 +3,13 @@ use std::fs;
 use std::path::Path;
 
 use regex::Regex;
+use similar::{ChangeTag, TextDiff};
 
 use crate::error::AppResult;
-use crate::model::{LoopResult, OptimizationStep, RemarkEntry, RemarkKind};
+use crate::model::{IrDiffStep, LoopResult, OptimizationStep, RemarkEntry, RemarkKind};
+
+const MAX_IR_STEPS: usize = 500;
+const MAX_DIFF_LINES: usize = 8000;
 
 pub fn parse_tsvc_stdout(stdout: &str) -> Vec<LoopResult> {
     let row_re = Regex::new(r"^\s*([A-Za-z0-9]+)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$")
@@ -176,6 +180,150 @@ pub fn group_optimization_steps(entries: &[RemarkEntry]) -> Vec<OptimizationStep
     steps
 }
 
+pub fn parse_ir_diff_steps(build_trace: &str, remarks: &[RemarkEntry]) -> Vec<IrDiffStep> {
+    let header_re = Regex::new(r"^\*\*\* IR Dump (At Start|After .+) \*\*\*$")
+        .expect("valid ir dump header regex");
+    let start_re =
+        Regex::new(r"^\*\*\* IR Dump At Start \*\*\*$").expect("valid ir dump start regex");
+    let after_re = Regex::new(r"^\*\*\* IR Dump After (.+?) on (.+?) \*\*\*$")
+        .expect("valid ir dump after regex");
+    let no_change_re = Regex::new(r"^\*\*\* IR Dump After .+ omitted because no change \*\*\*$")
+        .expect("valid ir no-change regex");
+
+    let mut i = 0usize;
+    let lines = build_trace.lines().collect::<Vec<_>>();
+    let mut prev_snapshot: Option<String> = None;
+    let mut steps = Vec::new();
+
+    while i < lines.len() {
+        let header = lines[i].trim();
+        if !header_re.is_match(header) {
+            i += 1;
+            continue;
+        }
+        i += 1;
+
+        if no_change_re.is_match(header) {
+            continue;
+        }
+
+        let mut body = Vec::new();
+        while i < lines.len() && !header_re.is_match(lines[i].trim()) {
+            body.push(lines[i]);
+            i += 1;
+        }
+        let snapshot = body.join("\n");
+
+        if start_re.is_match(header) {
+            prev_snapshot = Some(snapshot);
+            continue;
+        }
+
+        let Some(caps) = after_re.captures(header) else {
+            continue;
+        };
+        let pass = caps
+            .get(1)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| String::from("(unknown-pass)"));
+        let target = caps
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| String::from("(unknown-target)"));
+
+        let Some(before) = prev_snapshot.as_ref() else {
+            prev_snapshot = Some(snapshot);
+            continue;
+        };
+        if steps.len() >= MAX_IR_STEPS {
+            break;
+        }
+
+        let diff = TextDiff::from_lines(before, &snapshot);
+        let changed_lines = diff
+            .iter_all_changes()
+            .filter(|change| change.tag() != ChangeTag::Equal)
+            .count();
+        let mut diff_text = diff
+            .unified_diff()
+            .context_radius(3)
+            .header("before", "after")
+            .to_string();
+        diff_text = truncate_lines(&diff_text, MAX_DIFF_LINES);
+
+        steps.push(IrDiffStep {
+            index: steps.len() + 1,
+            remark_indices: collect_step_remark_indices(&pass, &target, remarks),
+            pass,
+            target,
+            changed_lines,
+            diff_text,
+        });
+
+        prev_snapshot = Some(snapshot);
+    }
+
+    steps
+}
+
+fn collect_step_remark_indices(pass: &str, target: &str, remarks: &[RemarkEntry]) -> Vec<usize> {
+    let pass_norm = normalize_pass_name(pass);
+    let target_is_module = target == "[module]";
+    let matching = remarks
+        .iter()
+        .enumerate()
+        .filter(|(_, remark)| normalize_pass_name(&remark.pass) == pass_norm)
+        .collect::<Vec<_>>();
+
+    if target_is_module {
+        return matching.into_iter().map(|(idx, _)| idx).collect();
+    }
+
+    let exact_function = matching
+        .iter()
+        .filter_map(|(idx, remark)| {
+            if remark
+                .function
+                .as_deref()
+                .is_some_and(|func| func == target)
+            {
+                Some(*idx)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if !exact_function.is_empty() {
+        return exact_function;
+    }
+
+    matching.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn normalize_pass_name(name: &str) -> String {
+    let lowercase = name.to_ascii_lowercase();
+    let without_suffix = lowercase.strip_suffix("pass").unwrap_or(&lowercase);
+    without_suffix
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+fn truncate_lines(text: &str, max_lines: usize) -> String {
+    let mut lines = text.lines();
+    let kept = lines.by_ref().take(max_lines).collect::<Vec<_>>();
+    let dropped = lines.count();
+    if dropped == 0 {
+        return text.to_string();
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("... [truncated {dropped} lines]"));
+    out
+}
+
 fn parse_kind(header: &str) -> RemarkKind {
     if header.starts_with("--- !Passed") {
         RemarkKind::Passed
@@ -295,5 +443,97 @@ Name:            Hoisted
         assert_eq!(steps[1].total, 1);
         assert_eq!(steps[1].missed, 1);
         assert_eq!(steps[1].remark_indices, vec![1]);
+    }
+
+    #[test]
+    fn parses_ir_diff_steps_in_execution_order() {
+        let trace = r#"
+*** IR Dump At Start ***
+define void @foo() {
+entry:
+  ret void
+}
+*** IR Dump After Annotation2MetadataPass on [module] omitted because no change ***
+*** IR Dump After LICMPass on foo ***
+define void @foo() {
+entry:
+  %x = add i32 1, 2
+  ret void
+}
+*** IR Dump After LoopVectorizePass on foo ***
+define void @foo() {
+entry:
+  %x = add i32 1, 2
+  %v = insertelement <4 x i32> poison, i32 1, i64 0
+  ret void
+}
+"#;
+        let remarks = vec![
+            RemarkEntry {
+                kind: RemarkKind::Passed,
+                pass: String::from("licm"),
+                name: String::from("Hoisted"),
+                file: None,
+                line: None,
+                function: Some(String::from("foo")),
+                message: None,
+            },
+            RemarkEntry {
+                kind: RemarkKind::Analysis,
+                pass: String::from("loop-vectorize"),
+                name: String::from("InterleavingNotBeneficial"),
+                file: None,
+                line: None,
+                function: Some(String::from("foo")),
+                message: None,
+            },
+        ];
+
+        let steps = parse_ir_diff_steps(trace, &remarks);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].index, 1);
+        assert_eq!(steps[0].pass, "LICMPass");
+        assert_eq!(steps[0].target, "foo");
+        assert!(steps[0].changed_lines > 0);
+        assert_eq!(steps[0].remark_indices, vec![0]);
+
+        assert_eq!(steps[1].index, 2);
+        assert_eq!(steps[1].pass, "LoopVectorizePass");
+        assert_eq!(steps[1].remark_indices, vec![1]);
+        assert!(steps[1].diff_text.contains("@@"));
+    }
+
+    #[test]
+    fn module_target_collects_all_matching_pass_remarks() {
+        let trace = r#"
+*** IR Dump At Start ***
+; start
+*** IR Dump After SimplifyCFGPass on [module] ***
+; changed
+"#;
+        let remarks = vec![
+            RemarkEntry {
+                kind: RemarkKind::Analysis,
+                pass: String::from("simplifycfg"),
+                name: String::from("X"),
+                file: None,
+                line: None,
+                function: Some(String::from("foo")),
+                message: None,
+            },
+            RemarkEntry {
+                kind: RemarkKind::Passed,
+                pass: String::from("simplify-cfg"),
+                name: String::from("Y"),
+                file: None,
+                line: None,
+                function: Some(String::from("bar")),
+                message: None,
+            },
+        ];
+
+        let steps = parse_ir_diff_steps(trace, &remarks);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].remark_indices, vec![0, 1]);
     }
 }

@@ -21,6 +21,7 @@ pub struct RunnerConfig {
 pub struct JobRawOutput {
     pub run_stdout: String,
     pub remark_file: Option<PathBuf>,
+    pub build_trace: String,
 }
 
 pub fn execute_job<F>(
@@ -37,10 +38,12 @@ where
         .with_context(|| format!("create build root {}", config.build_root.display()))?;
 
     let build_dir = config.build_root.join(profile.build_dir_name());
+    let mut build_trace = String::new();
 
     if matches!(kind, JobKind::Build | JobKind::BuildAndRun) {
         run_configure(config, &build_dir, profile, &mut log)?;
-        run_build(config, &build_dir, &benchmark.name, &mut log)?;
+        let build_capture = run_build(config, &build_dir, &benchmark.name, profile, &mut log)?;
+        build_trace = format!("{}\n{}", build_capture.stdout, build_capture.stderr);
     }
 
     let mut run_stdout = String::new();
@@ -63,6 +66,7 @@ where
     Ok(JobRawOutput {
         run_stdout,
         remark_file,
+        build_trace,
     })
 }
 
@@ -91,26 +95,35 @@ where
     Ok(())
 }
 
-fn run_build<F>(config: &RunnerConfig, build_dir: &Path, target: &str, log: &mut F) -> AppResult<()>
+fn run_build<F>(
+    config: &RunnerConfig,
+    build_dir: &Path,
+    target: &str,
+    profile: CompileProfile,
+    log: &mut F,
+) -> AppResult<CommandCapture>
 where
     F: FnMut(String),
 {
+    let jobs = effective_build_jobs(config.jobs, profile);
     let mut build = Command::new(&config.cmake);
     build
         .arg("--build")
         .arg(build_dir)
+        .arg("--clean-first")
         .arg("--target")
         .arg(target)
         .arg("-j")
-        .arg(config.jobs.to_string());
+        .arg(jobs.to_string());
 
-    let _ = capture_command(&mut build, log)?;
-    Ok(())
+    let capture = capture_command(&mut build, log)?;
+    Ok(capture)
 }
 
 #[derive(Debug)]
 struct CommandCapture {
     stdout: String,
+    stderr: String,
 }
 
 fn capture_command<F>(command: &mut Command, log: &mut F) -> AppResult<CommandCapture>
@@ -140,7 +153,7 @@ where
         ));
     }
 
-    Ok(CommandCapture { stdout })
+    Ok(CommandCapture { stdout, stderr })
 }
 
 fn render_command(command: &Command) -> String {
@@ -158,6 +171,14 @@ fn shell_escape(text: &OsStr) -> String {
         format!("\"{s}\"")
     } else {
         s.to_string()
+    }
+}
+
+fn effective_build_jobs(configured_jobs: usize, profile: CompileProfile) -> usize {
+    if profile.captures_ir_diff() {
+        1
+    } else {
+        configured_jobs.max(1)
     }
 }
 
@@ -244,5 +265,26 @@ mod tests {
     fn benchmark_path_contains_target_name() {
         let p = benchmark_binary_path(Path::new("/tmp/build"), "InductionVariable-dbl");
         assert!(p.ends_with("InductionVariable-dbl/InductionVariable-dbl"));
+    }
+
+    #[test]
+    fn ir_capture_forces_single_job() {
+        assert_eq!(effective_build_jobs(8, CompileProfile::O3Remarks), 1);
+        assert_eq!(effective_build_jobs(8, CompileProfile::O3Default), 1);
+    }
+
+    #[test]
+    fn render_command_includes_clean_first_for_build() {
+        let mut build = Command::new("cmake");
+        build
+            .arg("--build")
+            .arg("/tmp/build")
+            .arg("--clean-first")
+            .arg("--target")
+            .arg("foo")
+            .arg("-j")
+            .arg("1");
+        let rendered = render_command(&build);
+        assert!(rendered.contains("--clean-first"));
     }
 }

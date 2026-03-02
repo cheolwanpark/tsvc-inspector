@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    AppPage, BenchmarkItem, CompileProfile, JobKind, LoopResult, OptimizationStep, RemarkEntry,
-    RemarksSummary, RightTab, RunSession, SessionStatus,
+    AppPage, BenchmarkItem, CompileProfile, IrDiffStep, JobKind, LoopResult, OptimizationStep,
+    RemarkEntry, RemarksSummary, RunSession, SessionStatus,
 };
 
 #[derive(Debug)]
@@ -22,6 +22,7 @@ pub struct JobOutcome {
     pub profile: CompileProfile,
     pub loop_results: Vec<LoopResult>,
     pub remarks: Vec<RemarkEntry>,
+    pub ir_diff_steps: Vec<IrDiffStep>,
     pub optimization_steps: Vec<OptimizationStep>,
     pub remarks_summary: RemarksSummary,
 }
@@ -32,15 +33,43 @@ pub enum JobState {
     Running(JobKind),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailFocus {
+    Steps,
+    IrDiff,
+}
+
+impl DetailFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Steps => Self::IrDiff,
+            Self::IrDiff => Self::Steps,
+        }
+    }
+
+    fn prev(self) -> Self {
+        self.next()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Steps => "Steps",
+            Self::IrDiff => "IR Diff",
+        }
+    }
+}
+
 pub struct AppState {
     pub benchmarks: Vec<BenchmarkItem>,
     pub selected_idx: usize,
     pub active_profile: CompileProfile,
-    pub active_tab: RightTab,
+    pub overlay_enabled: bool,
     pub page: AppPage,
     pub selected_step_idx: usize,
     pub job_state: JobState,
     pub status_message: String,
+    pub detail_focus: DetailFocus,
+    pub diff_scroll: u16,
     sessions_by_benchmark: HashMap<String, RunSession>,
     running_benchmark: Option<String>,
 }
@@ -51,11 +80,13 @@ impl AppState {
             benchmarks,
             selected_idx: 0,
             active_profile: CompileProfile::O3Remarks,
-            active_tab: RightTab::StepDetails,
+            overlay_enabled: false,
             page: AppPage::BenchmarkList,
             selected_step_idx: 0,
             job_state: JobState::Idle,
             status_message: String::from("Ready"),
+            detail_focus: DetailFocus::Steps,
+            diff_scroll: 0,
             sessions_by_benchmark: HashMap::new(),
             running_benchmark: None,
         }
@@ -85,10 +116,6 @@ impl AppState {
         self.status_message = format!("Profile: {}", self.active_profile);
     }
 
-    pub fn switch_tab(&mut self) {
-        self.active_tab = self.active_tab.next();
-    }
-
     pub fn open_selected_benchmark_page(&mut self) {
         if self.selected_benchmark().is_none() {
             self.status_message = String::from("No benchmark selected");
@@ -96,7 +123,8 @@ impl AppState {
         }
         self.page = AppPage::BenchmarkDetail;
         self.selected_step_idx = 0;
-        self.active_tab = RightTab::StepDetails;
+        self.detail_focus = DetailFocus::Steps;
+        self.diff_scroll = 0;
     }
 
     pub fn back_to_benchmark_list(&mut self) {
@@ -111,6 +139,7 @@ impl AppState {
 
         if self.sessions_by_benchmark.remove(&benchmark).is_some() {
             self.selected_step_idx = 0;
+            self.diff_scroll = 0;
             self.status_message = String::from("Session cleared");
         } else {
             self.status_message = String::from("No session to clear");
@@ -134,34 +163,100 @@ impl AppState {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return 0;
         };
-        if session.optimization_steps.is_empty() {
+        if session.ir_diff_steps.is_empty() {
             return 0;
         }
         self.selected_step_idx
-            .min(session.optimization_steps.len().saturating_sub(1))
+            .min(session.ir_diff_steps.len().saturating_sub(1))
     }
 
-    pub fn selected_optimization_step(&self) -> Option<&OptimizationStep> {
+    pub fn selected_ir_diff_step(&self) -> Option<&IrDiffStep> {
         let session = self.active_session_for_selected_benchmark()?;
-        if session.optimization_steps.is_empty() {
+        if session.ir_diff_steps.is_empty() {
             return None;
         }
-        session.optimization_steps.get(self.selected_step_index())
+        session.ir_diff_steps.get(self.selected_step_index())
     }
 
     pub fn select_prev_step(&mut self) {
+        let old = self.selected_step_idx;
         self.selected_step_idx = self.selected_step_idx.saturating_sub(1);
+        if self.selected_step_idx != old {
+            self.diff_scroll = 0;
+        }
     }
 
     pub fn select_next_step(&mut self) {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return;
         };
-        if session.optimization_steps.is_empty() {
+        if session.ir_diff_steps.is_empty() {
             return;
         }
-        let max_idx = session.optimization_steps.len() - 1;
+        let max_idx = session.ir_diff_steps.len() - 1;
+        let old = self.selected_step_idx;
         self.selected_step_idx = (self.selected_step_idx + 1).min(max_idx);
+        if self.selected_step_idx != old {
+            self.diff_scroll = 0;
+        }
+    }
+
+    pub fn focus_prev_tab(&mut self) {
+        self.detail_focus = self.detail_focus.prev();
+        self.status_message = format!("Focus: {}", self.detail_focus.label());
+    }
+
+    pub fn focus_next_tab(&mut self) {
+        self.detail_focus = self.detail_focus.next();
+        self.status_message = format!("Focus: {}", self.detail_focus.label());
+    }
+
+    pub fn detail_move_up(&mut self) {
+        match self.detail_focus {
+            DetailFocus::Steps => self.select_prev_step(),
+            DetailFocus::IrDiff => self.scroll_diff_up(),
+        }
+    }
+
+    pub fn detail_move_down(&mut self) {
+        match self.detail_focus {
+            DetailFocus::Steps => self.select_next_step(),
+            DetailFocus::IrDiff => self.scroll_diff_down(),
+        }
+    }
+
+    pub fn is_steps_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::Steps
+    }
+
+    pub fn is_ir_diff_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::IrDiff
+    }
+
+    fn scroll_diff_up(&mut self) {
+        self.diff_scroll = self.diff_scroll.saturating_sub(1);
+    }
+
+    fn scroll_diff_down(&mut self) {
+        let max_scroll = self.max_diff_scroll();
+        self.diff_scroll = self.diff_scroll.saturating_add(1).min(max_scroll);
+    }
+
+    fn max_diff_scroll(&self) -> u16 {
+        let Some(step) = self.selected_ir_diff_step() else {
+            return 0;
+        };
+        let max = step.diff_text.lines().count().saturating_sub(1);
+        max.min(u16::MAX as usize) as u16
+    }
+
+    pub fn toggle_overlay(&mut self) {
+        self.overlay_enabled = !self.overlay_enabled;
+        self.status_message = if self.overlay_enabled {
+            String::from("Overlay enabled")
+        } else {
+            String::from("Overlay disabled")
+        };
     }
 
     pub fn begin_job(&mut self, kind: JobKind, benchmark: String, profile: CompileProfile) {
@@ -172,6 +267,7 @@ impl AppState {
             RunSession::new_running(profile, benchmark.clone()),
         );
         self.selected_step_idx = 0;
+        self.diff_scroll = 0;
         self.status_message = format!("{kind} started for {benchmark} ({profile})");
     }
 
@@ -217,6 +313,7 @@ impl AppState {
                         session.benchmark = outcome.benchmark.clone();
                         session.loop_results = outcome.loop_results;
                         session.remarks = outcome.remarks;
+                        session.ir_diff_steps = outcome.ir_diff_steps;
                         session.optimization_steps = outcome.optimization_steps;
                         session.remarks_summary = outcome.remarks_summary;
                         session.status = SessionStatus::Succeeded;
@@ -227,6 +324,7 @@ impl AppState {
                             .is_some_and(|b| b.name == outcome.benchmark)
                         {
                             self.selected_step_idx = 0;
+                            self.diff_scroll = 0;
                         }
                         self.status_message =
                             format!("Completed: {} ({})", outcome.benchmark, outcome.profile);
@@ -301,6 +399,14 @@ mod tests {
                 checksum: String::from("123"),
             }],
             remarks_summary: RemarksSummary::from_entries(&remarks),
+            ir_diff_steps: vec![IrDiffStep {
+                index: 1,
+                pass: String::from("LICMPass"),
+                target: String::from("main"),
+                changed_lines: 3,
+                diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
+                remark_indices: vec![0],
+            }],
             optimization_steps: vec![step("licm", 0), step("loop-vectorize", 1)],
             remarks,
         }
@@ -327,6 +433,24 @@ mod tests {
                 benchmark: String::from("A"),
                 loop_results: Vec::new(),
                 remarks: Vec::new(),
+                ir_diff_steps: vec![
+                    IrDiffStep {
+                        index: 1,
+                        pass: String::from("LICMPass"),
+                        target: String::from("main"),
+                        changed_lines: 1,
+                        diff_text: String::from("d1"),
+                        remark_indices: Vec::new(),
+                    },
+                    IrDiffStep {
+                        index: 2,
+                        pass: String::from("LoopVectorizePass"),
+                        target: String::from("main"),
+                        changed_lines: 2,
+                        diff_text: String::from("d2"),
+                        remark_indices: Vec::new(),
+                    },
+                ],
                 optimization_steps: vec![step("licm", 0), step("loop-vectorize", 1)],
                 remarks_summary: RemarksSummary::default(),
                 logs: Vec::new(),
@@ -341,6 +465,66 @@ mod tests {
         app.select_prev_step();
         app.select_prev_step();
         assert_eq!(app.selected_step_index(), 0);
+    }
+
+    #[test]
+    fn overlay_toggle_changes_state() {
+        let mut app = AppState::new(vec![benchmark("A")]);
+        assert!(!app.overlay_enabled);
+        app.toggle_overlay();
+        assert!(app.overlay_enabled);
+        app.toggle_overlay();
+        assert!(!app.overlay_enabled);
+    }
+
+    #[test]
+    fn detail_focus_controls_up_down_behavior() {
+        let mut app = AppState::new(vec![benchmark("A")]);
+        app.open_selected_benchmark_page();
+        app.sessions_by_benchmark.insert(
+            String::from("A"),
+            RunSession {
+                profile: CompileProfile::O3Remarks,
+                benchmark: String::from("A"),
+                loop_results: Vec::new(),
+                remarks: Vec::new(),
+                ir_diff_steps: vec![
+                    IrDiffStep {
+                        index: 1,
+                        pass: String::from("LICMPass"),
+                        target: String::from("main"),
+                        changed_lines: 1,
+                        diff_text: String::from("line1\nline2\nline3"),
+                        remark_indices: Vec::new(),
+                    },
+                    IrDiffStep {
+                        index: 2,
+                        pass: String::from("LoopVectorizePass"),
+                        target: String::from("main"),
+                        changed_lines: 1,
+                        diff_text: String::from("line1\nline2\nline3\nline4"),
+                        remark_indices: Vec::new(),
+                    },
+                ],
+                optimization_steps: vec![step("licm", 0), step("loop-vectorize", 1)],
+                remarks_summary: RemarksSummary::default(),
+                logs: Vec::new(),
+                status: SessionStatus::Succeeded,
+            },
+        );
+
+        assert!(app.is_steps_focused());
+        app.detail_move_down();
+        assert_eq!(app.selected_step_index(), 1);
+        assert_eq!(app.diff_scroll, 0);
+
+        app.focus_next_tab();
+        assert!(app.is_ir_diff_focused());
+        app.detail_move_down();
+        app.detail_move_down();
+        assert_eq!(app.diff_scroll, 2);
+        app.detail_move_up();
+        assert_eq!(app.diff_scroll, 1);
     }
 
     #[test]

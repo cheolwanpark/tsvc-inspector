@@ -26,13 +26,17 @@ impl CompileProfile {
     pub fn c_flags(self) -> &'static str {
         match self {
             Self::O3Remarks => {
-                "-O3 -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record"
+                "-O3 -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
             }
             Self::O3NoVec => {
-                "-O3 -fno-vectorize -fno-slp-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record"
+                "-O3 -fno-vectorize -fno-slp-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
             }
-            Self::O3Default => "-O3 -fsave-optimization-record",
+            Self::O3Default => "-O3 -fsave-optimization-record -mllvm -print-changed",
         }
+    }
+
+    pub fn captures_ir_diff(self) -> bool {
+        true
     }
 
     pub fn build_dir_name(self) -> &'static str {
@@ -133,6 +137,16 @@ pub struct OptimizationStep {
     pub remark_indices: Vec<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub struct IrDiffStep {
+    pub index: usize,
+    pub pass: String,
+    pub target: String,
+    pub changed_lines: usize,
+    pub diff_text: String,
+    pub remark_indices: Vec<usize>,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct RemarksSummary {
     pub total_loop_vectorize: usize,
@@ -183,6 +197,7 @@ pub struct RunSession {
     pub benchmark: String,
     pub loop_results: Vec<LoopResult>,
     pub remarks: Vec<RemarkEntry>,
+    pub ir_diff_steps: Vec<IrDiffStep>,
     pub optimization_steps: Vec<OptimizationStep>,
     pub remarks_summary: RemarksSummary,
     pub logs: Vec<String>,
@@ -196,32 +211,11 @@ impl RunSession {
             benchmark,
             loop_results: Vec::new(),
             remarks: Vec::new(),
+            ir_diff_steps: Vec::new(),
             optimization_steps: Vec::new(),
             remarks_summary: RemarksSummary::default(),
             logs: Vec::new(),
             status: SessionStatus::Running,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RightTab {
-    StepDetails,
-    BuildLog,
-}
-
-impl RightTab {
-    pub fn next(self) -> Self {
-        match self {
-            Self::StepDetails => Self::BuildLog,
-            Self::BuildLog => Self::StepDetails,
-        }
-    }
-
-    pub fn index(self) -> usize {
-        match self {
-            Self::StepDetails => 0,
-            Self::BuildLog => 1,
         }
     }
 }

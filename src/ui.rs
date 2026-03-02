@@ -2,10 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{AppState, JobState};
-use crate::model::{AppPage, RightTab};
+use crate::model::AppPage;
 
 pub fn render(frame: &mut Frame, app: &AppState) {
     match app.page {
@@ -39,15 +39,10 @@ fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
     let [header_area, main_area, footer_area] = vertical.areas(frame.area());
     render_detail_header(frame, app, header_area);
 
-    let horizontal = Layout::horizontal([
-        Constraint::Percentage(26),
-        Constraint::Percentage(34),
-        Constraint::Percentage(40),
-    ]);
-    let [steps_area, loop_area, inspector_area] = horizontal.areas(main_area);
-    render_optimization_steps(frame, app, steps_area);
-    render_loop_results(frame, app, loop_area);
-    render_inspector(frame, app, inspector_area);
+    let horizontal = Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)]);
+    let [steps_area, diff_area] = horizontal.areas(main_area);
+    render_ir_diff_steps(frame, app, steps_area);
+    render_ir_diff(frame, app, diff_area);
     render_detail_footer(frame, app, footer_area);
 }
 
@@ -87,6 +82,8 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
         selected.green(),
         "  Profile: ".gray(),
         app.active_profile.to_string().cyan(),
+        "  Focus: ".gray(),
+        app.detail_focus.label().cyan(),
         "  Job: ".gray(),
         job.magenta(),
     ]);
@@ -156,38 +153,47 @@ fn render_benchmark_info(frame: &mut Frame, app: &AppState, area: ratatui::layou
     frame.render_widget(paragraph, area);
 }
 
-fn render_optimization_steps(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn render_ir_diff_steps(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
             Paragraph::new("No run result yet.\nPress 'a' to build+run.")
-                .block(Block::bordered().title("Optimization Steps")),
+                .block(Block::bordered().title("IR Steps")),
             area,
         );
         return;
     };
 
-    if session.optimization_steps.is_empty() {
+    if session.ir_diff_steps.is_empty() {
         frame.render_widget(
-            Paragraph::new("No optimization remarks found.")
-                .block(Block::bordered().title("Optimization Steps")),
+            Paragraph::new("No IR diff captured.\nBuild with 'b' or 'a'.")
+                .block(Block::bordered().title("IR Steps")),
             area,
         );
         return;
     }
 
     let items = session
-        .optimization_steps
+        .ir_diff_steps
         .iter()
         .map(|step| {
             ListItem::new(format!(
-                "{} [{} | P:{} M:{} A:{} O:{}]",
-                step.pass, step.total, step.passed, step.missed, step.analysis, step.other
+                "#{:03} {} @ {} [Δ{} | R:{}]",
+                step.index,
+                step.pass,
+                step.target,
+                step.changed_lines,
+                step.remark_indices.len()
             ))
         })
         .collect::<Vec<_>>();
 
+    let steps_title = if app.is_steps_focused() {
+        "IR Steps [Focus]"
+    } else {
+        "IR Steps"
+    };
     let list = List::new(items)
-        .block(Block::bordered().title("Optimization Steps"))
+        .block(Block::bordered().title(steps_title))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -200,147 +206,98 @@ fn render_optimization_steps(frame: &mut Frame, app: &AppState, area: ratatui::l
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_loop_results(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn render_ir_diff(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
-            Paragraph::new("No run result yet.\nPress 'a' to build+run.")
-                .block(Block::bordered().title("Loop Results")),
+            Paragraph::new("No session available.").block(Block::bordered().title("IR Diff")),
+            area,
+        );
+        return;
+    };
+    let Some(step) = app.selected_ir_diff_step() else {
+        frame.render_widget(
+            Paragraph::new("No IR diff captured. Build this benchmark first.")
+                .block(Block::bordered().title("IR Diff")),
             area,
         );
         return;
     };
 
-    if session.loop_results.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No loop rows parsed.").block(Block::bordered().title("Loop Results")),
-            area,
-        );
-        return;
+    let diff_title = if app.is_ir_diff_focused() {
+        "IR Diff [Focus]"
+    } else {
+        "IR Diff"
+    };
+    let mut lines = vec![
+        Line::from(format!(
+            "Step #{:03} | Pass: {} | Target: {} | changed_lines={}",
+            step.index, step.pass, step.target, step.changed_lines
+        )),
+        Line::from(format!("Status: {}", session.status)),
+        Line::from(format!(
+            "Overlay: {} (press 'o' to toggle)",
+            if app.overlay_enabled { "ON" } else { "OFF" }
+        )),
+        Line::from(format!("Scroll: {}", app.diff_scroll)),
+    ];
+    if let Some(first_loop) = session.loop_results.first() {
+        lines.push(Line::from(format!(
+            "Run sample: {} {:.2}s checksum={}",
+            first_loop.loop_id, first_loop.time_sec, first_loop.checksum
+        )));
     }
-
-    let rows = session
-        .loop_results
-        .iter()
-        .take(300)
-        .map(|r| {
-            Row::new(vec![
-                r.loop_id.clone(),
-                format!("{:.2}", r.time_sec),
-                r.checksum.clone(),
-            ])
-        })
-        .collect::<Vec<_>>();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["Loop", "Time(s)", "Checksum"]).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(Block::bordered().title("Loop Results"));
-    frame.render_widget(table, area);
-}
-
-fn render_inspector(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let vertical = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]);
-    let [tabs_area, content_area] = vertical.areas(area);
-
-    let tabs = Tabs::new(vec!["Step Details", "Build Log"])
-        .block(Block::bordered().title("Inspector"))
-        .select(app.active_tab.index())
-        .highlight_style(Style::default().fg(Color::Yellow));
-    frame.render_widget(tabs, tabs_area);
-
-    match app.active_tab {
-        RightTab::StepDetails => render_step_details(frame, app, content_area),
-        RightTab::BuildLog => render_build_log(frame, app, content_area),
+    if let Some(first_remark_step) = session.optimization_steps.first() {
+        lines.push(Line::from(format!(
+            "Remark steps: {} (first pass: {})",
+            session.optimization_steps.len(),
+            first_remark_step.pass
+        )));
     }
-}
-
-fn render_step_details(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let Some(session) = app.active_session_for_selected_benchmark() else {
-        frame.render_widget(
-            Paragraph::new("No session available.").block(Block::bordered().title("Step Details")),
-            area,
-        );
-        return;
-    };
-
-    let Some(step) = app.selected_optimization_step() else {
-        frame.render_widget(
-            Paragraph::new("No optimization steps available.")
-                .block(Block::bordered().title("Step Details")),
-            area,
-        );
-        return;
-    };
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(format!(
-        "Pass: {} | total={} passed={} missed={} analysis={} other={}",
-        step.pass, step.total, step.passed, step.missed, step.analysis, step.other
-    )));
-    lines.push(Line::from(format!("Status: {}", session.status)));
     lines.push(Line::from(""));
 
-    if step.remark_indices.is_empty() {
-        lines.push(Line::from("No remarks in this step."));
-    } else {
-        for remark_idx in step.remark_indices.iter().take(120) {
-            let Some(r) = session.remarks.get(*remark_idx) else {
-                continue;
-            };
-            let mut location = String::from("-");
-            if let Some(file) = &r.file {
-                location = match r.line {
-                    Some(line) => format!("{file}:{line}"),
-                    None => file.clone(),
+    if app.overlay_enabled {
+        if step.remark_indices.is_empty() {
+            lines.push(Line::from("Overlay: no matched remarks"));
+        } else {
+            for remark_idx in step.remark_indices.iter().take(20) {
+                let Some(r) = session.remarks.get(*remark_idx) else {
+                    continue;
                 };
+                let location = match (&r.file, r.line) {
+                    (Some(file), Some(line)) => format!("{file}:{line}"),
+                    (Some(file), None) => file.clone(),
+                    _ => String::from("-"),
+                };
+                let function = r.function.as_deref().unwrap_or("-");
+                let message = r.message.as_deref().unwrap_or("-");
+                lines.push(Line::from(format!(
+                    "[{}] {} @ {} ({}) {}",
+                    r.kind, r.name, location, function, message
+                )));
             }
-            let function = r.function.as_deref().unwrap_or("-");
-            let message = r.message.as_deref().unwrap_or("-");
-            lines.push(Line::from(format!(
-                "[{}] {} @ {} ({}) {}",
-                r.kind, r.name, location, function, message
-            )));
+            if step.remark_indices.len() > 20 {
+                lines.push(Line::from(format!(
+                    "... {} more remarks omitted",
+                    step.remark_indices.len() - 20
+                )));
+            }
         }
+        lines.push(Line::from(""));
+    }
+
+    if step.diff_text.trim().is_empty() {
+        lines.push(Line::from("No diff text available for this step."));
+    } else {
+        lines.extend(
+            step.diff_text
+                .lines()
+                .map(|line| Line::from(line.to_string())),
+        );
     }
 
     let paragraph = Paragraph::new(Text::from(lines))
-        .block(Block::bordered().title("Step Details"))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
-}
-
-fn render_build_log(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let Some(session) = app.active_session_for_selected_benchmark() else {
-        frame.render_widget(
-            Paragraph::new("No session available.").block(Block::bordered().title("Build Log")),
-            area,
-        );
-        return;
-    };
-
-    let tail = session
-        .logs
-        .iter()
-        .rev()
-        .take(250)
-        .cloned()
-        .collect::<Vec<_>>();
-    let text = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-
-    let paragraph = Paragraph::new(text)
-        .block(Block::bordered().title("Build Log"))
+        .block(Block::bordered().title(diff_title))
+        .scroll((app.diff_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -357,7 +314,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "q quit | esc back | left/right step | p profile | b build | r run | a build+run | tab switch tab | c clear";
+    let hints = "q quit | esc back | left/right focus tab | up/down step-or-scroll | p profile | b build | r run | a build+run | o overlay | c clear";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),

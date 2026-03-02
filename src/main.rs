@@ -125,12 +125,14 @@ fn run_app(
                         _ => {}
                     },
                     AppPage::BenchmarkDetail => match action {
+                        UserAction::MoveUp => app.detail_move_up(),
+                        UserAction::MoveDown => app.detail_move_down(),
                         UserAction::BackToBenchmarkList => app.back_to_benchmark_list(),
+                        UserAction::FocusPrevTab => app.focus_prev_tab(),
+                        UserAction::FocusNextTab => app.focus_next_tab(),
                         UserAction::CycleProfile => app.cycle_profile(),
-                        UserAction::SwitchTab => app.switch_tab(),
+                        UserAction::ToggleOverlay => app.toggle_overlay(),
                         UserAction::ClearSession => app.clear_session(),
-                        UserAction::PrevOptimizationStep => app.select_prev_step(),
-                        UserAction::NextOptimizationStep => app.select_next_step(),
                         UserAction::Build => {
                             maybe_spawn_job(app, config, job_tx, JobKind::Build);
                         }
@@ -197,12 +199,14 @@ fn maybe_spawn_job(
                 };
 
                 let optimization_steps = parser::group_optimization_steps(&remarks);
+                let ir_diff_steps = parser::parse_ir_diff_steps(&raw.build_trace, &remarks);
                 let summary = RemarksSummary::from_entries(&remarks);
                 let outcome = JobOutcome {
                     benchmark: benchmark.name,
                     profile,
                     loop_results,
                     remarks,
+                    ir_diff_steps,
                     optimization_steps,
                     remarks_summary: summary,
                 };

@@ -8,13 +8,13 @@ pub enum UserAction {
     MoveDown,
     OpenBenchmarkPage,
     BackToBenchmarkList,
-    PrevOptimizationStep,
-    NextOptimizationStep,
+    FocusPrevTab,
+    FocusNextTab,
     CycleProfile,
     Build,
     Run,
     BuildAndRun,
-    SwitchTab,
+    ToggleOverlay,
     ClearSession,
 }
 
@@ -25,13 +25,13 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Down => UserAction::MoveDown,
         KeyCode::Enter => UserAction::OpenBenchmarkPage,
         KeyCode::Esc => UserAction::BackToBenchmarkList,
-        KeyCode::Left => UserAction::PrevOptimizationStep,
-        KeyCode::Right => UserAction::NextOptimizationStep,
+        KeyCode::Left => UserAction::FocusPrevTab,
+        KeyCode::Right => UserAction::FocusNextTab,
         KeyCode::Char('p') => UserAction::CycleProfile,
         KeyCode::Char('b') => UserAction::Build,
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::BuildAndRun,
-        KeyCode::Tab => UserAction::SwitchTab,
+        KeyCode::Char('o') => UserAction::ToggleOverlay,
         KeyCode::Char('c') => UserAction::ClearSession,
         _ => UserAction::None,
     }
@@ -52,7 +52,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_page_and_step_navigation_keys() {
+    fn maps_page_navigation_and_focus_keys() {
         assert_eq!(
             map_key_event(key(KeyCode::Enter)),
             UserAction::OpenBenchmarkPage
@@ -61,13 +61,11 @@ mod tests {
             map_key_event(key(KeyCode::Esc)),
             UserAction::BackToBenchmarkList
         );
+        assert_eq!(map_key_event(key(KeyCode::Left)), UserAction::FocusPrevTab);
+        assert_eq!(map_key_event(key(KeyCode::Right)), UserAction::FocusNextTab);
         assert_eq!(
-            map_key_event(key(KeyCode::Left)),
-            UserAction::PrevOptimizationStep
-        );
-        assert_eq!(
-            map_key_event(key(KeyCode::Right)),
-            UserAction::NextOptimizationStep
+            map_key_event(key(KeyCode::Char('o'))),
+            UserAction::ToggleOverlay
         );
     }
 }
