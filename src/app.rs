@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use ratatui::style::Color;
+
 use crate::model::{
-    AnalysisSource, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
+    AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
     CompileProfile, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary, RunSession,
     SessionStatus,
 };
@@ -40,8 +42,6 @@ pub enum JobOutcomeData {
         analysis_steps: Vec<AnalysisStep>,
         remarks: Vec<RemarkEntry>,
         remarks_summary: RemarksSummary,
-        source: AnalysisSource,
-        deep_window: Option<(usize, usize)>,
     },
 }
 
@@ -79,26 +79,18 @@ impl ListFocus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailFocus {
-    Steps,
-    IrDiff,
+    StageList,
+    PassList,
+    DiffView,
 }
 
 impl DetailFocus {
-    fn next(self) -> Self {
-        match self {
-            Self::Steps => Self::IrDiff,
-            Self::IrDiff => Self::Steps,
-        }
-    }
-
-    fn prev(self) -> Self {
-        self.next()
-    }
-
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Steps => "Steps",
-            Self::IrDiff => "IR Diff",
+            Self::StageList => "Stages",
+            Self::PassList => "Passes",
+            Self::DiffView => "Diff",
         }
     }
 }
@@ -107,9 +99,9 @@ pub struct AppState {
     pub benchmarks: Vec<BenchmarkItem>,
     pub selected_idx: usize,
     pub active_profile: CompileProfile,
-    pub overlay_enabled: bool,
     pub page: AppPage,
-    pub selected_step_idx: usize,
+    pub selected_stage: AnalysisStage,
+    pub selected_pass_by_stage: HashMap<AnalysisStage, usize>,
     pub job_state: JobState,
     pub status_message: String,
     pub list_focus: ListFocus,
@@ -133,14 +125,14 @@ impl AppState {
             benchmarks,
             selected_idx: 0,
             active_profile: CompileProfile::O3Remarks,
-            overlay_enabled: false,
             page: AppPage::BenchmarkList,
-            selected_step_idx: 0,
+            selected_stage: AnalysisStage::Vectorize,
+            selected_pass_by_stage: HashMap::new(),
             job_state: JobState::Idle,
             status_message: String::from("Ready"),
             list_focus: ListFocus::Benchmarks,
             list_source_scroll: 0,
-            detail_focus: DetailFocus::Steps,
+            detail_focus: DetailFocus::StageList,
             diff_scroll: 0,
             function_modal_open: false,
             function_modal_selected_idx: 0,
@@ -168,6 +160,7 @@ impl AppState {
         )
     }
 
+    #[allow(dead_code)]
     pub fn selected_function_symbol(&self) -> Option<&str> {
         Some(
             self.selected_function_for_selected_benchmark()?
@@ -343,8 +336,7 @@ impl AppState {
         }
 
         self.page = AppPage::BenchmarkDetail;
-        self.selected_step_idx = 0;
-        self.detail_focus = DetailFocus::Steps;
+        self.detail_focus = DetailFocus::StageList;
         self.diff_scroll = 0;
     }
 
@@ -364,8 +356,9 @@ impl AppState {
         let key = session_key(&benchmark.name, &function.symbol);
 
         if self.sessions_by_key.remove(&key).is_some() {
-            self.selected_step_idx = 0;
             self.diff_scroll = 0;
+            self.selected_pass_by_stage.clear();
+            self.detail_focus = DetailFocus::StageList;
             self.status_message = String::from("Session cleared");
         } else {
             self.status_message = String::from("No session to clear");
@@ -387,78 +380,175 @@ impl AppState {
             .get(&session_key(&benchmark.name, &function.symbol))
     }
 
-    pub fn selected_step_index(&self) -> usize {
-        let Some(session) = self.active_session_for_selected_benchmark() else {
-            return 0;
-        };
-        if session.analysis_steps.is_empty() {
-            return 0;
+    // --- Stage/Pass navigation ---
+
+    /// Returns stages (sorted by pipeline_order) that have at least one pass, with their counts.
+    pub fn ordered_stages_with_counts(session: &RunSession) -> Vec<(AnalysisStage, usize)> {
+        let mut counts: HashMap<AnalysisStage, usize> = HashMap::new();
+        for step in &session.analysis_steps {
+            *counts.entry(step.stage).or_insert(0) += 1;
         }
-        self.selected_step_idx
-            .min(session.analysis_steps.len().saturating_sub(1))
+        let mut result: Vec<(AnalysisStage, usize)> = counts.into_iter().collect();
+        result.sort_by_key(|(stage, _)| stage.pipeline_order());
+        result
     }
 
-    pub fn selected_analysis_step(&self) -> Option<&AnalysisStep> {
-        let session = self.active_session_for_selected_benchmark()?;
-        if session.analysis_steps.is_empty() {
+    /// Returns passes for the given stage in order.
+    pub fn passes_for_stage(session: &RunSession, stage: AnalysisStage) -> Vec<&AnalysisStep> {
+        session
+            .analysis_steps
+            .iter()
+            .filter(|s| s.stage == stage)
+            .collect()
+    }
+
+    /// Returns the selected pass index within the current stage, clamped to valid range.
+    pub fn selected_pass_index_in_stage(&self, session: &RunSession) -> usize {
+        let passes = Self::passes_for_stage(session, self.selected_stage);
+        if passes.is_empty() {
+            return 0;
+        }
+        let stored = self
+            .selected_pass_by_stage
+            .get(&self.selected_stage)
+            .copied()
+            .unwrap_or(0);
+        stored.min(passes.len() - 1)
+    }
+
+    /// Returns a reference to the currently selected pass, or None if no passes exist.
+    pub fn selected_step_in_stage<'a>(&self, session: &'a RunSession) -> Option<&'a AnalysisStep> {
+        let passes = Self::passes_for_stage(session, self.selected_stage);
+        if passes.is_empty() {
             return None;
         }
-        session.analysis_steps.get(self.selected_step_index())
+        let idx = self.selected_pass_index_in_stage(session);
+        passes.into_iter().nth(idx)
     }
 
-    pub fn select_prev_step(&mut self) {
-        let old = self.selected_step_idx;
-        self.selected_step_idx = self.selected_step_idx.saturating_sub(1);
-        if self.selected_step_idx != old {
-            self.diff_scroll = 0;
-        }
+    pub fn is_stage_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::StageList
     }
 
-    pub fn select_next_step(&mut self) {
-        let Some(session) = self.active_session_for_selected_benchmark() else {
-            return;
+    pub fn is_pass_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::PassList
+    }
+
+    pub fn is_diff_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::DiffView
+    }
+
+    /// Advance focus: StageList→PassList→DiffView (clamped at DiffView).
+    pub fn focus_next_pane(&mut self) {
+        self.detail_focus = match self.detail_focus {
+            DetailFocus::StageList => DetailFocus::PassList,
+            DetailFocus::PassList => DetailFocus::DiffView,
+            DetailFocus::DiffView => DetailFocus::DiffView,
         };
-        if session.analysis_steps.is_empty() {
+    }
+
+    /// Retreat focus: DiffView→PassList→StageList (clamped at StageList).
+    pub fn focus_prev_pane(&mut self) {
+        self.detail_focus = match self.detail_focus {
+            DetailFocus::StageList => DetailFocus::StageList,
+            DetailFocus::PassList => DetailFocus::StageList,
+            DetailFocus::DiffView => DetailFocus::PassList,
+        };
+    }
+
+    pub fn enter_diff_view(&mut self) {
+        self.detail_focus = DetailFocus::DiffView;
+    }
+
+    pub fn exit_diff_view(&mut self) {
+        self.detail_focus = DetailFocus::PassList;
+    }
+
+    pub fn select_prev_stage(&mut self) {
+        let stages = self
+            .active_session_for_selected_benchmark()
+            .map(Self::ordered_stages_with_counts)
+            .unwrap_or_default();
+        if stages.is_empty() {
             return;
         }
-        let max_idx = session.analysis_steps.len() - 1;
-        let old = self.selected_step_idx;
-        self.selected_step_idx = (self.selected_step_idx + 1).min(max_idx);
-        if self.selected_step_idx != old {
-            self.diff_scroll = 0;
+        let current_pos = stages
+            .iter()
+            .position(|(s, _)| *s == self.selected_stage)
+            .unwrap_or(0);
+        if current_pos > 0 {
+            self.selected_stage = stages[current_pos - 1].0;
         }
     }
 
-    pub fn focus_prev_tab(&mut self) {
-        self.detail_focus = self.detail_focus.prev();
-        self.status_message = format!("Focus: {}", self.detail_focus.label());
+    pub fn select_next_stage(&mut self) {
+        let stages = self
+            .active_session_for_selected_benchmark()
+            .map(Self::ordered_stages_with_counts)
+            .unwrap_or_default();
+        if stages.is_empty() {
+            return;
+        }
+        let current_pos = stages
+            .iter()
+            .position(|(s, _)| *s == self.selected_stage)
+            .unwrap_or(0);
+        if current_pos + 1 < stages.len() {
+            self.selected_stage = stages[current_pos + 1].0;
+        }
     }
 
-    pub fn focus_next_tab(&mut self) {
-        self.detail_focus = self.detail_focus.next();
-        self.status_message = format!("Focus: {}", self.detail_focus.label());
+    pub fn select_prev_pass(&mut self) {
+        let count = self
+            .active_session_for_selected_benchmark()
+            .map(|s| Self::passes_for_stage(s, self.selected_stage).len())
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let idx = self
+            .selected_pass_by_stage
+            .get(&self.selected_stage)
+            .copied()
+            .unwrap_or(0);
+        self.selected_pass_by_stage
+            .insert(self.selected_stage, idx.saturating_sub(1));
+        self.diff_scroll = 0;
+    }
+
+    pub fn select_next_pass(&mut self) {
+        let count = self
+            .active_session_for_selected_benchmark()
+            .map(|s| Self::passes_for_stage(s, self.selected_stage).len())
+            .unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let idx = self
+            .selected_pass_by_stage
+            .get(&self.selected_stage)
+            .copied()
+            .unwrap_or(0);
+        let new_idx = (idx + 1).min(count - 1);
+        self.selected_pass_by_stage
+            .insert(self.selected_stage, new_idx);
+        self.diff_scroll = 0;
     }
 
     pub fn detail_move_up(&mut self) {
         match self.detail_focus {
-            DetailFocus::Steps => self.select_prev_step(),
-            DetailFocus::IrDiff => self.scroll_diff_up(),
+            DetailFocus::StageList => self.select_prev_stage(),
+            DetailFocus::PassList => self.select_prev_pass(),
+            DetailFocus::DiffView => self.scroll_diff_up(),
         }
     }
 
     pub fn detail_move_down(&mut self) {
         match self.detail_focus {
-            DetailFocus::Steps => self.select_next_step(),
-            DetailFocus::IrDiff => self.scroll_diff_down(),
+            DetailFocus::StageList => self.select_next_stage(),
+            DetailFocus::PassList => self.select_next_pass(),
+            DetailFocus::DiffView => self.scroll_diff_down(),
         }
-    }
-
-    pub fn is_steps_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::Steps
-    }
-
-    pub fn is_ir_diff_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::IrDiff
     }
 
     fn scroll_diff_up(&mut self) {
@@ -471,20 +561,69 @@ impl AppState {
     }
 
     fn max_diff_scroll(&self) -> u16 {
-        let Some(step) = self.selected_analysis_step() else {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return 0;
+        };
+        let Some(step) = self.selected_step_in_stage(session) else {
             return 0;
         };
         let max = step.diff_text.lines().count().saturating_sub(1);
         max.min(u16::MAX as usize) as u16
     }
 
-    pub fn toggle_overlay(&mut self) {
-        self.overlay_enabled = !self.overlay_enabled;
-        self.status_message = if self.overlay_enabled {
-            String::from("Overlay enabled")
+    /// After analysis completes, auto-navigate to Vectorize stage + PassList focus.
+    /// Skipped if user has already navigated away from StageList.
+    pub fn auto_navigate_to_vectorize(&mut self) {
+        if self.detail_focus != DetailFocus::StageList {
+            return;
+        }
+        let stages = self
+            .active_session_for_selected_benchmark()
+            .map(Self::ordered_stages_with_counts)
+            .unwrap_or_default();
+        if stages.is_empty() {
+            return;
+        }
+        let target_stage = if stages.iter().any(|(s, _)| *s == AnalysisStage::Vectorize) {
+            AnalysisStage::Vectorize
         } else {
-            String::from("Overlay disabled")
+            stages[0].0
         };
+        self.selected_stage = target_stage;
+        self.selected_pass_by_stage.insert(target_stage, 0);
+        self.detail_focus = DetailFocus::PassList;
+    }
+
+    /// Returns a badge string and color for the benchmark's analysis state in the list page.
+    pub fn verdict_badge_for_benchmark(&self, name: &str) -> Option<(String, Color)> {
+        let function = self.selected_function_by_benchmark.get(name)?;
+        let session = self
+            .sessions_by_key
+            .get(&session_key(name, &function.symbol))?;
+
+        let badge = match session.analysis_state {
+            AnalysisState::Running => ("⟳".to_string(), Color::Cyan),
+            AnalysisState::Failed => ("!".to_string(), Color::Red),
+            AnalysisState::Ready => {
+                let summary = &session.remarks_summary;
+                if summary.vectorized > 0 {
+                    let vf = extract_vf_from_remarks(&session.remarks);
+                    let text = match vf {
+                        Some(n) => format!("✓ ×{n}"),
+                        None => "✓".to_string(),
+                    };
+                    (text, Color::Green)
+                } else if summary.missed_details > 0 {
+                    ("✗".to_string(), Color::Red)
+                } else if summary.not_beneficial > 0 {
+                    ("○".to_string(), Color::Yellow)
+                } else {
+                    ("—".to_string(), Color::DarkGray)
+                }
+            }
+            AnalysisState::None => return None,
+        };
+        Some(badge)
     }
 
     pub fn begin_job(
@@ -517,21 +656,17 @@ impl AppState {
         session.run_mode = run_mode;
         session.status = SessionStatus::Running;
         session.logs.clear();
-        if matches!(kind, JobKind::AnalyzeFast | JobKind::AnalyzeDeep) {
+        if matches!(kind, JobKind::AnalyzeFast) {
             session.remarks.clear();
             session.remarks_summary = RemarksSummary::default();
-            if matches!(kind, JobKind::AnalyzeFast) {
-                session.analysis_steps.clear();
-            }
+            session.analysis_steps.clear();
         }
         session.analysis_state = match kind {
-            JobKind::AnalyzeFast => AnalysisState::RunningFast,
-            JobKind::AnalyzeDeep => AnalysisState::RunningDeep,
+            JobKind::AnalyzeFast => AnalysisState::Running,
             _ => session.analysis_state,
         };
         self.sessions_by_key.insert(key, session);
 
-        self.selected_step_idx = 0;
         self.diff_scroll = 0;
         self.status_message = format!(
             "{kind} started for {benchmark} [{}] ({profile})",
@@ -604,8 +739,9 @@ impl AppState {
                                 session.loop_results = loop_results;
                                 session.remarks = remarks;
                                 session.remarks_summary = remarks_summary;
+                                // After a runtime job, keep analysis state if steps exist
                                 if !session.analysis_steps.is_empty() {
-                                    session.analysis_state = AnalysisState::Stale;
+                                    session.analysis_state = AnalysisState::Ready;
                                 } else {
                                     session.analysis_state = AnalysisState::None;
                                 }
@@ -614,34 +750,15 @@ impl AppState {
                                 analysis_steps,
                                 remarks,
                                 remarks_summary,
-                                source,
-                                deep_window,
                             } => {
                                 session.analysis_steps = analysis_steps;
                                 session.remarks = remarks;
                                 session.remarks_summary = remarks_summary;
                                 session.analysis_state = AnalysisState::Ready;
-                                if self
-                                    .selected_benchmark()
-                                    .is_some_and(|b| b.name == benchmark)
-                                    && self
-                                        .selected_function_for_selected_benchmark()
-                                        .is_some_and(|f| f.symbol == selected_function.symbol)
-                                {
-                                    self.selected_step_idx = 0;
-                                    self.diff_scroll = 0;
-                                }
-                                self.status_message = if let Some((start, end)) = deep_window {
-                                    format!(
-                                        "Analysis ready: {} [{}] window={start}..{end} ({source})",
-                                        benchmark, selected_function.loop_id
-                                    )
-                                } else {
-                                    format!(
-                                        "Analysis ready: {} [{}] ({source})",
-                                        benchmark, selected_function.loop_id
-                                    )
-                                };
+                                self.status_message = format!(
+                                    "Analysis ready: {} [{}]",
+                                    benchmark, selected_function.loop_id
+                                );
                             }
                         }
                         session.status = SessionStatus::Succeeded;
@@ -650,7 +767,19 @@ impl AppState {
                             .insert(benchmark.clone(), selected_function.clone());
                         self.sessions_by_key.insert(key, session);
 
-                        if !matches!(kind, JobKind::AnalyzeFast | JobKind::AnalyzeDeep) {
+                        // Auto-navigate after analysis if this is the currently viewed benchmark
+                        if matches!(kind, JobKind::AnalyzeFast)
+                            && self
+                                .selected_benchmark()
+                                .is_some_and(|b| b.name == benchmark)
+                            && self
+                                .selected_function_for_selected_benchmark()
+                                .is_some_and(|f| f.symbol == selected_function.symbol)
+                        {
+                            self.auto_navigate_to_vectorize();
+                        }
+
+                        if !matches!(kind, JobKind::AnalyzeFast) {
                             self.status_message = format!(
                                 "Completed: {} [{}] ({})",
                                 benchmark, selected_function.loop_id, profile
@@ -662,10 +791,7 @@ impl AppState {
                             && let Some(session) = self.sessions_by_key.get_mut(&key)
                         {
                             session.status = SessionStatus::Failed(error.clone());
-                            if matches!(
-                                finished_kind,
-                                Some(JobKind::AnalyzeFast | JobKind::AnalyzeDeep)
-                            ) {
+                            if matches!(finished_kind, Some(JobKind::AnalyzeFast)) {
                                 session.analysis_state = AnalysisState::Failed;
                             }
                         }
@@ -681,10 +807,31 @@ fn session_key(benchmark: &str, function_symbol: &str) -> String {
     format!("{benchmark}::{function_symbol}")
 }
 
+/// Extracts the vectorization factor from a session's remarks.
+fn extract_vf_from_remarks(remarks: &[RemarkEntry]) -> Option<u32> {
+    for r in remarks {
+        if r.pass == "loop-vectorize"
+            && let Some(msg) = &r.message
+        {
+            for pattern in &["VF = ", "VF="] {
+                if let Some(pos) = msg.find(pattern) {
+                    let rest = msg[pos + pattern.len()..].trim_start_matches(' ');
+                    let num: String =
+                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = num.parse::<u32>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnalysisStage, AnalysisStep, RemarkKind};
+    use crate::model::{AnalysisSource, AnalysisStage, AnalysisStep, RemarkKind};
 
     fn benchmark(name: &str) -> BenchmarkItem {
         BenchmarkItem {
@@ -706,8 +853,25 @@ mod tests {
         }
     }
 
+    fn make_step(stage: AnalysisStage, pass_key: &str, visible_index: usize) -> AnalysisStep {
+        AnalysisStep {
+            visible_index,
+            raw_index: visible_index + 1,
+            pass: pass_key.to_string(),
+            pass_key: pass_key.to_string(),
+            pass_occurrence: 1,
+            stage,
+            target_raw: String::from("s161"),
+            target_function: Some(String::from("s161")),
+            changed_lines: 3,
+            diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
+            remark_indices: vec![],
+            source: AnalysisSource::TraceFast,
+        }
+    }
+
     fn outcome_for(
-        benchmark: &str,
+        benchmark_name: &str,
         profile: CompileProfile,
         function: BenchmarkFunction,
     ) -> JobOutcome {
@@ -722,29 +886,45 @@ mod tests {
         }];
         JobOutcome {
             kind: JobKind::AnalyzeFast,
-            benchmark: benchmark.to_string(),
+            benchmark: benchmark_name.to_string(),
             profile,
             selected_function: function,
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
-                analysis_steps: vec![AnalysisStep {
-                    visible_index: 0,
-                    raw_index: 12,
-                    pass: String::from("LICMPass"),
-                    pass_key: String::from("licm"),
-                    pass_occurrence: 1,
-                    stage: AnalysisStage::Loop,
-                    target_raw: String::from("s161"),
-                    target_function: Some(String::from("s161")),
-                    changed_lines: 3,
-                    diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
-                    remark_indices: vec![0],
-                    source: AnalysisSource::TraceFast,
-                }],
+                analysis_steps: vec![make_step(AnalysisStage::Loop, "licm", 0)],
                 remarks_summary: RemarksSummary::from_entries(&remarks),
                 remarks,
-                source: AnalysisSource::TraceFast,
-                deep_window: None,
+            },
+        }
+    }
+
+    fn outcome_with_vectorize(
+        benchmark_name: &str,
+        profile: CompileProfile,
+        function: BenchmarkFunction,
+    ) -> JobOutcome {
+        let remarks = vec![RemarkEntry {
+            kind: RemarkKind::Passed,
+            pass: String::from("loop-vectorize"),
+            name: String::from("Vectorized"),
+            file: None,
+            line: None,
+            function: Some(function.symbol.clone()),
+            message: Some(String::from("vectorized loop (VF = 4)")),
+        }];
+        JobOutcome {
+            kind: JobKind::AnalyzeFast,
+            benchmark: benchmark_name.to_string(),
+            profile,
+            selected_function: function,
+            run_mode: FunctionRunMode::OutputFilter,
+            data: JobOutcomeData::Analysis {
+                analysis_steps: vec![
+                    make_step(AnalysisStage::Loop, "licm", 0),
+                    make_step(AnalysisStage::Vectorize, "loop-vectorize", 1),
+                ],
+                remarks_summary: RemarksSummary::from_entries(&remarks),
+                remarks,
             },
         }
     }
@@ -834,5 +1014,222 @@ mod tests {
             .expect("session should exist");
         assert_eq!(session.selected_function_loop_id, "S161");
         assert!(matches!(session.status, SessionStatus::Succeeded));
+    }
+
+    #[test]
+    fn auto_navigates_to_vectorize_after_analysis() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
+            "A",
+            CompileProfile::O3Remarks,
+            selected_function,
+        ))));
+
+        assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
+        assert_eq!(app.detail_focus, DetailFocus::PassList);
+    }
+
+    #[test]
+    fn auto_navigate_skips_if_user_navigated() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+        // User manually moved to PassList before analysis completes
+        app.detail_focus = DetailFocus::PassList;
+
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
+            "A",
+            CompileProfile::O3Remarks,
+            selected_function,
+        ))));
+
+        // Should still be PassList, auto-navigate was skipped
+        assert_eq!(app.detail_focus, DetailFocus::PassList);
+        // But selected_stage was NOT changed by auto_navigate since it was skipped
+        // (remains as default Vectorize which happens to match, but the key thing is no navigation happened)
+    }
+
+    #[test]
+    fn stage_navigation_wraps_correctly() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.detail_focus = DetailFocus::StageList;
+        app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
+            "A",
+            CompileProfile::O3Remarks,
+            selected_function,
+        ))));
+
+        // Reset to start of stages for this test
+        app.detail_focus = DetailFocus::StageList;
+        let session = app.active_session_for_selected_benchmark().unwrap();
+        let stages = AppState::ordered_stages_with_counts(session);
+        app.selected_stage = stages[0].0;
+
+        // Try to go before first stage - should clamp
+        app.select_prev_stage();
+        let session = app.active_session_for_selected_benchmark().unwrap();
+        let stages = AppState::ordered_stages_with_counts(session);
+        assert_eq!(app.selected_stage, stages[0].0, "should clamp at first stage");
+
+        // Navigate to last stage and try to go beyond
+        app.selected_stage = stages[stages.len() - 1].0;
+        app.select_next_stage();
+        assert_eq!(
+            app.selected_stage,
+            stages[stages.len() - 1].0,
+            "should clamp at last stage"
+        );
+    }
+
+    #[test]
+    fn pass_index_clamps_after_reanalysis() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        // First analysis with 2 vectorize passes
+        let remarks: Vec<RemarkEntry> = vec![];
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(JobOutcome {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+            data: JobOutcomeData::Analysis {
+                analysis_steps: vec![
+                    make_step(AnalysisStage::Vectorize, "loop-vectorize", 0),
+                    make_step(AnalysisStage::Vectorize, "slp-vectorize", 1),
+                ],
+                remarks: remarks.clone(),
+                remarks_summary: RemarksSummary::from_entries(&remarks),
+            },
+        })));
+
+        // Select second pass (index 1)
+        app.selected_stage = AnalysisStage::Vectorize;
+        app.selected_pass_by_stage.insert(AnalysisStage::Vectorize, 1);
+
+        // Second analysis with only 1 vectorize pass
+        app.detail_focus = DetailFocus::PassList; // user already navigated
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(JobOutcome {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+            data: JobOutcomeData::Analysis {
+                analysis_steps: vec![make_step(AnalysisStage::Vectorize, "loop-vectorize", 0)],
+                remarks: remarks.clone(),
+                remarks_summary: RemarksSummary::from_entries(&remarks),
+            },
+        })));
+
+        // Index should clamp: stored=1, len=1, so min(1, 0) = 0
+        let session = app.active_session_for_selected_benchmark().unwrap();
+        let clamped = app.selected_pass_index_in_stage(session);
+        assert_eq!(clamped, 0, "index should clamp to 0 after reanalysis reduced pass count");
+    }
+
+    #[test]
+    fn empty_stage_not_in_ordered_list() {
+        let session = RunSession::new_running(
+            CompileProfile::O3Remarks,
+            String::from("A"),
+            String::from("S161"),
+            String::from("s161"),
+            FunctionRunMode::OutputFilter,
+        );
+        // No steps → ordered_stages_with_counts returns empty
+        let stages = AppState::ordered_stages_with_counts(&session);
+        assert!(stages.is_empty());
+    }
+
+    #[test]
+    fn focus_transitions_complete_cycle() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        assert_eq!(app.detail_focus, DetailFocus::StageList);
+
+        app.focus_next_pane();
+        assert_eq!(app.detail_focus, DetailFocus::PassList);
+
+        app.focus_next_pane();
+        assert_eq!(app.detail_focus, DetailFocus::DiffView);
+
+        // Clamped at DiffView
+        app.focus_next_pane();
+        assert_eq!(app.detail_focus, DetailFocus::DiffView);
+
+        // Back via prev
+        app.focus_prev_pane();
+        assert_eq!(app.detail_focus, DetailFocus::PassList);
+
+        app.focus_prev_pane();
+        assert_eq!(app.detail_focus, DetailFocus::StageList);
+
+        // Clamped at StageList
+        app.focus_prev_pane();
+        assert_eq!(app.detail_focus, DetailFocus::StageList);
     }
 }

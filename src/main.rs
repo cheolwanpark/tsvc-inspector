@@ -22,8 +22,8 @@ use crate::app::{AppState, JobEvent, JobOutcome, JobOutcomeData};
 use crate::error::AppResult;
 use crate::input::UserAction;
 use crate::model::{
-    AnalysisSource, AppPage, BenchmarkFunction, BuildPurpose, CompileProfile, FunctionRunMode,
-    JobKind, LoopResult, RemarkEntry, RemarksSummary,
+    AppPage, BenchmarkFunction, BuildPurpose, CompileProfile, FunctionRunMode, JobKind,
+    LoopResult, RemarkEntry, RemarksSummary,
 };
 use crate::runner::RunnerConfig;
 use crate::tsvc_patch::TsvcPatchOutcome;
@@ -193,7 +193,7 @@ fn run_app(
                 action if app.is_function_modal_open() => match action {
                     UserAction::MoveUp => app.function_modal_move_up(),
                     UserAction::MoveDown => app.function_modal_move_down(),
-                    UserAction::OpenBenchmarkPage => app.confirm_function_selection(),
+                    UserAction::Confirm => app.confirm_function_selection(),
                     UserAction::BackToBenchmarkList => app.close_function_select_modal(),
                     _ => {}
                 },
@@ -201,14 +201,10 @@ fn run_app(
                     AppPage::BenchmarkList => match action {
                         UserAction::MoveUp => app.list_move_up(),
                         UserAction::MoveDown => app.list_move_down(),
-                        UserAction::FocusPrevTab => app.focus_prev_list_pane(),
-                        UserAction::FocusNextTab => app.focus_next_list_pane(),
-                        UserAction::OpenBenchmarkPage => app.open_function_select_modal(),
-                        UserAction::Build
-                        | UserAction::Run
-                        | UserAction::BuildAndRun
-                        | UserAction::AnalyzeFast
-                        | UserAction::AnalyzeDeep => {
+                        UserAction::FocusPrevPane => app.focus_prev_list_pane(),
+                        UserAction::FocusNextPane => app.focus_next_list_pane(),
+                        UserAction::Confirm => app.open_function_select_modal(),
+                        UserAction::Run | UserAction::Analyze => {
                             app.set_status_message(
                                 "Select function and open detail page to run or analyze",
                             );
@@ -219,25 +215,24 @@ fn run_app(
                         UserAction::MoveUp => app.detail_move_up(),
                         UserAction::MoveDown => app.detail_move_down(),
                         UserAction::BackToBenchmarkList => app.back_to_benchmark_list(),
-                        UserAction::FocusPrevTab => app.focus_prev_tab(),
-                        UserAction::FocusNextTab => app.focus_next_tab(),
+                        UserAction::FocusPrevPane => app.focus_prev_pane(),
+                        UserAction::FocusNextPane => app.focus_next_pane(),
+                        UserAction::Confirm => {
+                            if app.is_stage_focused() {
+                                app.focus_next_pane();
+                            } else if app.is_pass_focused() {
+                                app.enter_diff_view();
+                            } else if app.is_diff_focused() {
+                                app.exit_diff_view();
+                            }
+                        }
                         UserAction::CycleProfile => app.cycle_profile(),
-                        UserAction::ToggleOverlay => app.toggle_overlay(),
                         UserAction::ClearSession => app.clear_session(),
-                        UserAction::Build => {
-                            maybe_spawn_job(app, config, job_tx, JobKind::Build);
-                        }
                         UserAction::Run => {
-                            maybe_spawn_job(app, config, job_tx, JobKind::Run);
-                        }
-                        UserAction::BuildAndRun => {
                             maybe_spawn_job(app, config, job_tx, JobKind::BuildAndRun);
                         }
-                        UserAction::AnalyzeFast => {
+                        UserAction::Analyze => {
                             maybe_spawn_job(app, config, job_tx, JobKind::AnalyzeFast);
-                        }
-                        UserAction::AnalyzeDeep => {
-                            maybe_spawn_job(app, config, job_tx, JobKind::AnalyzeDeep);
                         }
                         _ => {}
                     },
@@ -266,15 +261,6 @@ fn maybe_spawn_job(
         app.set_status_message("Select a function first");
         return;
     };
-    let deep_request = if kind == JobKind::AnalyzeDeep {
-        let Some(step) = app.selected_analysis_step() else {
-            app.set_status_message("No analysis step selected. Run 'x' first.");
-            return;
-        };
-        Some((step.pass_key.clone(), step.pass_occurrence))
-    } else {
-        None
-    };
 
     let profile = app.active_profile;
     let run_mode = app.function_run_mode;
@@ -291,12 +277,11 @@ fn maybe_spawn_job(
         });
 
         match kind {
-            JobKind::Build | JobKind::Run | JobKind::BuildAndRun => {
+            JobKind::BuildAndRun => {
                 let exec_result = runner::execute_runtime_job(
                     &cfg,
                     &benchmark,
                     profile,
-                    kind,
                     &selected_function.symbol,
                     run_mode,
                     |line| {
@@ -315,9 +300,7 @@ fn maybe_spawn_job(
                             parsed_remarks,
                             &selected_function,
                         );
-                        if matches!(kind, JobKind::Run | JobKind::BuildAndRun)
-                            && loop_results.is_empty()
-                        {
+                        if loop_results.is_empty() {
                             let _ = tx.send(JobEvent::Finished(Err(format!(
                                 "selected function '{}' was not found in run output",
                                 selected_function.loop_id
@@ -381,80 +364,6 @@ fn maybe_spawn_job(
                                 analysis_steps,
                                 remarks,
                                 remarks_summary: summary,
-                                source: AnalysisSource::TraceFast,
-                                deep_window: None,
-                            },
-                        };
-                        let _ = tx.send(JobEvent::Finished(Ok(outcome)));
-                    }
-                    Err(err) => {
-                        let _ = tx.send(JobEvent::Finished(Err(format!("{err:#}"))));
-                    }
-                }
-            }
-            JobKind::AnalyzeDeep => {
-                let Some((target_pass_key, target_pass_occurrence)) = deep_request.as_ref() else {
-                    let _ = tx.send(JobEvent::Finished(Err(String::from(
-                        "missing deep analysis request context",
-                    ))));
-                    return;
-                };
-                let exec_result = runner::execute_analysis_deep(
-                    &cfg,
-                    &benchmark,
-                    profile,
-                    runner::AnalysisDeepRequest {
-                        selected_function_symbol: &selected_function.symbol,
-                        target_pass_key,
-                        target_pass_occurrence: *target_pass_occurrence,
-                    },
-                    |line| {
-                        let _ = tx.send(JobEvent::LogLine(line));
-                    },
-                );
-                match exec_result {
-                    Ok(raw) => {
-                        if let Some(mapped_idx) = raw.mapped_index {
-                            let _ = tx.send(JobEvent::LogLine(format!(
-                                "deep analyze | mapped selected step to bisect index {mapped_idx}"
-                            )));
-                        } else {
-                            let _ = tx.send(JobEvent::LogLine(String::from(
-                                "deep analyze | pass mapping failed, using fallback window",
-                            )));
-                        }
-                        let parsed_remarks = parse_remarks_with_log(raw.remark_file, &tx);
-                        let remarks = filter_remarks_for_selected_function(
-                            parsed_remarks,
-                            &selected_function,
-                        );
-                        let analysis_steps = parser::build_analysis_steps_from_snapshots(
-                            &raw.snapshots,
-                            &selected_function.symbol,
-                            &remarks,
-                            AnalysisSource::SnapshotDeep,
-                        );
-                        if analysis_steps.is_empty() {
-                            let _ = tx.send(JobEvent::Finished(Err(format!(
-                                "no function-level IR steps found in deep window for '{}'",
-                                selected_function.symbol
-                            ))));
-                            return;
-                        }
-
-                        let summary = RemarksSummary::from_entries(&remarks);
-                        let outcome = JobOutcome {
-                            kind,
-                            benchmark: benchmark.name,
-                            profile,
-                            selected_function,
-                            run_mode,
-                            data: JobOutcomeData::Analysis {
-                                analysis_steps,
-                                remarks,
-                                remarks_summary: summary,
-                                source: AnalysisSource::SnapshotDeep,
-                                deep_window: Some((raw.window_start, raw.window_end)),
                             },
                         };
                         let _ = tx.send(JobEvent::Finished(Ok(outcome)));

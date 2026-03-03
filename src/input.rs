@@ -6,18 +6,14 @@ pub enum UserAction {
     Quit,
     MoveUp,
     MoveDown,
-    OpenBenchmarkPage,
-    BackToBenchmarkList,
-    FocusPrevTab,
-    FocusNextTab,
-    CycleProfile,
-    Build,
-    Run,
-    BuildAndRun,
-    AnalyzeFast,
-    AnalyzeDeep,
-    ToggleOverlay,
-    ClearSession,
+    Confirm,             // Enter
+    BackToBenchmarkList, // Esc
+    FocusPrevPane,       // Left
+    FocusNextPane,       // Right
+    CycleProfile,        // 'p'
+    Run,                 // 'r' → BuildAndRun
+    Analyze,             // 'a' → AnalyzeFast
+    ClearSession,        // 'c'
 }
 
 pub fn map_key_event(key: KeyEvent) -> UserAction {
@@ -25,17 +21,13 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Char('q') => UserAction::Quit,
         KeyCode::Up => UserAction::MoveUp,
         KeyCode::Down => UserAction::MoveDown,
-        KeyCode::Enter => UserAction::OpenBenchmarkPage,
+        KeyCode::Enter => UserAction::Confirm,
         KeyCode::Esc => UserAction::BackToBenchmarkList,
-        KeyCode::Left => UserAction::FocusPrevTab,
-        KeyCode::Right => UserAction::FocusNextTab,
+        KeyCode::Left => UserAction::FocusPrevPane,
+        KeyCode::Right => UserAction::FocusNextPane,
         KeyCode::Char('p') => UserAction::CycleProfile,
-        KeyCode::Char('b') => UserAction::Build,
         KeyCode::Char('r') => UserAction::Run,
-        KeyCode::Char('a') => UserAction::BuildAndRun,
-        KeyCode::Char('x') => UserAction::AnalyzeFast,
-        KeyCode::Char('X') => UserAction::AnalyzeDeep,
-        KeyCode::Char('o') => UserAction::ToggleOverlay,
+        KeyCode::Char('a') => UserAction::Analyze,
         KeyCode::Char('c') => UserAction::ClearSession,
         _ => UserAction::None,
     }
@@ -57,27 +49,37 @@ mod tests {
 
     #[test]
     fn maps_page_navigation_and_focus_keys() {
-        assert_eq!(
-            map_key_event(key(KeyCode::Enter)),
-            UserAction::OpenBenchmarkPage
-        );
+        assert_eq!(map_key_event(key(KeyCode::Enter)), UserAction::Confirm);
         assert_eq!(
             map_key_event(key(KeyCode::Esc)),
             UserAction::BackToBenchmarkList
         );
-        assert_eq!(map_key_event(key(KeyCode::Left)), UserAction::FocusPrevTab);
-        assert_eq!(map_key_event(key(KeyCode::Right)), UserAction::FocusNextTab);
         assert_eq!(
-            map_key_event(key(KeyCode::Char('o'))),
-            UserAction::ToggleOverlay
+            map_key_event(key(KeyCode::Left)),
+            UserAction::FocusPrevPane
         );
         assert_eq!(
-            map_key_event(key(KeyCode::Char('x'))),
-            UserAction::AnalyzeFast
+            map_key_event(key(KeyCode::Right)),
+            UserAction::FocusNextPane
+        );
+        // Removed keys return None
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('o'))),
+            UserAction::None
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('b'))),
+            UserAction::None
         );
         assert_eq!(
             map_key_event(key(KeyCode::Char('X'))),
-            UserAction::AnalyzeDeep
+            UserAction::None
         );
+        // New bindings
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('a'))),
+            UserAction::Analyze
+        );
+        assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
     }
 }

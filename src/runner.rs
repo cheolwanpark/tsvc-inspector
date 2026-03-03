@@ -1,25 +1,23 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
-use regex::Regex;
 
 use crate::error::AppResult;
-use crate::model::{BenchmarkItem, BuildPurpose, CompileProfile, FunctionRunMode, JobKind};
-use crate::parser::IrSnapshot;
+use crate::model::{BenchmarkItem, BuildPurpose, CompileProfile, FunctionRunMode};
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
     pub tsvc_root: PathBuf,
     pub clang: String,
     pub cmake: String,
+    #[allow(dead_code)]
     pub opt: String,
     pub build_root: PathBuf,
     pub jobs: usize,
+    #[allow(dead_code)]
     pub analysis_window: usize,
 }
 
@@ -35,36 +33,10 @@ pub struct AnalysisFastRawOutput {
     pub remark_file: Option<PathBuf>,
 }
 
-#[derive(Debug)]
-pub struct AnalysisDeepRequest<'a> {
-    pub selected_function_symbol: &'a str,
-    pub target_pass_key: &'a str,
-    pub target_pass_occurrence: usize,
-}
-
-#[derive(Debug)]
-pub struct AnalysisDeepRawOutput {
-    pub snapshots: Vec<IrSnapshot>,
-    pub remark_file: Option<PathBuf>,
-    pub window_start: usize,
-    pub window_end: usize,
-    pub mapped_index: Option<usize>,
-}
-
-#[derive(Clone, Debug)]
-struct BisectPassMeta {
-    index: usize,
-    pass: String,
-    target: String,
-    pass_key: String,
-    pass_occurrence: usize,
-}
-
 pub fn execute_runtime_job<F>(
     config: &RunnerConfig,
     benchmark: &BenchmarkItem,
     profile: CompileProfile,
-    kind: JobKind,
     selected_function_symbol: &str,
     run_mode: FunctionRunMode,
     mut log: F,
@@ -77,32 +49,27 @@ where
 
     let build_dir = build_dir_path(config, profile, BuildPurpose::Runtime);
 
-    if matches!(kind, JobKind::Build | JobKind::BuildAndRun) {
-        run_configure(config, &build_dir, profile, BuildPurpose::Runtime, &mut log)?;
-        let _ = run_build(config, &build_dir, &benchmark.name, &mut log)?;
+    run_configure(config, &build_dir, profile, BuildPurpose::Runtime, &mut log)?;
+    let _ = run_build(config, &build_dir, &benchmark.name, &mut log)?;
+
+    let binary = benchmark_binary_path(&build_dir, &benchmark.name);
+    if !binary.exists() {
+        return Err(anyhow!(
+            "target binary not found: {} (build failed)",
+            binary.display()
+        ));
     }
 
-    let mut run_stdout = String::new();
-    if matches!(kind, JobKind::Run | JobKind::BuildAndRun) {
-        let binary = benchmark_binary_path(&build_dir, &benchmark.name);
-        if !binary.exists() {
-            return Err(anyhow!(
-                "target binary not found: {} (build it first with 'b')",
-                binary.display()
-            ));
-        }
-
-        let mut run = Command::new(&binary);
-        run.args(&benchmark.run_options);
-        if run_mode == FunctionRunMode::RealSelective {
-            log(format!(
-                "env | TSVC_TUI_FUNCTION_FILTER={selected_function_symbol}"
-            ));
-            run.env("TSVC_TUI_FUNCTION_FILTER", selected_function_symbol);
-        }
-        let output = capture_command(&mut run, &mut log)?;
-        run_stdout = output.stdout;
+    let mut run = Command::new(&binary);
+    run.args(&benchmark.run_options);
+    if run_mode == FunctionRunMode::RealSelective {
+        log(format!(
+            "env | TSVC_TUI_FUNCTION_FILTER={selected_function_symbol}"
+        ));
+        run.env("TSVC_TUI_FUNCTION_FILTER", selected_function_symbol);
     }
+    let output = capture_command(&mut run, &mut log)?;
+    let run_stdout = output.stdout;
 
     let remark_file = locate_remark_file(&build_dir, &benchmark.name);
     Ok(RuntimeJobRawOutput {
@@ -138,220 +105,6 @@ where
         build_trace: format!("{}\n{}", build_capture.stdout, build_capture.stderr),
         remark_file,
     })
-}
-
-pub fn execute_analysis_deep<F>(
-    config: &RunnerConfig,
-    benchmark: &BenchmarkItem,
-    profile: CompileProfile,
-    request: AnalysisDeepRequest<'_>,
-    mut log: F,
-) -> AppResult<AnalysisDeepRawOutput>
-where
-    F: FnMut(String),
-{
-    fs::create_dir_all(&config.build_root)
-        .with_context(|| format!("create build root {}", config.build_root.display()))?;
-
-    let tsvc_source = config
-        .tsvc_root
-        .join("MultiSource")
-        .join("Benchmarks")
-        .join("TSVC")
-        .join(&benchmark.name)
-        .join("tsc.c");
-    if !tsvc_source.is_file() {
-        return Err(anyhow!(
-            "source not found for deep analysis: {}",
-            tsvc_source.display()
-        ));
-    }
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_nanos();
-    let deep_dir = config
-        .build_root
-        .join(format!("deep-analysis-{}-{nonce}", benchmark.name));
-    fs::create_dir_all(&deep_dir).with_context(|| format!("create {}", deep_dir.display()))?;
-
-    let deep_outcome = (|| -> AppResult<AnalysisDeepRawOutput> {
-        log(format!(
-            "deep analyze | benchmark={} function={} pass_key={} occurrence={}",
-            benchmark.name,
-            request.selected_function_symbol,
-            request.target_pass_key,
-            request.target_pass_occurrence
-        ));
-        let bc_path = deep_dir.join("tsc.O0.dbg.bc");
-        let mut compile = Command::new(&config.clang);
-        compile
-            .arg("-O0")
-            .arg("-g")
-            .arg("-fno-discard-value-names")
-            .arg("-Xclang")
-            .arg("-disable-O0-optnone")
-            .arg("-emit-llvm")
-            .arg("-c")
-            .arg(&tsvc_source)
-            .arg("-o")
-            .arg(&bc_path);
-        let _ = capture_command(&mut compile, &mut log)?;
-
-        let mut bisect_probe = Command::new(&config.opt);
-        bisect_probe
-            .arg("-passes=default<O3>")
-            .arg("-opt-bisect-limit=-1")
-            .arg("-disable-output")
-            .arg(&bc_path);
-        let bisect_probe_capture = capture_command(&mut bisect_probe, &mut log)?;
-        let bisect_log = format!(
-            "{}\n{}",
-            bisect_probe_capture.stderr, bisect_probe_capture.stdout
-        );
-        let passes = parse_bisect_passes(&bisect_log);
-        let max_pass_idx = passes.iter().map(|m| m.index).max().unwrap_or(0);
-
-        let mapped_index = passes
-            .iter()
-            .find(|meta| {
-                meta.pass_key == request.target_pass_key
-                    && meta.pass_occurrence == request.target_pass_occurrence
-            })
-            .map(|meta| meta.index);
-
-        let (window_start, window_end) = if let Some(center) = mapped_index {
-            (
-                center.saturating_sub(config.analysis_window),
-                center
-                    .saturating_add(config.analysis_window)
-                    .min(max_pass_idx),
-            )
-        } else {
-            (
-                0,
-                config.analysis_window.saturating_mul(2).min(max_pass_idx),
-            )
-        };
-
-        let pass_by_index = passes
-            .iter()
-            .map(|meta| (meta.index, meta))
-            .collect::<HashMap<_, _>>();
-
-        let mut snapshots = Vec::new();
-        for raw_idx in window_start..=window_end {
-            let step_path = deep_dir.join(format!("step-{raw_idx:05}.ll"));
-            let mut opt_step = Command::new(&config.opt);
-            opt_step
-                .arg("-passes=default<O3>")
-                .arg(format!("-opt-bisect-limit={raw_idx}"))
-                .arg("-S")
-                .arg(&bc_path)
-                .arg("-o")
-                .arg(&step_path);
-            let _ = capture_command(&mut opt_step, &mut log)?;
-            let snapshot = fs::read_to_string(&step_path)
-                .with_context(|| format!("read {}", step_path.display()))?;
-
-            let (pass, target, pass_occurrence) = if raw_idx == 0 {
-                (
-                    String::from("(initial IR)"),
-                    String::from("[module]"),
-                    1usize,
-                )
-            } else if let Some(meta) = pass_by_index.get(&raw_idx) {
-                (
-                    meta.pass.clone(),
-                    meta.target.clone(),
-                    meta.pass_occurrence.max(1),
-                )
-            } else {
-                (
-                    format!("(pass-{raw_idx})"),
-                    String::from("[module]"),
-                    1usize,
-                )
-            };
-
-            snapshots.push(IrSnapshot {
-                raw_index: raw_idx,
-                pass,
-                pass_occurrence,
-                target,
-                snapshot,
-            });
-        }
-
-        let analysis_build_dir = build_dir_path(config, profile, BuildPurpose::Analysis);
-        let remark_file = locate_remark_file(&analysis_build_dir, &benchmark.name);
-
-        Ok(AnalysisDeepRawOutput {
-            snapshots,
-            remark_file,
-            window_start,
-            window_end,
-            mapped_index,
-        })
-    })();
-
-    let _ = fs::remove_dir_all(&deep_dir);
-    deep_outcome
-}
-
-fn parse_bisect_passes(log_text: &str) -> Vec<BisectPassMeta> {
-    let line_re =
-        Regex::new(r"^BISECT:\s+running pass \((\d+)\)\s+(.+?)\s+on\s+(.+)$").expect("regex");
-    let mut metas = Vec::new();
-    let mut occurrence_by_pass = HashMap::<String, usize>::new();
-
-    for line in log_text.lines() {
-        let Some(caps) = line_re.captures(line) else {
-            continue;
-        };
-        let index = caps
-            .get(1)
-            .and_then(|m| m.as_str().parse::<usize>().ok())
-            .unwrap_or(0);
-        if index == 0 {
-            continue;
-        }
-        let pass = caps
-            .get(2)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_default();
-        let target = caps
-            .get(3)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_else(|| String::from("[module]"));
-        let pass_key = normalize_pass_key(&pass);
-        let pass_occurrence = {
-            let next = occurrence_by_pass.get(&pass_key).copied().unwrap_or(0) + 1;
-            occurrence_by_pass.insert(pass_key.clone(), next);
-            next
-        };
-
-        metas.push(BisectPassMeta {
-            index,
-            pass,
-            target,
-            pass_key,
-            pass_occurrence,
-        });
-    }
-
-    metas.sort_by_key(|m| m.index);
-    metas
-}
-
-fn normalize_pass_key(pass: &str) -> String {
-    let lowercase = pass.to_ascii_lowercase();
-    let without_suffix = lowercase.strip_suffix("pass").unwrap_or(&lowercase);
-    without_suffix
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect()
 }
 
 fn build_dir_path(
@@ -671,19 +424,5 @@ mod tests {
         assert!(logs.iter().any(|line| line.contains("removed")));
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn parse_bisect_lines_extracts_occurrence() {
-        let text = r#"
-BISECT: running pass (1) SROAPass on foo
-BISECT: running pass (2) SROAPass on bar
-BISECT: running pass (3) LICMPass on loop %x in function foo
-"#;
-        let pass = parse_bisect_passes(text);
-        assert_eq!(pass.len(), 3);
-        assert_eq!(pass[0].pass_occurrence, 1);
-        assert_eq!(pass[1].pass_occurrence, 2);
-        assert_eq!(pass[2].pass_key, "licm");
     }
 }

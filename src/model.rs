@@ -100,21 +100,15 @@ impl fmt::Display for CompileProfile {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    Build,
-    Run,
     BuildAndRun,
     AnalyzeFast,
-    AnalyzeDeep,
 }
 
 impl fmt::Display for JobKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
-            Self::Build => "Build",
-            Self::Run => "Run",
             Self::BuildAndRun => "Build+Run",
             Self::AnalyzeFast => "Analyze",
-            Self::AnalyzeDeep => "Analyze+Deep",
         };
         write!(f, "{text}")
     }
@@ -152,7 +146,9 @@ pub struct RemarkEntry {
     pub kind: RemarkKind,
     pub pass: String,
     pub name: String,
+    #[allow(dead_code)]
     pub file: Option<String>,
+    #[allow(dead_code)]
     pub line: Option<u32>,
     pub function: Option<String>,
     pub message: Option<String>,
@@ -181,7 +177,7 @@ pub struct IrDiffStep {
     pub remark_indices: Vec<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AnalysisStage {
     Initial,
     Interprocedural,
@@ -191,31 +187,45 @@ pub enum AnalysisStage {
     Other,
 }
 
+impl AnalysisStage {
+    pub fn pipeline_order(self) -> u8 {
+        match self {
+            Self::Initial => 0,
+            Self::Interprocedural => 1,
+            Self::Loop => 2,
+            Self::Vectorize => 3,
+            Self::Cleanup => 4,
+            Self::Other => 5,
+        }
+    }
+
+    pub fn ui_label(self) -> &'static str {
+        match self {
+            Self::Initial => "Initial",
+            Self::Interprocedural => "Interproc",
+            Self::Loop => "Loop Opts",
+            Self::Vectorize => "Vectorize",
+            Self::Cleanup => "Cleanup",
+            Self::Other => "Other",
+        }
+    }
+}
+
 impl fmt::Display for AnalysisStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Self::Initial => "initial",
-            Self::Interprocedural => "interprocedural",
-            Self::Loop => "loop",
-            Self::Vectorize => "vectorize",
-            Self::Cleanup => "cleanup",
-            Self::Other => "other",
-        };
-        write!(f, "{label}")
+        write!(f, "{}", self.ui_label())
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisSource {
     TraceFast,
-    SnapshotDeep,
 }
 
 impl fmt::Display for AnalysisSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             Self::TraceFast => "trace",
-            Self::SnapshotDeep => "deep",
         };
         write!(f, "{label}")
     }
@@ -224,10 +234,8 @@ impl fmt::Display for AnalysisSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnalysisState {
     None,
-    RunningFast,
-    RunningDeep,
+    Running,
     Ready,
-    Stale,
     Failed,
 }
 
@@ -235,10 +243,8 @@ impl fmt::Display for AnalysisState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             Self::None => "none",
-            Self::RunningFast => "running-fast",
-            Self::RunningDeep => "running-deep",
+            Self::Running => "running",
             Self::Ready => "ready",
-            Self::Stale => "stale",
             Self::Failed => "failed",
         };
         write!(f, "{label}")
@@ -247,17 +253,24 @@ impl fmt::Display for AnalysisState {
 
 #[derive(Clone, Debug)]
 pub struct AnalysisStep {
+    #[allow(dead_code)]
     pub visible_index: usize,
+    #[allow(dead_code)]
     pub raw_index: usize,
+    #[allow(dead_code)]
     pub pass: String,
     pub pass_key: String,
+    #[allow(dead_code)]
     pub pass_occurrence: usize,
     pub stage: AnalysisStage,
+    #[allow(dead_code)]
     pub target_raw: String,
+    #[allow(dead_code)]
     pub target_function: Option<String>,
     pub changed_lines: usize,
     pub diff_text: String,
     pub remark_indices: Vec<usize>,
+    #[allow(dead_code)]
     pub source: AnalysisSource,
 }
 

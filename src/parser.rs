@@ -1045,10 +1045,10 @@ entry:
             &snapshots,
             "foo",
             &[],
-            AnalysisSource::SnapshotDeep,
+            AnalysisSource::TraceFast,
         );
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[1].target_function.as_deref(), Some("foo"));
-        assert_eq!(steps[1].source, AnalysisSource::SnapshotDeep);
+        assert_eq!(steps[1].source, AnalysisSource::TraceFast);
     }
 }
