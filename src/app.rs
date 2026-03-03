@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    AppPage, BenchmarkFunction, BenchmarkItem, CompileProfile, FunctionRunMode, IrDiffStep,
-    JobKind, LoopResult, OptimizationStep, RemarkEntry, RemarksSummary, RunSession, SessionStatus,
+    AnalysisSource, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
+    CompileProfile, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary, RunSession,
+    SessionStatus,
 };
 
 #[derive(Debug)]
@@ -20,15 +21,28 @@ pub enum JobEvent {
 
 #[derive(Debug)]
 pub struct JobOutcome {
+    pub kind: JobKind,
     pub benchmark: String,
     pub profile: CompileProfile,
     pub selected_function: BenchmarkFunction,
     pub run_mode: FunctionRunMode,
-    pub loop_results: Vec<LoopResult>,
-    pub remarks: Vec<RemarkEntry>,
-    pub ir_diff_steps: Vec<IrDiffStep>,
-    pub optimization_steps: Vec<OptimizationStep>,
-    pub remarks_summary: RemarksSummary,
+    pub data: JobOutcomeData,
+}
+
+#[derive(Debug)]
+pub enum JobOutcomeData {
+    Runtime {
+        loop_results: Vec<LoopResult>,
+        remarks: Vec<RemarkEntry>,
+        remarks_summary: RemarksSummary,
+    },
+    Analysis {
+        analysis_steps: Vec<AnalysisStep>,
+        remarks: Vec<RemarkEntry>,
+        remarks_summary: RemarksSummary,
+        source: AnalysisSource,
+        deep_window: Option<(usize, usize)>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -377,19 +391,19 @@ impl AppState {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return 0;
         };
-        if session.ir_diff_steps.is_empty() {
+        if session.analysis_steps.is_empty() {
             return 0;
         }
         self.selected_step_idx
-            .min(session.ir_diff_steps.len().saturating_sub(1))
+            .min(session.analysis_steps.len().saturating_sub(1))
     }
 
-    pub fn selected_ir_diff_step(&self) -> Option<&IrDiffStep> {
+    pub fn selected_analysis_step(&self) -> Option<&AnalysisStep> {
         let session = self.active_session_for_selected_benchmark()?;
-        if session.ir_diff_steps.is_empty() {
+        if session.analysis_steps.is_empty() {
             return None;
         }
-        session.ir_diff_steps.get(self.selected_step_index())
+        session.analysis_steps.get(self.selected_step_index())
     }
 
     pub fn select_prev_step(&mut self) {
@@ -404,10 +418,10 @@ impl AppState {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return;
         };
-        if session.ir_diff_steps.is_empty() {
+        if session.analysis_steps.is_empty() {
             return;
         }
-        let max_idx = session.ir_diff_steps.len() - 1;
+        let max_idx = session.analysis_steps.len() - 1;
         let old = self.selected_step_idx;
         self.selected_step_idx = (self.selected_step_idx + 1).min(max_idx);
         if self.selected_step_idx != old {
@@ -457,7 +471,7 @@ impl AppState {
     }
 
     fn max_diff_scroll(&self) -> u16 {
-        let Some(step) = self.selected_ir_diff_step() else {
+        let Some(step) = self.selected_analysis_step() else {
             return 0;
         };
         let max = step.diff_text.lines().count().saturating_sub(1);
@@ -487,16 +501,35 @@ impl AppState {
 
         let key = session_key(&benchmark, &selected_function.symbol);
         self.running_session_key = Some(key.clone());
-        self.sessions_by_key.insert(
-            key,
+        let mut session = self.sessions_by_key.remove(&key).unwrap_or_else(|| {
             RunSession::new_running(
                 profile,
                 benchmark.clone(),
                 selected_function.loop_id.clone(),
                 selected_function.symbol.clone(),
                 run_mode,
-            ),
-        );
+            )
+        });
+        session.profile = profile;
+        session.benchmark = benchmark.clone();
+        session.selected_function_loop_id = selected_function.loop_id.clone();
+        session.selected_function_symbol = selected_function.symbol.clone();
+        session.run_mode = run_mode;
+        session.status = SessionStatus::Running;
+        session.logs.clear();
+        if matches!(kind, JobKind::AnalyzeFast | JobKind::AnalyzeDeep) {
+            session.remarks.clear();
+            session.remarks_summary = RemarksSummary::default();
+            if matches!(kind, JobKind::AnalyzeFast) {
+                session.analysis_steps.clear();
+            }
+        }
+        session.analysis_state = match kind {
+            JobKind::AnalyzeFast => AnalysisState::RunningFast,
+            JobKind::AnalyzeDeep => AnalysisState::RunningDeep,
+            _ => session.analysis_state,
+        };
+        self.sessions_by_key.insert(key, session);
 
         self.selected_step_idx = 0;
         self.diff_scroll = 0;
@@ -530,59 +563,111 @@ impl AppState {
                 }
             }
             JobEvent::Finished(result) => {
+                let finished_kind = match self.job_state {
+                    JobState::Running(kind) => Some(kind),
+                    JobState::Idle => None,
+                };
                 self.job_state = JobState::Idle;
                 let running_session_key = self.running_session_key.take();
                 match result {
                     Ok(outcome) => {
-                        let key =
-                            session_key(&outcome.benchmark, &outcome.selected_function.symbol);
+                        let JobOutcome {
+                            kind,
+                            benchmark,
+                            profile,
+                            selected_function,
+                            run_mode,
+                            data,
+                        } = outcome;
+                        let key = session_key(&benchmark, &selected_function.symbol);
                         let mut session = self.sessions_by_key.remove(&key).unwrap_or_else(|| {
                             RunSession::new_running(
-                                outcome.profile,
-                                outcome.benchmark.clone(),
-                                outcome.selected_function.loop_id.clone(),
-                                outcome.selected_function.symbol.clone(),
-                                outcome.run_mode,
+                                profile,
+                                benchmark.clone(),
+                                selected_function.loop_id.clone(),
+                                selected_function.symbol.clone(),
+                                run_mode,
                             )
                         });
 
-                        session.profile = outcome.profile;
-                        session.benchmark = outcome.benchmark.clone();
-                        session.selected_function_loop_id =
-                            outcome.selected_function.loop_id.clone();
-                        session.selected_function_symbol = outcome.selected_function.symbol.clone();
-                        session.run_mode = outcome.run_mode;
-                        session.loop_results = outcome.loop_results;
-                        session.remarks = outcome.remarks;
-                        session.ir_diff_steps = outcome.ir_diff_steps;
-                        session.optimization_steps = outcome.optimization_steps;
-                        session.remarks_summary = outcome.remarks_summary;
+                        session.profile = profile;
+                        session.benchmark = benchmark.clone();
+                        session.selected_function_loop_id = selected_function.loop_id.clone();
+                        session.selected_function_symbol = selected_function.symbol.clone();
+                        session.run_mode = run_mode;
+                        match data {
+                            JobOutcomeData::Runtime {
+                                loop_results,
+                                remarks,
+                                remarks_summary,
+                            } => {
+                                session.loop_results = loop_results;
+                                session.remarks = remarks;
+                                session.remarks_summary = remarks_summary;
+                                if !session.analysis_steps.is_empty() {
+                                    session.analysis_state = AnalysisState::Stale;
+                                } else {
+                                    session.analysis_state = AnalysisState::None;
+                                }
+                            }
+                            JobOutcomeData::Analysis {
+                                analysis_steps,
+                                remarks,
+                                remarks_summary,
+                                source,
+                                deep_window,
+                            } => {
+                                session.analysis_steps = analysis_steps;
+                                session.remarks = remarks;
+                                session.remarks_summary = remarks_summary;
+                                session.analysis_state = AnalysisState::Ready;
+                                if self
+                                    .selected_benchmark()
+                                    .is_some_and(|b| b.name == benchmark)
+                                    && self
+                                        .selected_function_for_selected_benchmark()
+                                        .is_some_and(|f| f.symbol == selected_function.symbol)
+                                {
+                                    self.selected_step_idx = 0;
+                                    self.diff_scroll = 0;
+                                }
+                                self.status_message = if let Some((start, end)) = deep_window {
+                                    format!(
+                                        "Analysis ready: {} [{}] window={start}..{end} ({source})",
+                                        benchmark, selected_function.loop_id
+                                    )
+                                } else {
+                                    format!(
+                                        "Analysis ready: {} [{}] ({source})",
+                                        benchmark, selected_function.loop_id
+                                    )
+                                };
+                            }
+                        }
                         session.status = SessionStatus::Succeeded;
 
                         self.selected_function_by_benchmark
-                            .insert(outcome.benchmark.clone(), outcome.selected_function.clone());
+                            .insert(benchmark.clone(), selected_function.clone());
                         self.sessions_by_key.insert(key, session);
 
-                        if self
-                            .selected_benchmark()
-                            .is_some_and(|b| b.name == outcome.benchmark)
-                            && self
-                                .selected_function_for_selected_benchmark()
-                                .is_some_and(|f| f.symbol == outcome.selected_function.symbol)
-                        {
-                            self.selected_step_idx = 0;
-                            self.diff_scroll = 0;
+                        if !matches!(kind, JobKind::AnalyzeFast | JobKind::AnalyzeDeep) {
+                            self.status_message = format!(
+                                "Completed: {} [{}] ({})",
+                                benchmark, selected_function.loop_id, profile
+                            );
                         }
-                        self.status_message = format!(
-                            "Completed: {} [{}] ({})",
-                            outcome.benchmark, outcome.selected_function.loop_id, outcome.profile
-                        );
                     }
                     Err(error) => {
                         if let Some(key) = running_session_key
                             && let Some(session) = self.sessions_by_key.get_mut(&key)
                         {
                             session.status = SessionStatus::Failed(error.clone());
+                            if matches!(
+                                finished_kind,
+                                Some(JobKind::AnalyzeFast | JobKind::AnalyzeDeep)
+                            ) {
+                                session.analysis_state = AnalysisState::Failed;
+                            }
                         }
                         self.status_message = format!("Job failed: {error}");
                     }
@@ -599,7 +684,7 @@ fn session_key(benchmark: &str, function_symbol: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RemarkKind;
+    use crate::model::{AnalysisStage, AnalysisStep, RemarkKind};
 
     fn benchmark(name: &str) -> BenchmarkItem {
         BenchmarkItem {
@@ -636,34 +721,31 @@ mod tests {
             message: Some(String::from("ok")),
         }];
         JobOutcome {
+            kind: JobKind::AnalyzeFast,
             benchmark: benchmark.to_string(),
             profile,
             selected_function: function,
             run_mode: FunctionRunMode::OutputFilter,
-            loop_results: vec![LoopResult {
-                loop_id: String::from("S161"),
-                time_sec: 1.0,
-                checksum: String::from("123"),
-            }],
-            remarks_summary: RemarksSummary::from_entries(&remarks),
-            ir_diff_steps: vec![IrDiffStep {
-                index: 1,
-                pass: String::from("LICMPass"),
-                target: String::from("s161"),
-                changed_lines: 3,
-                diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
-                remark_indices: vec![0],
-            }],
-            optimization_steps: vec![OptimizationStep {
-                pass: String::from("licm"),
-                total: 1,
-                passed: 1,
-                missed: 0,
-                analysis: 0,
-                other: 0,
-                remark_indices: vec![0],
-            }],
-            remarks,
+            data: JobOutcomeData::Analysis {
+                analysis_steps: vec![AnalysisStep {
+                    visible_index: 0,
+                    raw_index: 12,
+                    pass: String::from("LICMPass"),
+                    pass_key: String::from("licm"),
+                    pass_occurrence: 1,
+                    stage: AnalysisStage::Loop,
+                    target_raw: String::from("s161"),
+                    target_function: Some(String::from("s161")),
+                    changed_lines: 3,
+                    diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
+                    remark_indices: vec![0],
+                    source: AnalysisSource::TraceFast,
+                }],
+                remarks_summary: RemarksSummary::from_entries(&remarks),
+                remarks,
+                source: AnalysisSource::TraceFast,
+                deep_window: None,
+            },
         }
     }
 
@@ -734,7 +816,7 @@ mod tests {
         };
 
         app.handle_job_event(JobEvent::Started {
-            kind: JobKind::BuildAndRun,
+            kind: JobKind::AnalyzeFast,
             benchmark: String::from("A"),
             profile: CompileProfile::O3Remarks,
             selected_function: selected_function.clone(),

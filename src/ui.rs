@@ -76,6 +76,10 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
         JobState::Idle => "Idle".to_string(),
         JobState::Running(kind) => format!("Running {kind}"),
     };
+    let analysis_state = app
+        .active_session_for_selected_benchmark()
+        .map(|s| s.analysis_state.to_string())
+        .unwrap_or_else(|| String::from("-"));
 
     let line = Line::from(vec![
         "TSVC TUI  ".into(),
@@ -96,6 +100,8 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
         app.detail_focus.label().cyan(),
         "  Job: ".gray(),
         job.magenta(),
+        "  Analysis: ".gray(),
+        analysis_state.cyan(),
     ]);
 
     let header = Paragraph::new(line).block(Block::bordered().title("Session"));
@@ -175,14 +181,14 @@ fn render_benchmark_source_code(frame: &mut Frame, app: &AppState, area: ratatui
 fn render_ir_diff_steps(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
-            Paragraph::new("No run result yet.\nPress 'a' to build+run.")
+            Paragraph::new("No analysis yet.\nPress 'x' to analyze optimization path.")
                 .block(Block::bordered().title("IR Steps")),
             area,
         );
         return;
     };
 
-    if session.ir_diff_steps.is_empty() {
+    if session.analysis_steps.is_empty() {
         let run_hint = if let Some(first) = session.loop_results.first() {
             format!(
                 "Latest run: {} {:.2}s checksum={}",
@@ -192,24 +198,31 @@ fn render_ir_diff_steps(frame: &mut Frame, app: &AppState, area: ratatui::layout
             String::from("No run rows captured yet.")
         };
         frame.render_widget(
-            Paragraph::new(format!("No IR diff captured in latest build.\n{run_hint}"))
-                .block(Block::bordered().title("IR Steps")),
+            Paragraph::new(format!(
+                "No analysis steps yet (state: {}).\nPress 'x' to analyze.\n{run_hint}",
+                session.analysis_state
+            ))
+            .block(Block::bordered().title("IR Steps")),
             area,
         );
         return;
     }
 
     let items = session
-        .ir_diff_steps
+        .analysis_steps
         .iter()
         .map(|step| {
             ListItem::new(format!(
-                "#{:03} {} @ {} [Δ{} | R:{}]",
-                step.index,
+                "#{:03} raw:{:05} {} {}#{} @ {} [Δ{} | R:{} | {}]",
+                step.visible_index,
+                step.raw_index,
+                step.stage,
                 step.pass,
-                step.target,
+                step.pass_occurrence,
+                step.target_raw,
                 step.changed_lines,
-                step.remark_indices.len()
+                step.remark_indices.len(),
+                step.source,
             ))
         })
         .collect::<Vec<_>>();
@@ -249,6 +262,10 @@ fn render_ir_diff(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect
     };
     let mut lines = vec![Line::from(format!("Status: {}", session.status))];
     lines.push(Line::from(format!(
+        "Analysis state: {}",
+        session.analysis_state
+    )));
+    lines.push(Line::from(format!(
         "Overlay: {} (press 'o' to toggle)",
         if app.overlay_enabled { "ON" } else { "OFF" }
     )));
@@ -278,10 +295,10 @@ fn render_ir_diff(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect
         }
     }
 
-    let Some(step) = app.selected_ir_diff_step() else {
+    let Some(step) = app.selected_analysis_step() else {
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "No IR diff captured in latest build (incremental/no source change).",
+            "No analysis diff captured yet. Press 'x' to run fast analysis.",
         ));
         let paragraph = Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(diff_title))
@@ -293,15 +310,18 @@ fn render_ir_diff(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect
 
     lines.push(Line::from(""));
     lines.push(Line::from(format!(
-        "Step #{:03} | Pass: {} | Target: {} | changed_lines={}",
-        step.index, step.pass, step.target, step.changed_lines
+        "Step #{:03} | raw={} | stage={} | source={} | pass={} (occ={}) | target={} | changed_lines={}",
+        step.visible_index,
+        step.raw_index,
+        step.stage,
+        step.source,
+        step.pass,
+        step.pass_occurrence,
+        step.target_raw,
+        step.changed_lines
     )));
-    if let Some(first_remark_step) = session.optimization_steps.first() {
-        lines.push(Line::from(format!(
-            "Remark steps: {} (first pass: {})",
-            session.optimization_steps.len(),
-            first_remark_step.pass
-        )));
+    if let Some(target_function) = step.target_function.as_deref() {
+        lines.push(Line::from(format!("Target function: {target_function}")));
     }
     lines.push(Line::from(""));
 
@@ -364,7 +384,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "q quit | esc back | left/right focus tab | up/down step-or-scroll | p profile | b build | r run | a build+run | o overlay | c clear";
+    let hints = "q quit | esc back | left/right focus tab | up/down step-or-scroll | p profile | b build | r run | a build+run | x analyze | X deep-analyze | o overlay | c clear";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),

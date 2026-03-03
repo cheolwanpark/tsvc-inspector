@@ -14,6 +14,8 @@ pub enum UserAction {
     Build,
     Run,
     BuildAndRun,
+    AnalyzeFast,
+    AnalyzeDeep,
     ToggleOverlay,
     ClearSession,
 }
@@ -31,6 +33,8 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Char('b') => UserAction::Build,
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::BuildAndRun,
+        KeyCode::Char('x') => UserAction::AnalyzeFast,
+        KeyCode::Char('X') => UserAction::AnalyzeDeep,
         KeyCode::Char('o') => UserAction::ToggleOverlay,
         KeyCode::Char('c') => UserAction::ClearSession,
         _ => UserAction::None,
@@ -66,6 +70,14 @@ mod tests {
         assert_eq!(
             map_key_event(key(KeyCode::Char('o'))),
             UserAction::ToggleOverlay
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('x'))),
+            UserAction::AnalyzeFast
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('X'))),
+            UserAction::AnalyzeDeep
         );
     }
 }
