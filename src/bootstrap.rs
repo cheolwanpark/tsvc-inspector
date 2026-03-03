@@ -13,7 +13,7 @@ pub fn resolve_tsvc_root(preferred_root: &Path) -> AppResult<PathBuf> {
         return Ok(preferred_root.to_path_buf());
     }
 
-    let fallback = default_fallback_root();
+    let fallback = app_managed_fallback_root();
     if has_tsvc_dir(&fallback) {
         eprintln!(
             "TSVC root '{}' not found, using cached repository at '{}'",
@@ -48,8 +48,12 @@ pub fn resolve_tsvc_root(preferred_root: &Path) -> AppResult<PathBuf> {
     Ok(fallback)
 }
 
-fn default_fallback_root() -> PathBuf {
+pub fn app_managed_fallback_root() -> PathBuf {
     std::env::temp_dir().join("tsvc-tui-llvm-test-suite")
+}
+
+pub fn is_app_managed_fallback_root(root: &Path) -> bool {
+    root == app_managed_fallback_root()
 }
 
 fn has_tsvc_dir(root: &Path) -> bool {

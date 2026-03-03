@@ -6,6 +6,14 @@ pub struct BenchmarkItem {
     pub category: String,
     pub data_type: String,
     pub run_options: Vec<String>,
+    pub available_functions: Vec<BenchmarkFunction>,
+    pub source_code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BenchmarkFunction {
+    pub loop_id: String,
+    pub symbol: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,10 +41,6 @@ impl CompileProfile {
             }
             Self::O3Default => "-O3 -fsave-optimization-record -mllvm -print-changed",
         }
-    }
-
-    pub fn captures_ir_diff(self) -> bool {
-        true
     }
 
     pub fn build_dir_name(self) -> &'static str {
@@ -181,6 +185,22 @@ pub enum SessionStatus {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionRunMode {
+    RealSelective,
+    OutputFilter,
+}
+
+impl fmt::Display for FunctionRunMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::RealSelective => "real-selective",
+            Self::OutputFilter => "output-filter",
+        };
+        write!(f, "{text}")
+    }
+}
+
 impl fmt::Display for SessionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -195,6 +215,9 @@ impl fmt::Display for SessionStatus {
 pub struct RunSession {
     pub profile: CompileProfile,
     pub benchmark: String,
+    pub selected_function_loop_id: String,
+    pub selected_function_symbol: String,
+    pub run_mode: FunctionRunMode,
     pub loop_results: Vec<LoopResult>,
     pub remarks: Vec<RemarkEntry>,
     pub ir_diff_steps: Vec<IrDiffStep>,
@@ -205,10 +228,19 @@ pub struct RunSession {
 }
 
 impl RunSession {
-    pub fn new_running(profile: CompileProfile, benchmark: String) -> Self {
+    pub fn new_running(
+        profile: CompileProfile,
+        benchmark: String,
+        selected_function_loop_id: String,
+        selected_function_symbol: String,
+        run_mode: FunctionRunMode,
+    ) -> Self {
         Self {
             profile,
             benchmark,
+            selected_function_loop_id,
+            selected_function_symbol,
+            run_mode,
             loop_results: Vec::new(),
             remarks: Vec::new(),
             ir_diff_steps: Vec::new(),

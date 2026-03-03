@@ -2,23 +2,42 @@
 
 ## Project Structure & Module Organization
 - `src/main.rs` wires CLI parsing, app startup, and the Ratatui event loop.
-- `src/app.rs` owns UI state, page routing (list/detail), per-benchmark sessions, focus/scroll state for the detail page, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
-- `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery, build/run execution, output parsing (remarks + IR diff step parsing), and TSVC root resolution.
+- `src/app.rs` owns UI state, page routing (list/detail), per-benchmark sessions, list/detail focus + scroll state, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
+- `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), build/run execution, output parsing (remarks + IR diff step parsing), and TSVC root resolution.
 - `src/model.rs` contains shared domain types; `src/error.rs` defines common error/result aliases.
 - Build outputs are generated in `target/` and profile-specific folders such as `build-tsvc-o3-remarks/`; keep generated artifacts out of commits.
 
 ## TUI Navigation Model
 - The app has two pages: `Benchmark List` and `Benchmark Detail`.
-- `Enter` opens the selected benchmark detail page; `Esc` returns to the list page.
+- `Enter` on list opens an intermediate `Select Function` modal first.
+- In `Select Function` modal: `Up`/`Down` moves selection, `Enter` confirms and opens detail, `Esc` cancels.
+- `Esc` on detail returns to the list page.
 - Build/run keys (`b`, `r`, `a`) are active on the benchmark detail page only.
-- Benchmark list page uses `Up`/`Down` for benchmark selection.
+- Benchmark list page has two focus panes: `Benchmarks` and `C Source (kernel-focused)`.
+- On list page, `Left`/`Right` switches focus between `Benchmarks` and `C Source`.
+- On list page, `Up`/`Down` acts on the focused pane:
+  - `Benchmarks` focus: move selected benchmark.
+  - `C Source` focus: scroll source text.
+- List-page source text is derived from `tsc.c` and filtered `tsc.inc` sections selected by `#define TESTS ...` for the benchmark; common timing/harness lines are omitted for readability.
 - Benchmark detail page has two focus panes: `IR Steps` and `IR Diff`.
 - On detail page, `Left`/`Right` switches focus between `IR Steps` and `IR Diff`.
 - On detail page, `Up`/`Down` acts on the focused pane:
   - `IR Steps` focus: move selected optimization step.
   - `IR Diff` focus: scroll IR diff text.
 - `o` toggles remarks/analysis overlay on top of the IR diff.
-- Sessions are scoped per benchmark, with latest-run data shown for the currently selected benchmark.
+- Detail sessions are scoped per `benchmark + selected function`.
+- Function selection is required before entering detail.
+
+## Function-Selective Run Notes
+- The app supports function-selective runs with two modes:
+  - `real-selective`: available when using app-managed fallback TSVC root and patching `tsc.inc` succeeds.
+  - `output-filter`: used for external TSVC roots or when fallback patching fails.
+- In both modes, detail view data is filtered by selected function (loop rows, remarks, IR steps).
+- Build path is incremental and parallelized (`-j`), without `--clean-first`.
+
+## Known Issue (Current)
+- `a` (`build+run`) can still return to `Idle` without expected IR-step updates in some environments.
+- Treat this as unresolved and investigate runner/build artifact handling first when touching related code.
 
 ## Build, Test, and Development Commands
 - `cargo check`: fast compile validation during development.

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    AppPage, BenchmarkItem, CompileProfile, IrDiffStep, JobKind, LoopResult, OptimizationStep,
-    RemarkEntry, RemarksSummary, RunSession, SessionStatus,
+    AppPage, BenchmarkFunction, BenchmarkItem, CompileProfile, FunctionRunMode, IrDiffStep,
+    JobKind, LoopResult, OptimizationStep, RemarkEntry, RemarksSummary, RunSession, SessionStatus,
 };
 
 #[derive(Debug)]
@@ -11,6 +11,8 @@ pub enum JobEvent {
         kind: JobKind,
         benchmark: String,
         profile: CompileProfile,
+        selected_function: BenchmarkFunction,
+        run_mode: FunctionRunMode,
     },
     LogLine(String),
     Finished(Result<JobOutcome, String>),
@@ -20,6 +22,8 @@ pub enum JobEvent {
 pub struct JobOutcome {
     pub benchmark: String,
     pub profile: CompileProfile,
+    pub selected_function: BenchmarkFunction,
+    pub run_mode: FunctionRunMode,
     pub loop_results: Vec<LoopResult>,
     pub remarks: Vec<RemarkEntry>,
     pub ir_diff_steps: Vec<IrDiffStep>,
@@ -31,6 +35,32 @@ pub struct JobOutcome {
 pub enum JobState {
     Idle,
     Running(JobKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListFocus {
+    Benchmarks,
+    SourceCode,
+}
+
+impl ListFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Benchmarks => Self::SourceCode,
+            Self::SourceCode => Self::Benchmarks,
+        }
+    }
+
+    fn prev(self) -> Self {
+        self.next()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Benchmarks => "Benchmarks",
+            Self::SourceCode => "Source Code",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,14 +98,23 @@ pub struct AppState {
     pub selected_step_idx: usize,
     pub job_state: JobState,
     pub status_message: String,
+    pub list_focus: ListFocus,
+    pub list_source_scroll: u16,
     pub detail_focus: DetailFocus,
     pub diff_scroll: u16,
-    sessions_by_benchmark: HashMap<String, RunSession>,
-    running_benchmark: Option<String>,
+    pub function_modal_open: bool,
+    pub function_modal_selected_idx: usize,
+    pub function_run_mode: FunctionRunMode,
+    selected_function_by_benchmark: HashMap<String, BenchmarkFunction>,
+    sessions_by_key: HashMap<String, RunSession>,
+    running_session_key: Option<String>,
 }
 
 impl AppState {
-    pub fn new(benchmarks: Vec<BenchmarkItem>) -> Self {
+    pub fn new_with_run_mode(
+        benchmarks: Vec<BenchmarkItem>,
+        function_run_mode: FunctionRunMode,
+    ) -> Self {
         Self {
             benchmarks,
             selected_idx: 0,
@@ -85,10 +124,16 @@ impl AppState {
             selected_step_idx: 0,
             job_state: JobState::Idle,
             status_message: String::from("Ready"),
+            list_focus: ListFocus::Benchmarks,
+            list_source_scroll: 0,
             detail_focus: DetailFocus::Steps,
             diff_scroll: 0,
-            sessions_by_benchmark: HashMap::new(),
-            running_benchmark: None,
+            function_modal_open: false,
+            function_modal_selected_idx: 0,
+            function_run_mode,
+            selected_function_by_benchmark: HashMap::new(),
+            sessions_by_key: HashMap::new(),
+            running_session_key: None,
         }
     }
 
@@ -96,11 +141,115 @@ impl AppState {
         self.benchmarks.get(self.selected_idx)
     }
 
+    pub fn selected_function_for_selected_benchmark(&self) -> Option<&BenchmarkFunction> {
+        let benchmark_name = self.selected_benchmark()?.name.as_str();
+        self.selected_function_by_benchmark.get(benchmark_name)
+    }
+
+    pub fn selected_function_loop_id(&self) -> Option<&str> {
+        Some(
+            self.selected_function_for_selected_benchmark()?
+                .loop_id
+                .as_str(),
+        )
+    }
+
+    pub fn selected_function_symbol(&self) -> Option<&str> {
+        Some(
+            self.selected_function_for_selected_benchmark()?
+                .symbol
+                .as_str(),
+        )
+    }
+
+    pub fn function_modal_items_for_selected_benchmark(&self) -> Option<&[BenchmarkFunction]> {
+        let benchmark = self.selected_benchmark()?;
+        Some(benchmark.available_functions.as_slice())
+    }
+
+    pub fn is_function_modal_open(&self) -> bool {
+        self.function_modal_open
+    }
+
+    pub fn open_function_select_modal(&mut self) {
+        let Some(benchmark) = self.selected_benchmark() else {
+            self.status_message = String::from("No benchmark selected");
+            return;
+        };
+        if benchmark.available_functions.is_empty() {
+            self.status_message = String::from("No functions discovered for selected benchmark");
+            return;
+        }
+
+        let selected_idx = self
+            .selected_function_by_benchmark
+            .get(&benchmark.name)
+            .and_then(|selected| {
+                benchmark
+                    .available_functions
+                    .iter()
+                    .position(|entry| entry.symbol == selected.symbol)
+            })
+            .unwrap_or(0);
+
+        self.function_modal_open = true;
+        self.function_modal_selected_idx = selected_idx;
+        self.status_message = String::from("Select function and press Enter");
+    }
+
+    pub fn close_function_select_modal(&mut self) {
+        self.function_modal_open = false;
+        self.status_message = String::from("Function selection canceled");
+    }
+
+    pub fn function_modal_move_up(&mut self) {
+        self.function_modal_selected_idx = self.function_modal_selected_idx.saturating_sub(1);
+    }
+
+    pub fn function_modal_move_down(&mut self) {
+        let Some(items) = self.function_modal_items_for_selected_benchmark() else {
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        let max_idx = items.len() - 1;
+        self.function_modal_selected_idx = (self.function_modal_selected_idx + 1).min(max_idx);
+    }
+
+    pub fn confirm_function_selection(&mut self) {
+        let Some(benchmark) = self.selected_benchmark().cloned() else {
+            self.status_message = String::from("No benchmark selected");
+            return;
+        };
+        if benchmark.available_functions.is_empty() {
+            self.status_message = String::from("No functions discovered for selected benchmark");
+            return;
+        }
+
+        let max_idx = benchmark.available_functions.len() - 1;
+        let idx = self.function_modal_selected_idx.min(max_idx);
+        let function = benchmark.available_functions[idx].clone();
+        self.selected_function_by_benchmark
+            .insert(benchmark.name.clone(), function.clone());
+
+        self.function_modal_open = false;
+        self.status_message = format!(
+            "Selected function: {} ({})",
+            function.loop_id, function.symbol
+        );
+        self.open_selected_benchmark_page();
+    }
+
     pub fn select_prev(&mut self) {
         if self.benchmarks.is_empty() {
             return;
         }
+        let old = self.selected_idx;
         self.selected_idx = self.selected_idx.saturating_sub(1);
+        if self.selected_idx != old {
+            self.list_source_scroll = 0;
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -108,7 +257,60 @@ impl AppState {
             return;
         }
         let max_idx = self.benchmarks.len() - 1;
+        let old = self.selected_idx;
         self.selected_idx = (self.selected_idx + 1).min(max_idx);
+        if self.selected_idx != old {
+            self.list_source_scroll = 0;
+        }
+    }
+
+    pub fn list_move_up(&mut self) {
+        match self.list_focus {
+            ListFocus::Benchmarks => self.select_prev(),
+            ListFocus::SourceCode => self.scroll_source_up(),
+        }
+    }
+
+    pub fn list_move_down(&mut self) {
+        match self.list_focus {
+            ListFocus::Benchmarks => self.select_next(),
+            ListFocus::SourceCode => self.scroll_source_down(),
+        }
+    }
+
+    pub fn focus_prev_list_pane(&mut self) {
+        self.list_focus = self.list_focus.prev();
+        self.status_message = format!("Focus: {}", self.list_focus.label());
+    }
+
+    pub fn focus_next_list_pane(&mut self) {
+        self.list_focus = self.list_focus.next();
+        self.status_message = format!("Focus: {}", self.list_focus.label());
+    }
+
+    pub fn is_benchmarks_focused(&self) -> bool {
+        self.list_focus == ListFocus::Benchmarks
+    }
+
+    pub fn is_source_code_focused(&self) -> bool {
+        self.list_focus == ListFocus::SourceCode
+    }
+
+    fn scroll_source_up(&mut self) {
+        self.list_source_scroll = self.list_source_scroll.saturating_sub(1);
+    }
+
+    fn scroll_source_down(&mut self) {
+        let max_scroll = self.max_source_scroll();
+        self.list_source_scroll = self.list_source_scroll.saturating_add(1).min(max_scroll);
+    }
+
+    fn max_source_scroll(&self) -> u16 {
+        let Some(benchmark) = self.selected_benchmark() else {
+            return 0;
+        };
+        let max = benchmark.source_code.lines().count().saturating_sub(1);
+        max.min(u16::MAX as usize) as u16
     }
 
     pub fn cycle_profile(&mut self) {
@@ -121,6 +323,11 @@ impl AppState {
             self.status_message = String::from("No benchmark selected");
             return;
         }
+        if self.selected_function_for_selected_benchmark().is_none() {
+            self.status_message = String::from("Select a function first");
+            return;
+        }
+
         self.page = AppPage::BenchmarkDetail;
         self.selected_step_idx = 0;
         self.detail_focus = DetailFocus::Steps;
@@ -132,12 +339,17 @@ impl AppState {
     }
 
     pub fn clear_session(&mut self) {
-        let Some(benchmark) = self.selected_benchmark().map(|b| b.name.clone()) else {
+        let Some(benchmark) = self.selected_benchmark() else {
             self.status_message = String::from("No benchmark selected");
             return;
         };
+        let Some(function) = self.selected_function_for_selected_benchmark() else {
+            self.status_message = String::from("Select a function first");
+            return;
+        };
+        let key = session_key(&benchmark.name, &function.symbol);
 
-        if self.sessions_by_benchmark.remove(&benchmark).is_some() {
+        if self.sessions_by_key.remove(&key).is_some() {
             self.selected_step_idx = 0;
             self.diff_scroll = 0;
             self.status_message = String::from("Session cleared");
@@ -155,8 +367,10 @@ impl AppState {
     }
 
     pub fn active_session_for_selected_benchmark(&self) -> Option<&RunSession> {
-        let benchmark_name = self.selected_benchmark()?.name.as_str();
-        self.sessions_by_benchmark.get(benchmark_name)
+        let benchmark = self.selected_benchmark()?;
+        let function = self.selected_function_for_selected_benchmark()?;
+        self.sessions_by_key
+            .get(&session_key(&benchmark.name, &function.symbol))
     }
 
     pub fn selected_step_index(&self) -> usize {
@@ -259,16 +473,37 @@ impl AppState {
         };
     }
 
-    pub fn begin_job(&mut self, kind: JobKind, benchmark: String, profile: CompileProfile) {
+    pub fn begin_job(
+        &mut self,
+        kind: JobKind,
+        benchmark: String,
+        profile: CompileProfile,
+        selected_function: BenchmarkFunction,
+        run_mode: FunctionRunMode,
+    ) {
         self.job_state = JobState::Running(kind);
-        self.running_benchmark = Some(benchmark.clone());
-        self.sessions_by_benchmark.insert(
-            benchmark.clone(),
-            RunSession::new_running(profile, benchmark.clone()),
+        self.selected_function_by_benchmark
+            .insert(benchmark.clone(), selected_function.clone());
+
+        let key = session_key(&benchmark, &selected_function.symbol);
+        self.running_session_key = Some(key.clone());
+        self.sessions_by_key.insert(
+            key,
+            RunSession::new_running(
+                profile,
+                benchmark.clone(),
+                selected_function.loop_id.clone(),
+                selected_function.symbol.clone(),
+                run_mode,
+            ),
         );
+
         self.selected_step_idx = 0;
         self.diff_scroll = 0;
-        self.status_message = format!("{kind} started for {benchmark} ({profile})");
+        self.status_message = format!(
+            "{kind} started for {benchmark} [{}] ({profile})",
+            selected_function.loop_id
+        );
     }
 
     pub fn handle_job_event(&mut self, event: JobEvent) {
@@ -277,18 +512,14 @@ impl AppState {
                 kind,
                 benchmark,
                 profile,
+                selected_function,
+                run_mode,
             } => {
-                self.job_state = JobState::Running(kind);
-                self.running_benchmark = Some(benchmark.clone());
-                self.sessions_by_benchmark.insert(
-                    benchmark.clone(),
-                    RunSession::new_running(profile, benchmark.clone()),
-                );
-                self.status_message = format!("{kind} started for {benchmark} ({profile})");
+                self.begin_job(kind, benchmark, profile, selected_function, run_mode);
             }
             JobEvent::LogLine(line) => {
-                if let Some(benchmark) = self.running_benchmark.as_deref()
-                    && let Some(session) = self.sessions_by_benchmark.get_mut(benchmark)
+                if let Some(session_key) = self.running_session_key.as_deref()
+                    && let Some(session) = self.sessions_by_key.get_mut(session_key)
                 {
                     session.logs.push(line);
                     const MAX_LOG_LINES: usize = 4000;
@@ -300,38 +531,56 @@ impl AppState {
             }
             JobEvent::Finished(result) => {
                 self.job_state = JobState::Idle;
-                let running_benchmark = self.running_benchmark.take();
+                let running_session_key = self.running_session_key.take();
                 match result {
                     Ok(outcome) => {
-                        let mut session = self
-                            .sessions_by_benchmark
-                            .remove(&outcome.benchmark)
-                            .unwrap_or_else(|| {
-                                RunSession::new_running(outcome.profile, outcome.benchmark.clone())
-                            });
+                        let key =
+                            session_key(&outcome.benchmark, &outcome.selected_function.symbol);
+                        let mut session = self.sessions_by_key.remove(&key).unwrap_or_else(|| {
+                            RunSession::new_running(
+                                outcome.profile,
+                                outcome.benchmark.clone(),
+                                outcome.selected_function.loop_id.clone(),
+                                outcome.selected_function.symbol.clone(),
+                                outcome.run_mode,
+                            )
+                        });
+
                         session.profile = outcome.profile;
                         session.benchmark = outcome.benchmark.clone();
+                        session.selected_function_loop_id =
+                            outcome.selected_function.loop_id.clone();
+                        session.selected_function_symbol = outcome.selected_function.symbol.clone();
+                        session.run_mode = outcome.run_mode;
                         session.loop_results = outcome.loop_results;
                         session.remarks = outcome.remarks;
                         session.ir_diff_steps = outcome.ir_diff_steps;
                         session.optimization_steps = outcome.optimization_steps;
                         session.remarks_summary = outcome.remarks_summary;
                         session.status = SessionStatus::Succeeded;
-                        self.sessions_by_benchmark
-                            .insert(outcome.benchmark.clone(), session);
+
+                        self.selected_function_by_benchmark
+                            .insert(outcome.benchmark.clone(), outcome.selected_function.clone());
+                        self.sessions_by_key.insert(key, session);
+
                         if self
                             .selected_benchmark()
                             .is_some_and(|b| b.name == outcome.benchmark)
+                            && self
+                                .selected_function_for_selected_benchmark()
+                                .is_some_and(|f| f.symbol == outcome.selected_function.symbol)
                         {
                             self.selected_step_idx = 0;
                             self.diff_scroll = 0;
                         }
-                        self.status_message =
-                            format!("Completed: {} ({})", outcome.benchmark, outcome.profile);
+                        self.status_message = format!(
+                            "Completed: {} [{}] ({})",
+                            outcome.benchmark, outcome.selected_function.loop_id, outcome.profile
+                        );
                     }
                     Err(error) => {
-                        if let Some(benchmark) = running_benchmark
-                            && let Some(session) = self.sessions_by_benchmark.get_mut(&benchmark)
+                        if let Some(key) = running_session_key
+                            && let Some(session) = self.sessions_by_key.get_mut(&key)
                         {
                             session.status = SessionStatus::Failed(error.clone());
                         }
@@ -341,6 +590,10 @@ impl AppState {
             }
         }
     }
+}
+
+fn session_key(benchmark: &str, function_symbol: &str) -> String {
+    format!("{benchmark}::{function_symbol}")
 }
 
 #[cfg(test)]
@@ -354,47 +607,41 @@ mod tests {
             category: String::from("Category"),
             data_type: String::from("dbl"),
             run_options: vec![String::from("100"), String::from("5")],
+            available_functions: vec![
+                BenchmarkFunction {
+                    loop_id: String::from("S161"),
+                    symbol: String::from("s161"),
+                },
+                BenchmarkFunction {
+                    loop_id: String::from("S162"),
+                    symbol: String::from("s162"),
+                },
+            ],
+            source_code: String::from("line1\nline2\nline3\nline4"),
         }
     }
 
-    fn step(pass: &str, idx: usize) -> OptimizationStep {
-        OptimizationStep {
-            pass: pass.to_string(),
-            total: 1,
-            passed: 1,
-            missed: 0,
-            analysis: 0,
-            other: 0,
-            remark_indices: vec![idx],
-        }
-    }
-
-    fn outcome_for(benchmark: &str, profile: CompileProfile) -> JobOutcome {
-        let remarks = vec![
-            RemarkEntry {
-                kind: RemarkKind::Passed,
-                pass: String::from("licm"),
-                name: String::from("Hoisted"),
-                file: None,
-                line: None,
-                function: Some(String::from("main")),
-                message: Some(String::from("ok")),
-            },
-            RemarkEntry {
-                kind: RemarkKind::Missed,
-                pass: String::from("loop-vectorize"),
-                name: String::from("MissedDetails"),
-                file: None,
-                line: None,
-                function: Some(String::from("main")),
-                message: Some(String::from("no")),
-            },
-        ];
+    fn outcome_for(
+        benchmark: &str,
+        profile: CompileProfile,
+        function: BenchmarkFunction,
+    ) -> JobOutcome {
+        let remarks = vec![RemarkEntry {
+            kind: RemarkKind::Passed,
+            pass: String::from("licm"),
+            name: String::from("Hoisted"),
+            file: None,
+            line: None,
+            function: Some(function.symbol.clone()),
+            message: Some(String::from("ok")),
+        }];
         JobOutcome {
             benchmark: benchmark.to_string(),
             profile,
+            selected_function: function,
+            run_mode: FunctionRunMode::OutputFilter,
             loop_results: vec![LoopResult {
-                loop_id: String::from("S1"),
+                loop_id: String::from("S161"),
                 time_sec: 1.0,
                 checksum: String::from("123"),
             }],
@@ -402,188 +649,108 @@ mod tests {
             ir_diff_steps: vec![IrDiffStep {
                 index: 1,
                 pass: String::from("LICMPass"),
-                target: String::from("main"),
+                target: String::from("s161"),
                 changed_lines: 3,
                 diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
                 remark_indices: vec![0],
             }],
-            optimization_steps: vec![step("licm", 0), step("loop-vectorize", 1)],
+            optimization_steps: vec![OptimizationStep {
+                pass: String::from("licm"),
+                total: 1,
+                passed: 1,
+                missed: 0,
+                analysis: 0,
+                other: 0,
+                remark_indices: vec![0],
+            }],
             remarks,
         }
     }
 
     #[test]
-    fn page_navigation_roundtrip() {
-        let mut app = AppState::new(vec![benchmark("A")]);
-        assert_eq!(app.page, AppPage::BenchmarkList);
-        app.open_selected_benchmark_page();
+    fn modal_selection_opens_detail_page() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        assert!(app.is_function_modal_open());
+        app.confirm_function_selection();
         assert_eq!(app.page, AppPage::BenchmarkDetail);
-        app.back_to_benchmark_list();
+        assert_eq!(app.selected_function_loop_id(), Some("S161"));
+    }
+
+    #[test]
+    fn detail_requires_function_selection() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_selected_benchmark_page();
         assert_eq!(app.page, AppPage::BenchmarkList);
+        assert!(app.status_message.contains("Select a function first"));
     }
 
     #[test]
-    fn optimization_step_selection_is_clamped() {
-        let mut app = AppState::new(vec![benchmark("A")]);
-        app.open_selected_benchmark_page();
-        app.sessions_by_benchmark.insert(
+    fn sessions_are_scoped_per_function() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.selected_function_by_benchmark.insert(
             String::from("A"),
-            RunSession {
-                profile: CompileProfile::O3Remarks,
-                benchmark: String::from("A"),
-                loop_results: Vec::new(),
-                remarks: Vec::new(),
-                ir_diff_steps: vec![
-                    IrDiffStep {
-                        index: 1,
-                        pass: String::from("LICMPass"),
-                        target: String::from("main"),
-                        changed_lines: 1,
-                        diff_text: String::from("d1"),
-                        remark_indices: Vec::new(),
-                    },
-                    IrDiffStep {
-                        index: 2,
-                        pass: String::from("LoopVectorizePass"),
-                        target: String::from("main"),
-                        changed_lines: 2,
-                        diff_text: String::from("d2"),
-                        remark_indices: Vec::new(),
-                    },
-                ],
-                optimization_steps: vec![step("licm", 0), step("loop-vectorize", 1)],
-                remarks_summary: RemarksSummary::default(),
-                logs: Vec::new(),
-                status: SessionStatus::Succeeded,
+            BenchmarkFunction {
+                loop_id: String::from("S161"),
+                symbol: String::from("s161"),
             },
         );
-
-        app.select_next_step();
-        app.select_next_step();
-        assert_eq!(app.selected_step_index(), 1);
-
-        app.select_prev_step();
-        app.select_prev_step();
-        assert_eq!(app.selected_step_index(), 0);
-    }
-
-    #[test]
-    fn overlay_toggle_changes_state() {
-        let mut app = AppState::new(vec![benchmark("A")]);
-        assert!(!app.overlay_enabled);
-        app.toggle_overlay();
-        assert!(app.overlay_enabled);
-        app.toggle_overlay();
-        assert!(!app.overlay_enabled);
-    }
-
-    #[test]
-    fn detail_focus_controls_up_down_behavior() {
-        let mut app = AppState::new(vec![benchmark("A")]);
-        app.open_selected_benchmark_page();
-        app.sessions_by_benchmark.insert(
-            String::from("A"),
-            RunSession {
-                profile: CompileProfile::O3Remarks,
-                benchmark: String::from("A"),
-                loop_results: Vec::new(),
-                remarks: Vec::new(),
-                ir_diff_steps: vec![
-                    IrDiffStep {
-                        index: 1,
-                        pass: String::from("LICMPass"),
-                        target: String::from("main"),
-                        changed_lines: 1,
-                        diff_text: String::from("line1\nline2\nline3"),
-                        remark_indices: Vec::new(),
-                    },
-                    IrDiffStep {
-                        index: 2,
-                        pass: String::from("LoopVectorizePass"),
-                        target: String::from("main"),
-                        changed_lines: 1,
-                        diff_text: String::from("line1\nline2\nline3\nline4"),
-                        remark_indices: Vec::new(),
-                    },
-                ],
-                optimization_steps: vec![step("licm", 0), step("loop-vectorize", 1)],
-                remarks_summary: RemarksSummary::default(),
-                logs: Vec::new(),
-                status: SessionStatus::Succeeded,
-            },
+        app.sessions_by_key.insert(
+            String::from("A::s161"),
+            RunSession::new_running(
+                CompileProfile::O3Remarks,
+                String::from("A"),
+                String::from("S161"),
+                String::from("s161"),
+                FunctionRunMode::OutputFilter,
+            ),
+        );
+        app.sessions_by_key.insert(
+            String::from("A::s162"),
+            RunSession::new_running(
+                CompileProfile::O3Remarks,
+                String::from("A"),
+                String::from("S162"),
+                String::from("s162"),
+                FunctionRunMode::OutputFilter,
+            ),
         );
 
-        assert!(app.is_steps_focused());
-        app.detail_move_down();
-        assert_eq!(app.selected_step_index(), 1);
-        assert_eq!(app.diff_scroll, 0);
-
-        app.focus_next_tab();
-        assert!(app.is_ir_diff_focused());
-        app.detail_move_down();
-        app.detail_move_down();
-        assert_eq!(app.diff_scroll, 2);
-        app.detail_move_up();
-        assert_eq!(app.diff_scroll, 1);
+        app.clear_session();
+        assert!(!app.sessions_by_key.contains_key("A::s161"));
+        assert!(app.sessions_by_key.contains_key("A::s162"));
     }
 
     #[test]
-    fn finished_events_store_sessions_per_benchmark() {
-        let mut app = AppState::new(vec![benchmark("A"), benchmark("B")]);
+    fn finished_event_updates_selected_function_session() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
 
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::BuildAndRun,
             benchmark: String::from("A"),
             profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
         });
-        app.handle_job_event(JobEvent::LogLine(String::from("log-a")));
         app.handle_job_event(JobEvent::Finished(Ok(outcome_for(
             "A",
             CompileProfile::O3Remarks,
+            selected_function,
         ))));
 
-        app.select_next();
-        app.handle_job_event(JobEvent::Started {
-            kind: JobKind::Build,
-            benchmark: String::from("B"),
-            profile: CompileProfile::O3Default,
-        });
-        app.handle_job_event(JobEvent::Finished(Ok(outcome_for(
-            "B",
-            CompileProfile::O3Default,
-        ))));
-
-        assert_eq!(app.sessions_by_benchmark.len(), 2);
-        assert_eq!(
-            app.sessions_by_benchmark
-                .get("A")
-                .expect("session A should exist")
-                .benchmark,
-            "A"
-        );
-        assert_eq!(
-            app.sessions_by_benchmark
-                .get("B")
-                .expect("session B should exist")
-                .benchmark,
-            "B"
-        );
-    }
-
-    #[test]
-    fn clear_session_only_affects_selected_benchmark() {
-        let mut app = AppState::new(vec![benchmark("A"), benchmark("B")]);
-        app.sessions_by_benchmark.insert(
-            String::from("A"),
-            RunSession::new_running(CompileProfile::O3Remarks, String::from("A")),
-        );
-        app.sessions_by_benchmark.insert(
-            String::from("B"),
-            RunSession::new_running(CompileProfile::O3Remarks, String::from("B")),
-        );
-
-        app.clear_session();
-        assert!(!app.sessions_by_benchmark.contains_key("A"));
-        assert!(app.sessions_by_benchmark.contains_key("B"));
+        let session = app
+            .sessions_by_key
+            .get("A::s161")
+            .expect("session should exist");
+        assert_eq!(session.selected_function_loop_id, "S161");
+        assert!(matches!(session.status, SessionStatus::Succeeded));
     }
 }

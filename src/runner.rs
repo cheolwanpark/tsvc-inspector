@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, anyhow};
 
 use crate::error::AppResult;
-use crate::model::{BenchmarkItem, CompileProfile, JobKind};
+use crate::model::{BenchmarkItem, CompileProfile, FunctionRunMode, JobKind};
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
@@ -29,6 +29,8 @@ pub fn execute_job<F>(
     benchmark: &BenchmarkItem,
     profile: CompileProfile,
     kind: JobKind,
+    selected_function_symbol: &str,
+    run_mode: FunctionRunMode,
     mut log: F,
 ) -> AppResult<JobRawOutput>
 where
@@ -42,7 +44,7 @@ where
 
     if matches!(kind, JobKind::Build | JobKind::BuildAndRun) {
         run_configure(config, &build_dir, profile, &mut log)?;
-        let build_capture = run_build(config, &build_dir, &benchmark.name, profile, &mut log)?;
+        let build_capture = run_build(config, &build_dir, &benchmark.name, &mut log)?;
         build_trace = format!("{}\n{}", build_capture.stdout, build_capture.stderr);
     }
 
@@ -58,6 +60,12 @@ where
 
         let mut run = Command::new(&binary);
         run.args(&benchmark.run_options);
+        if run_mode == FunctionRunMode::RealSelective {
+            log(format!(
+                "env | TSVC_TUI_FUNCTION_FILTER={selected_function_symbol}"
+            ));
+            run.env("TSVC_TUI_FUNCTION_FILTER", selected_function_symbol);
+        }
         let output = capture_command(&mut run, &mut log)?;
         run_stdout = output.stdout;
     }
@@ -99,18 +107,18 @@ fn run_build<F>(
     config: &RunnerConfig,
     build_dir: &Path,
     target: &str,
-    profile: CompileProfile,
     log: &mut F,
 ) -> AppResult<CommandCapture>
 where
     F: FnMut(String),
 {
-    let jobs = effective_build_jobs(config.jobs, profile);
+    prepare_target_rebuild(build_dir, target, log)?;
+
+    let jobs = effective_build_jobs(config.jobs);
     let mut build = Command::new(&config.cmake);
     build
         .arg("--build")
         .arg(build_dir)
-        .arg("--clean-first")
         .arg("--target")
         .arg(target)
         .arg("-j")
@@ -118,6 +126,62 @@ where
 
     let capture = capture_command(&mut build, log)?;
     Ok(capture)
+}
+
+fn prepare_target_rebuild<F>(build_dir: &Path, target: &str, log: &mut F) -> AppResult<()>
+where
+    F: FnMut(String),
+{
+    let target_dir = build_dir
+        .join("MultiSource")
+        .join("Benchmarks")
+        .join("TSVC")
+        .join(target);
+    let obj_dir = target_dir.join("CMakeFiles").join(format!("{target}.dir"));
+    let binary = target_dir.join(target);
+
+    if obj_dir.is_dir() {
+        remove_target_outputs(&obj_dir, log)?;
+    }
+    if binary.exists() {
+        fs::remove_file(&binary).with_context(|| format!("remove {}", binary.display()))?;
+        log(format!("prep | removed file {}", binary.display()));
+    }
+
+    Ok(())
+}
+
+fn remove_target_outputs<F>(dir: &Path, log: &mut F) -> AppResult<()>
+where
+    F: FnMut(String),
+{
+    let entries = fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            remove_target_outputs(&path, log)?;
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or_default();
+        let should_remove =
+            matches!(ext, "o" | "obj" | "bc" | "ll" | "s") || file_name.ends_with(".opt.yaml");
+        if !should_remove {
+            continue;
+        }
+
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        log(format!("prep | removed file {}", path.display()));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -174,12 +238,8 @@ fn shell_escape(text: &OsStr) -> String {
     }
 }
 
-fn effective_build_jobs(configured_jobs: usize, profile: CompileProfile) -> usize {
-    if profile.captures_ir_diff() {
-        1
-    } else {
-        configured_jobs.max(1)
-    }
+fn effective_build_jobs(configured_jobs: usize) -> usize {
+    configured_jobs.max(1)
 }
 
 pub fn benchmark_binary_path(build_dir: &Path, benchmark: &str) -> PathBuf {
@@ -268,23 +328,63 @@ mod tests {
     }
 
     #[test]
-    fn ir_capture_forces_single_job() {
-        assert_eq!(effective_build_jobs(8, CompileProfile::O3Remarks), 1);
-        assert_eq!(effective_build_jobs(8, CompileProfile::O3Default), 1);
+    fn build_jobs_respect_requested_parallelism() {
+        assert_eq!(effective_build_jobs(8), 8);
+        assert_eq!(effective_build_jobs(1), 1);
+        assert_eq!(effective_build_jobs(0), 1);
     }
 
     #[test]
-    fn render_command_includes_clean_first_for_build() {
+    fn render_command_for_build_omits_clean_first() {
         let mut build = Command::new("cmake");
         build
             .arg("--build")
             .arg("/tmp/build")
-            .arg("--clean-first")
             .arg("--target")
             .arg("foo")
             .arg("-j")
             .arg("1");
         let rendered = render_command(&build);
-        assert!(rendered.contains("--clean-first"));
+        assert!(!rendered.contains("--clean-first"));
+    }
+
+    #[test]
+    fn prepare_target_rebuild_removes_target_artifacts() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tsvc-tui-prepare-rebuild-test-{unique}"));
+        let obj_dir = root
+            .join("MultiSource")
+            .join("Benchmarks")
+            .join("TSVC")
+            .join("Foo")
+            .join("CMakeFiles")
+            .join("Foo.dir");
+        fs::create_dir_all(&obj_dir).expect("create obj dir");
+        fs::write(obj_dir.join("build.make"), "keep").expect("write build.make");
+        fs::write(obj_dir.join("tsc.c.o"), "obj").expect("write object");
+        fs::write(obj_dir.join("tsc.c.opt.yaml"), "yaml").expect("write remark");
+
+        let binary = root
+            .join("MultiSource")
+            .join("Benchmarks")
+            .join("TSVC")
+            .join("Foo")
+            .join("Foo");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("create target dir");
+        fs::write(&binary, "bin").expect("write binary");
+
+        let mut logs = Vec::new();
+        prepare_target_rebuild(&root, "Foo", &mut |line| logs.push(line)).expect("prepare");
+        assert!(obj_dir.exists());
+        assert!(obj_dir.join("build.make").exists());
+        assert!(!obj_dir.join("tsc.c.o").exists());
+        assert!(!obj_dir.join("tsc.c.opt.yaml").exists());
+        assert!(!binary.exists());
+        assert!(logs.iter().any(|line| line.contains("removed")));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
