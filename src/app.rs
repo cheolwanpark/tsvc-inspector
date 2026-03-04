@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 
 use ratatui::style::Color;
+use similar::ChangeTag;
 
 use crate::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
@@ -582,6 +584,74 @@ impl AppState {
         }
     }
 
+    pub fn build_detail_copy_payload(&self) -> Result<String, String> {
+        let benchmark = self
+            .selected_benchmark()
+            .ok_or_else(|| String::from("no benchmark selected"))?;
+        let selected_function = self
+            .selected_function_for_selected_benchmark()
+            .ok_or_else(|| String::from("no function selected"))?;
+        let session = self
+            .active_session_for_selected_benchmark()
+            .ok_or_else(|| String::from("no active session for selected function"))?;
+        let step = self
+            .selected_step_in_stage(session)
+            .ok_or_else(|| String::from("no selected analysis pass"))?;
+        let passes = Self::passes_for_stage(session, self.selected_stage);
+        let selected_pass_index = self.selected_pass_index_in_stage(session) + 1;
+        let source_text = self
+            .detail_source_text_for_selected_benchmark()
+            .unwrap_or_else(|| String::from("(source not available)"));
+        let full_pass_diff = build_full_pass_diff(step);
+        let pass_name = if step.pass.is_empty() {
+            step.pass_key.as_str()
+        } else {
+            step.pass.as_str()
+        };
+        let remarks_text = format_step_remarks(step, &session.remarks);
+
+        let mut out = String::new();
+        let _ = writeln!(out, "TSVC Detail Snapshot");
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "Context");
+        let _ = writeln!(out, "- benchmark: {}", benchmark.name);
+        let _ = writeln!(
+            out,
+            "- function: {} ({})",
+            selected_function.loop_id, selected_function.symbol
+        );
+        let _ = writeln!(out, "- profile: {}", session.profile);
+        let _ = writeln!(out, "- focus: {}", self.detail_focus.label());
+        let _ = writeln!(out, "- analysis_state: {}", session.analysis_state);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "Stage/Pass");
+        let _ = writeln!(out, "- stage: {}", self.selected_stage.ui_label());
+        let _ = writeln!(out, "- pass_key: {}", step.pass_key);
+        let _ = writeln!(out, "- pass_raw: {}", step.pass);
+        let _ = writeln!(out, "- pass_index: {selected_pass_index}/{}", passes.len());
+        let _ = writeln!(out, "- changed_lines: {}", step.changed_lines);
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "Remarks");
+        let _ = writeln!(out, "{remarks_text}");
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "C Source");
+        let _ = writeln!(out, "```c");
+        let _ = writeln!(out, "{source_text}");
+        let _ = writeln!(out, "```");
+        let _ = writeln!(out);
+
+        let _ = writeln!(out, "IR Diff ({pass_name})");
+        let _ = writeln!(out, "```diff");
+        let _ = writeln!(out, "{full_pass_diff}");
+        let _ = writeln!(out, "```");
+
+        Ok(out)
+    }
+
     fn scroll_ir_up(&mut self) {
         self.ir_scroll = self.ir_scroll.saturating_sub(1);
     }
@@ -888,6 +958,43 @@ impl AppState {
     }
 }
 
+fn format_step_remarks(step: &AnalysisStep, remarks: &[RemarkEntry]) -> String {
+    let mut lines = Vec::new();
+    for idx in &step.remark_indices {
+        let Some(remark) = remarks.get(*idx) else {
+            continue;
+        };
+        let message = remark.message.as_deref().unwrap_or(remark.name.as_str());
+        let line = format!(
+            "- [{}] {}::{} {}",
+            remark.kind, remark.pass, remark.name, message
+        );
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return String::from("- (none)");
+    }
+    lines.join("\n")
+}
+
+fn build_full_pass_diff(step: &AnalysisStep) -> String {
+    if step.ir_lines.is_empty() {
+        return step.diff_text.clone();
+    }
+    step.ir_lines
+        .iter()
+        .map(|line| {
+            let prefix = match line.tag {
+                ChangeTag::Insert => "+ ",
+                ChangeTag::Delete => "- ",
+                ChangeTag::Equal => "  ",
+            };
+            format!("{prefix}{}", line.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn extract_c_function_source(source: &str, symbol: &str) -> Option<String> {
     if symbol.is_empty() {
         return None;
@@ -1013,7 +1120,10 @@ fn extract_vf_from_remarks(remarks: &[RemarkEntry]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AnalysisSource, AnalysisStage, AnalysisStep, RemarkKind};
+    use crate::model::{
+        AnalysisSource, AnalysisStage, AnalysisState, AnalysisStep, IrLine, RemarkKind,
+    };
+    use similar::ChangeTag;
 
     fn benchmark(name: &str) -> BenchmarkItem {
         BenchmarkItem {
@@ -1058,6 +1168,34 @@ mod tests {
             remark_indices: vec![],
             source: AnalysisSource::TraceFast,
         }
+    }
+
+    fn attach_ready_session(app: &mut AppState, step: AnalysisStep, remarks: Vec<RemarkEntry>) {
+        let benchmark = app
+            .selected_benchmark()
+            .expect("benchmark should exist")
+            .name
+            .clone();
+        let selected_function = app
+            .selected_function_for_selected_benchmark()
+            .expect("selected function should exist")
+            .clone();
+
+        let mut session = RunSession::new_running(
+            CompileProfile::O3Remarks,
+            benchmark.clone(),
+            selected_function.loop_id.clone(),
+            selected_function.symbol.clone(),
+            FunctionRunMode::OutputFilter,
+        );
+        session.analysis_state = AnalysisState::Ready;
+        session.analysis_steps = vec![step];
+        session.remarks = remarks.clone();
+        session.remarks_summary = RemarksSummary::from_entries(&remarks);
+        session.status = SessionStatus::Succeeded;
+
+        let key = session_key(&benchmark, &selected_function.symbol);
+        app.sessions_by_key.insert(key, session);
     }
 
     #[test]
@@ -1183,6 +1321,150 @@ int tail(void) {
         );
 
         assert_eq!(app.max_source_detail_scroll(), 4);
+    }
+
+    #[test]
+    fn build_detail_copy_payload_requires_active_session() {
+        let source = r#"
+int s161(void) {
+    return 1;
+}
+"#;
+        let mut app = AppState::new_with_run_mode(
+            vec![benchmark_with_source("A", source)],
+            FunctionRunMode::OutputFilter,
+        );
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        let err = app
+            .build_detail_copy_payload()
+            .expect_err("missing session should fail");
+        assert_eq!(err, "no active session for selected function");
+    }
+
+    #[test]
+    fn build_detail_copy_payload_contains_context_remarks_and_source() {
+        let source = r#"
+int s161(void) {
+    return 1;
+}
+"#;
+        let mut app = AppState::new_with_run_mode(
+            vec![benchmark_with_source("A", source)],
+            FunctionRunMode::OutputFilter,
+        );
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
+        step.pass = String::from("LoopVectorizePass");
+        step.diff_text = String::from("@@ -1,3 +1,3 @@\n x\n-old\n+new\n y");
+        step.ir_lines = vec![
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("x"),
+            },
+            IrLine {
+                tag: ChangeTag::Delete,
+                text: String::from("old"),
+            },
+            IrLine {
+                tag: ChangeTag::Insert,
+                text: String::from("new"),
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("y"),
+            },
+        ];
+        step.source_line_map = vec![None; step.ir_lines.len()];
+        step.remark_indices = vec![0];
+
+        let remarks = vec![RemarkEntry {
+            kind: RemarkKind::Passed,
+            pass: String::from("loop-vectorize"),
+            name: String::from("Vectorized"),
+            file: None,
+            line: None,
+            function: Some(String::from("s161")),
+            message: Some(String::from("vectorized loop (VF = 4)")),
+        }];
+        attach_ready_session(&mut app, step, remarks);
+
+        let payload = app
+            .build_detail_copy_payload()
+            .expect("payload should be generated");
+        assert!(payload.contains("benchmark: A"));
+        assert!(payload.contains("function: S161 (s161)"));
+        assert!(payload.contains("stage: Vectorize"));
+        assert!(payload.contains("pass_key: loopvectorize"));
+        assert!(payload.contains("[Passed] loop-vectorize::Vectorized vectorized loop (VF = 4)"));
+        assert!(payload.contains("int s161(void) {"));
+        assert!(payload.contains("IR Diff (LoopVectorizePass)"));
+        assert!(payload.contains("  x"));
+        assert!(payload.contains("- old"));
+        assert!(payload.contains("+ new"));
+    }
+
+    #[test]
+    fn build_detail_copy_payload_includes_all_ir_lines_for_selected_pass() {
+        let source = r#"
+int s161(void) {
+    return 1;
+}
+"#;
+        let mut app = AppState::new_with_run_mode(
+            vec![benchmark_with_source("A", source)],
+            FunctionRunMode::OutputFilter,
+        );
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+        let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
+        step.ir_lines = vec![
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("l1"),
+            },
+            IrLine {
+                tag: ChangeTag::Delete,
+                text: String::from("old1"),
+            },
+            IrLine {
+                tag: ChangeTag::Insert,
+                text: String::from("new1"),
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("l2"),
+            },
+            IrLine {
+                tag: ChangeTag::Delete,
+                text: String::from("old2"),
+            },
+            IrLine {
+                tag: ChangeTag::Insert,
+                text: String::from("new2"),
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("l3"),
+            },
+        ];
+        step.source_line_map = vec![None; step.ir_lines.len()];
+        attach_ready_session(&mut app, step, vec![]);
+
+        let payload = app
+            .build_detail_copy_payload()
+            .expect("payload should be generated");
+
+        assert!(payload.contains("  l1"));
+        assert!(payload.contains("- old1"));
+        assert!(payload.contains("+ new1"));
+        assert!(payload.contains("  l2"));
+        assert!(payload.contains("- old2"));
+        assert!(payload.contains("+ new2"));
+        assert!(payload.contains("  l3"));
     }
 
     fn outcome_for(

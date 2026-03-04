@@ -32,7 +32,7 @@
   - `IrView`: scroll full-function IR (interleaved diff view).
 - `Enter`: StageList -> PassList, PassList -> IrView.
 - `Esc`: IrView -> PassList -> StageList -> back to list page.
-- `a` runs analysis, `r` runs build+run, `p` cycles profile, `c` clears session.
+- `a` runs analysis, `r` runs build+run, `y` copies a detail snapshot to clipboard, `p` cycles profile, `c` clears session.
 - Detail sessions are scoped per `benchmark + selected function`.
 - Function selection is required before entering detail.
 - Minimum terminal size: 100x30.
@@ -44,6 +44,7 @@
   - Unchanged lines: `  ` prefix with syntax-highlighted text over a dark code background (`CODE_BG`).
 - IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag`) per `AnalysisStep`.
 - LLVM IR syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-llvm`, and diff backgrounds remain visible via style patching.
+- Clipboard snapshot (`y`) includes the selected stage/pass metadata, linked remarks, selected-function C source, and full IR diff for the selected pass.
 
 ### C Source Panel (Detail)
 - Shows only the selected target function's C source with line numbers.

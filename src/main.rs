@@ -1,5 +1,6 @@
 mod app;
 mod bootstrap;
+mod clipboard;
 mod discovery;
 mod error;
 mod input;
@@ -241,11 +242,27 @@ fn run_app(
                         UserAction::Analyze => {
                             maybe_spawn_job(app, config, job_tx, JobKind::AnalyzeFast);
                         }
+                        UserAction::CopyDetailToClipboard => copy_detail_snapshot(app),
                         _ => {}
                     },
                 },
             }
         }
+    }
+}
+
+fn copy_detail_snapshot(app: &mut AppState) {
+    let payload = match app.build_detail_copy_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            app.set_status_message(format!("Nothing to copy: {err}"));
+            return;
+        }
+    };
+
+    match clipboard::copy_text(&payload) {
+        Ok(()) => app.set_status_message("Copied detail snapshot to clipboard"),
+        Err(err) => app.set_status_message(format!("Copy failed: {err}")),
     }
 }
 

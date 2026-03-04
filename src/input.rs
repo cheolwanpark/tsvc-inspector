@@ -6,14 +6,15 @@ pub enum UserAction {
     Quit,
     MoveUp,
     MoveDown,
-    Confirm,             // Enter
-    BackToBenchmarkList, // Esc
-    FocusNextPaneCycle,  // Tab
-    FocusPrevPaneCycle,  // Shift-Tab
-    CycleProfile,        // 'p'
-    Run,                 // 'r' → BuildAndRun
-    Analyze,             // 'a' → AnalyzeFast
-    ClearSession,        // 'c'
+    Confirm,               // Enter
+    BackToBenchmarkList,   // Esc
+    FocusNextPaneCycle,    // Tab
+    FocusPrevPaneCycle,    // Shift-Tab
+    CycleProfile,          // 'p'
+    Run,                   // 'r' → BuildAndRun
+    Analyze,               // 'a' → AnalyzeFast
+    ClearSession,          // 'c'
+    CopyDetailToClipboard, // 'y'
 }
 
 pub fn map_key_event(key: KeyEvent) -> UserAction {
@@ -29,6 +30,7 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::Analyze,
         KeyCode::Char('c') => UserAction::ClearSession,
+        KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
         _ => UserAction::None,
     }
 }
@@ -71,5 +73,9 @@ mod tests {
         // New bindings
         assert_eq!(map_key_event(key(KeyCode::Char('a'))), UserAction::Analyze);
         assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('y'))),
+            UserAction::CopyDetailToClipboard
+        );
     }
 }
