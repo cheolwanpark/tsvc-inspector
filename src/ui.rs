@@ -259,7 +259,7 @@ fn render_detail_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::
         "C Source"
     };
 
-    let Some(benchmark) = app.selected_benchmark() else {
+    let Some(source_text) = app.detail_source_text_for_selected_benchmark() else {
         frame.render_widget(
             Paragraph::new("Source not available").block(Block::bordered().title(title)),
             area,
@@ -267,7 +267,7 @@ fn render_detail_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::
         return;
     };
 
-    if benchmark.source_code.trim().is_empty() {
+    if source_text.trim().is_empty() {
         frame.render_widget(
             Paragraph::new("(source not available)").block(Block::bordered().title(title)),
             area,
@@ -278,8 +278,7 @@ fn render_detail_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::
     // Collect highlighted source lines from current step's source_line_map + visible IR range
     let highlighted_lines = collect_highlighted_source_lines(app);
 
-    let lines: Vec<Line> = benchmark
-        .source_code
+    let lines: Vec<Line> = source_text
         .lines()
         .enumerate()
         .map(|(i, l)| {

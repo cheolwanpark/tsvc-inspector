@@ -44,9 +44,10 @@
 - IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag`) per `AnalysisStep`.
 
 ### C Source Panel (Detail)
-- Shows C source with line numbers.
+- Shows only the selected target function's C source with line numbers.
+- Function text is extracted from the benchmark's kernel-focused source; if extraction fails, the panel shows an explicit unavailable message.
 - `!dbg` metadata in IR is parsed to build `source_line_map` for potential C<->IR matching.
-- Note: `!dbg` line numbers are absolute file positions; the source panel shows a kernel excerpt with different numbering, so C<->IR highlighting is not yet functional (degrades gracefully with no highlights).
+- Note: `!dbg` line numbers are absolute file positions; the source panel shows a function-only excerpt with different numbering, so C<->IR highlighting is not yet functional (degrades gracefully with no highlights).
 
 ### Verdict System
 - Header shows vectorization verdict based on optimization remarks.

@@ -194,6 +194,21 @@ impl AppState {
         )
     }
 
+    pub fn detail_source_text_for_selected_benchmark(&self) -> Option<String> {
+        let benchmark = self.selected_benchmark()?;
+        let function = self.selected_function_for_selected_benchmark()?;
+        Some(
+            extract_c_function_source(&benchmark.source_code, &function.symbol).unwrap_or_else(
+                || {
+                    format!(
+                        "(source unavailable: could not locate function '{}' in kernel-focused source)",
+                        function.symbol
+                    )
+                },
+            ),
+        )
+    }
+
     pub fn function_modal_items_for_selected_benchmark(&self) -> Option<&[BenchmarkFunction]> {
         let benchmark = self.selected_benchmark()?;
         Some(benchmark.available_functions.as_slice())
@@ -598,10 +613,10 @@ impl AppState {
     }
 
     fn max_source_detail_scroll(&self) -> u16 {
-        let Some(benchmark) = self.selected_benchmark() else {
+        let Some(source) = self.detail_source_text_for_selected_benchmark() else {
             return 0;
         };
-        let max = benchmark.source_code.lines().count().saturating_sub(1);
+        let max = source.lines().count().saturating_sub(1);
         max.min(u16::MAX as usize) as u16
     }
 
@@ -874,6 +889,95 @@ impl AppState {
     }
 }
 
+fn extract_c_function_source(source: &str, symbol: &str) -> Option<String> {
+    if symbol.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    for start in 0..lines.len() {
+        if !line_contains_symbol_with_call_paren(lines[start], symbol) {
+            continue;
+        }
+
+        let mut found_open_brace = false;
+        let mut brace_depth = 0u32;
+        let mut end = start;
+
+        while end < lines.len() {
+            let line = lines[end];
+            for ch in line.chars() {
+                if found_open_brace {
+                    match ch {
+                        '{' => brace_depth = brace_depth.saturating_add(1),
+                        '}' => {
+                            brace_depth = brace_depth.saturating_sub(1);
+                            if brace_depth == 0 {
+                                return Some(lines[start..=end].join("\n"));
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match ch {
+                        ';' => break,
+                        '{' => {
+                            found_open_brace = true;
+                            brace_depth = 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !found_open_brace && line.contains(';') {
+                break;
+            }
+            end += 1;
+        }
+    }
+
+    None
+}
+
+fn line_contains_symbol_with_call_paren(line: &str, symbol: &str) -> bool {
+    let bytes = line.as_bytes();
+    let symbol_len = symbol.len();
+    if symbol_len == 0 || bytes.len() < symbol_len {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    while offset + symbol_len <= bytes.len() {
+        let Some(found) = line[offset..].find(symbol) else {
+            break;
+        };
+        let start = offset + found;
+        let end = start + symbol_len;
+
+        let left_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+        let right_ok = end >= bytes.len() || !is_identifier_byte(bytes[end]);
+        if left_ok && right_ok {
+            let mut idx = end;
+            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+                idx += 1;
+            }
+            if idx < bytes.len() && bytes[idx] == b'(' {
+                return true;
+            }
+        }
+        offset = end;
+    }
+    false
+}
+
+fn is_identifier_byte(ch: u8) -> bool {
+    ch.is_ascii_alphanumeric() || ch == b'_'
+}
+
 fn session_key(benchmark: &str, function_symbol: &str) -> String {
     format!("{benchmark}::{function_symbol}")
 }
@@ -933,6 +1037,12 @@ mod tests {
         }
     }
 
+    fn benchmark_with_source(name: &str, source_code: &str) -> BenchmarkItem {
+        let mut item = benchmark(name);
+        item.source_code = source_code.to_string();
+        item
+    }
+
     fn make_step(stage: AnalysisStage, pass_key: &str, visible_index: usize) -> AnalysisStep {
         AnalysisStep {
             visible_index,
@@ -950,6 +1060,128 @@ mod tests {
             remark_indices: vec![],
             source: AnalysisSource::TraceFast,
         }
+    }
+
+    #[test]
+    fn extract_c_function_source_returns_only_target_function() {
+        let source = r#"
+int s160() {
+    return 0;
+}
+
+int s161() {
+    int acc = 0;
+    acc += 1;
+    return acc;
+}
+
+int s162() {
+    return 2;
+}
+"#;
+
+        let extracted =
+            extract_c_function_source(source, "s161").expect("target function should be found");
+        assert!(extracted.contains("int s161()"));
+        assert!(extracted.contains("return acc;"));
+        assert!(!extracted.contains("int s160()"));
+        assert!(!extracted.contains("int s162()"));
+    }
+
+    #[test]
+    fn extract_c_function_source_ignores_callsite_and_prototype() {
+        let source = r#"
+int main(void) {
+    s161(7);
+    return 0;
+}
+
+int s161(int n);
+
+int s161(int n) {
+    return n + 1;
+}
+"#;
+
+        let extracted =
+            extract_c_function_source(source, "s161").expect("definition should be found");
+        assert!(extracted.contains("int s161(int n) {"));
+        assert!(extracted.contains("return n + 1;"));
+        assert!(!extracted.contains("int main(void)"));
+    }
+
+    #[test]
+    fn extract_c_function_source_handles_multiline_signature() {
+        let source = r#"
+int
+s161(
+    int n,
+    int m
+)
+{
+    return n + m;
+}
+"#;
+
+        let extracted =
+            extract_c_function_source(source, "s161").expect("multiline signature should parse");
+        assert!(extracted.contains("s161("));
+        assert!(extracted.contains("return n + m;"));
+    }
+
+    #[test]
+    fn detail_source_accessor_returns_unavailable_message_when_missing() {
+        let mut app = AppState::new_with_run_mode(
+            vec![benchmark_with_source("A", "int other(void) { return 0; }\n")],
+            FunctionRunMode::OutputFilter,
+        );
+        app.selected_function_by_benchmark.insert(
+            String::from("A"),
+            BenchmarkFunction {
+                loop_id: String::from("S161"),
+                symbol: String::from("s161"),
+            },
+        );
+
+        let detail_source = app
+            .detail_source_text_for_selected_benchmark()
+            .expect("detail source should resolve");
+        assert_eq!(
+            detail_source,
+            "(source unavailable: could not locate function 's161' in kernel-focused source)"
+        );
+    }
+
+    #[test]
+    fn max_source_detail_scroll_uses_function_only_line_count() {
+        let source = r#"
+int helper(void) {
+    return 0;
+}
+
+int s161() {
+    int x = 0;
+    x += 1;
+    return x;
+}
+
+int tail(void) {
+    return 1;
+}
+"#;
+        let mut app = AppState::new_with_run_mode(
+            vec![benchmark_with_source("A", source)],
+            FunctionRunMode::OutputFilter,
+        );
+        app.selected_function_by_benchmark.insert(
+            String::from("A"),
+            BenchmarkFunction {
+                loop_id: String::from("S161"),
+                symbol: String::from("s161"),
+            },
+        );
+
+        assert_eq!(app.max_source_detail_scroll(), 4);
     }
 
     fn outcome_for(
