@@ -268,10 +268,6 @@ fn compile_tsc_flags(
         return flags;
     }
 
-    if !flags.iter().any(|flag| flag.starts_with("-print-changed")) {
-        return flags;
-    }
-
     let Some(symbol) = selected_function_symbol
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -530,17 +526,4 @@ mod tests {
         assert!(flags.iter().any(|flag| flag == "-filter-print-funcs=s161"));
     }
 
-    #[test]
-    fn compile_tsc_flags_skip_filter_without_print_changed() {
-        let config = CompilerConfig {
-            emit_print_changed: false,
-            ..CompilerConfig::default()
-        };
-        let flags = compile_tsc_flags(&config, BuildPurpose::Analysis, Some("s161"));
-        assert!(
-            !flags
-                .iter()
-                .any(|flag| flag.starts_with("-filter-print-funcs="))
-        );
-    }
 }

@@ -77,20 +77,38 @@ fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
     let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]);
     let [left, right] = cols.areas(main_area);
 
-    let items = app
-        .config_rows()
+    let rows = app.config_rows();
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut display_to_data: Vec<Option<usize>> = Vec::new();
+    let mut prev_group: Option<&str> = None;
+
+    for (i, row) in rows.iter().enumerate() {
+        let group = row.group();
+        if prev_group != Some(group) {
+            let header_text = format!("  --- {} ---", group);
+            items.push(
+                ListItem::new(header_text)
+                    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            );
+            display_to_data.push(None);
+            prev_group = Some(group);
+        }
+        let value = app.config_row_value_text(*row);
+        let row_suffix =
+            if *row == app.config_selected_row_kind() && app.is_config_text_editing() {
+                " [editing]"
+            } else {
+                ""
+            };
+        items.push(ListItem::new(format!("  {:<18} : {}{}", row.title(), value, row_suffix)));
+        display_to_data.push(Some(i));
+    }
+
+    let display_index = display_to_data
         .iter()
-        .map(|row| {
-            let value = app.config_row_value_text(*row);
-            let row_suffix =
-                if *row == app.config_selected_row_kind() && app.is_config_text_editing() {
-                    " [editing]"
-                } else {
-                    ""
-                };
-            ListItem::new(format!("{:<18} : {}{}", row.title(), value, row_suffix))
-        })
-        .collect::<Vec<_>>();
+        .position(|entry| *entry == Some(app.config_selected_row))
+        .unwrap_or(0);
+
     let list = List::new(items)
         .block(Block::bordered().title("Configuration"))
         .highlight_style(
@@ -100,7 +118,7 @@ fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
         )
         .highlight_symbol(">> ");
     let mut state = ListState::default();
-    state.select(Some(app.config_selected_row));
+    state.select(Some(display_index));
     frame.render_stateful_widget(list, left, &mut state);
 
     let right_rows = Layout::vertical([Constraint::Percentage(54), Constraint::Percentage(46)]);
@@ -148,6 +166,11 @@ fn config_help_lines(app: &AppState, row: ConfigRow) -> Vec<Line<'static>> {
             "Why: Lower levels show simpler pass effects; higher levels show full pipeline behavior.",
             "Tip: Start with -O1 to learn pass order, then raise to -O3.",
         ],
+        ConfigRow::FastMath => vec![
+            "What: Enables -ffast-math (FP reassociation, no NaN/Inf guards).",
+            "Why: FP reassociation enables reduction vectorization for sums/products.",
+            "Tip: Try on for reduction loops that fail to vectorize with strict FP.",
+        ],
         ConfigRow::LoopVectorize => vec![
             "What: Enables/disables loop vectorization (-fno-vectorize when off).",
             "Why: Isolates vectorizer impact from other loop optimizations.",
@@ -158,35 +181,40 @@ fn config_help_lines(app: &AppState, row: ConfigRow) -> Vec<Line<'static>> {
             "Why: Separates basic-block vectorization effects from loop vectorization.",
             "Tip: Disable this when focusing only on loop-vectorize remarks.",
         ],
-        ConfigRow::Rpass => vec![
-            "What: Emits successful vectorization remarks (-Rpass=loop-vectorize).",
-            "Why: Quickly confirms where vectorization actually happened.",
-            "Tip: Keep on when validating vectorization wins.",
+        ConfigRow::ForceVecWidth => vec![
+            "What: Overrides the vectorizer's VF choice (-mllvm -force-vector-width=N).",
+            "Why: Tests specific vector factors regardless of cost model decisions.",
+            "Tip: Set to 4 or 8 to force vectorization even when cost model says no.",
         ],
-        ConfigRow::RpassMissed => vec![
-            "What: Emits missed vectorization remarks (-Rpass-missed=loop-vectorize).",
-            "Why: Shows why loops were not vectorized.",
-            "Tip: Enable when diagnosing performance gaps.",
+        ConfigRow::ForceInterleave => vec![
+            "What: Overrides interleaving factor (-mllvm -force-vector-interleave=N).",
+            "Why: Isolates vectorization from interleaving in the IR timeline.",
+            "Tip: Set to 1 to see pure vectorization without unroll-and-jam.",
         ],
-        ConfigRow::RpassAnalysis => vec![
-            "What: Emits analysis remarks from loop-vectorize.",
-            "Why: Reveals internal decision context before pass success/failure.",
-            "Tip: Useful for understanding profitability heuristics.",
+        ConfigRow::UnrollLoops => vec![
+            "What: Enables/disables loop unrolling (-fno-unroll-loops when off).",
+            "Why: Separates unrolling from vectorization in the IR timeline.",
+            "Tip: Disable to see cleaner vectorized IR without unrolled copies.",
         ],
-        ConfigRow::PrintChanged => vec![
-            "What: Enables LLVM changed-IR trace (-mllvm -print-changed).",
-            "Why: Powers pass-by-pass IR timeline in this TUI.",
-            "Tip: Keep on for optimization workflow exploration.",
+        ConfigRow::LoopInterchange => vec![
+            "What: Enables loop interchange (-mllvm -enable-loopinterchange).",
+            "Why: Reorders nested loop dimensions for better memory access.",
+            "Tip: Useful for matrix/stencil benchmarks with column-major access.",
         ],
-        ConfigRow::DebugInfo => vec![
-            "What: Emits debug metadata (-g).",
-            "Why: Keeps !dbg locations needed for source/IR mapping data.",
-            "Tip: Keep on during analysis unless compile speed is critical.",
+        ConfigRow::LoopDistribute => vec![
+            "What: Enables loop distribution (-mllvm -enable-loop-distribute).",
+            "Why: Splits loops with mixed dependences so vectorizable parts can proceed.",
+            "Tip: Try when vectorization fails due to carried dependences.",
+        ],
+        ConfigRow::MarchNative => vec![
+            "What: Targets the host CPU (-march=native).",
+            "Why: Unlocks wider SIMD (AVX2/AVX-512/NEON) beyond the default target.",
+            "Tip: Combine with Force Vec Width to test wider VFs on your hardware.",
         ],
         ConfigRow::ExtraCFlags => vec![
             "What: Appends extra clang C flags to compile/link commands.",
             "Why: Lets you quickly test hypotheses without changing code.",
-            "Tip: Example: -march=native or -fno-unroll-loops",
+            "Tip: Example: -fno-math-errno or -ffp-contract=fast",
         ],
         ConfigRow::ExtraLlvmFlags => vec![
             "What: Appends LLVM backend flags (each token passed via -mllvm).",

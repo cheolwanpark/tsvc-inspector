@@ -122,27 +122,31 @@ impl DetailFocus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigRow {
     OptLevel,
+    FastMath,
     LoopVectorize,
     SlpVectorize,
-    Rpass,
-    RpassMissed,
-    RpassAnalysis,
-    PrintChanged,
-    DebugInfo,
+    ForceVecWidth,
+    ForceInterleave,
+    UnrollLoops,
+    LoopInterchange,
+    LoopDistribute,
+    MarchNative,
     ExtraCFlags,
     ExtraLlvmFlags,
 }
 
 impl ConfigRow {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::OptLevel,
+        Self::FastMath,
         Self::LoopVectorize,
         Self::SlpVectorize,
-        Self::Rpass,
-        Self::RpassMissed,
-        Self::RpassAnalysis,
-        Self::PrintChanged,
-        Self::DebugInfo,
+        Self::ForceVecWidth,
+        Self::ForceInterleave,
+        Self::UnrollLoops,
+        Self::LoopInterchange,
+        Self::LoopDistribute,
+        Self::MarchNative,
         Self::ExtraCFlags,
         Self::ExtraLlvmFlags,
     ];
@@ -150,15 +154,27 @@ impl ConfigRow {
     pub fn title(self) -> &'static str {
         match self {
             Self::OptLevel => "Optimization",
+            Self::FastMath => "Fast Math",
             Self::LoopVectorize => "Loop Vectorize",
             Self::SlpVectorize => "SLP Vectorize",
-            Self::Rpass => "Rpass",
-            Self::RpassMissed => "Rpass Missed",
-            Self::RpassAnalysis => "Rpass Analysis",
-            Self::PrintChanged => "Print Changed",
-            Self::DebugInfo => "Debug Info",
+            Self::ForceVecWidth => "Force Vec Width",
+            Self::ForceInterleave => "Force Interleave",
+            Self::UnrollLoops => "Unroll Loops",
+            Self::LoopInterchange => "Loop Interchange",
+            Self::LoopDistribute => "Loop Distribute",
+            Self::MarchNative => "March Native",
             Self::ExtraCFlags => "Extra C Flags",
             Self::ExtraLlvmFlags => "Extra LLVM Flags",
+        }
+    }
+
+    pub fn group(self) -> &'static str {
+        match self {
+            Self::OptLevel | Self::FastMath => "Optimization",
+            Self::LoopVectorize | Self::SlpVectorize | Self::ForceVecWidth | Self::ForceInterleave => "Vectorization",
+            Self::UnrollLoops | Self::LoopInterchange | Self::LoopDistribute => "Loop Transforms",
+            Self::MarchNative => "Target",
+            Self::ExtraCFlags | Self::ExtraLlvmFlags => "Advanced",
         }
     }
 
@@ -456,13 +472,15 @@ impl AppState {
     pub fn config_row_value_text(&self, row: ConfigRow) -> String {
         match row {
             ConfigRow::OptLevel => self.config_draft.opt_level.to_string(),
+            ConfigRow::FastMath => bool_text(self.config_draft.fast_math),
             ConfigRow::LoopVectorize => bool_text(self.config_draft.enable_loop_vectorize),
             ConfigRow::SlpVectorize => bool_text(self.config_draft.enable_slp_vectorize),
-            ConfigRow::Rpass => bool_text(self.config_draft.emit_rpass),
-            ConfigRow::RpassMissed => bool_text(self.config_draft.emit_rpass_missed),
-            ConfigRow::RpassAnalysis => bool_text(self.config_draft.emit_rpass_analysis),
-            ConfigRow::PrintChanged => bool_text(self.config_draft.emit_print_changed),
-            ConfigRow::DebugInfo => bool_text(self.config_draft.emit_debug_info),
+            ConfigRow::ForceVecWidth => self.config_draft.force_vector_width.to_string(),
+            ConfigRow::ForceInterleave => self.config_draft.force_vector_interleave.to_string(),
+            ConfigRow::UnrollLoops => bool_text(self.config_draft.unroll_loops),
+            ConfigRow::LoopInterchange => bool_text(self.config_draft.loop_interchange),
+            ConfigRow::LoopDistribute => bool_text(self.config_draft.loop_distribute),
+            ConfigRow::MarchNative => bool_text(self.config_draft.march_native),
             ConfigRow::ExtraCFlags => {
                 if self.config_draft.extra_c_flags.trim().is_empty() {
                     String::from("(empty)")
@@ -617,26 +635,50 @@ impl AppState {
                     }
                 }
             }
+            ConfigRow::FastMath => {
+                self.config_draft.fast_math = !self.config_draft.fast_math;
+            }
             ConfigRow::LoopVectorize => {
                 self.config_draft.enable_loop_vectorize = !self.config_draft.enable_loop_vectorize;
             }
             ConfigRow::SlpVectorize => {
                 self.config_draft.enable_slp_vectorize = !self.config_draft.enable_slp_vectorize;
             }
-            ConfigRow::Rpass => {
-                self.config_draft.emit_rpass = !self.config_draft.emit_rpass;
+            ConfigRow::ForceVecWidth => {
+                if forward {
+                    self.config_draft.force_vector_width =
+                        self.config_draft.force_vector_width.next();
+                } else {
+                    // Cycle backwards: 4 forward steps in a 5-item cycle.
+                    for _ in 0..4 {
+                        self.config_draft.force_vector_width =
+                            self.config_draft.force_vector_width.next();
+                    }
+                }
             }
-            ConfigRow::RpassMissed => {
-                self.config_draft.emit_rpass_missed = !self.config_draft.emit_rpass_missed;
+            ConfigRow::ForceInterleave => {
+                if forward {
+                    self.config_draft.force_vector_interleave =
+                        self.config_draft.force_vector_interleave.next();
+                } else {
+                    // Cycle backwards: 3 forward steps in a 4-item cycle.
+                    for _ in 0..3 {
+                        self.config_draft.force_vector_interleave =
+                            self.config_draft.force_vector_interleave.next();
+                    }
+                }
             }
-            ConfigRow::RpassAnalysis => {
-                self.config_draft.emit_rpass_analysis = !self.config_draft.emit_rpass_analysis;
+            ConfigRow::UnrollLoops => {
+                self.config_draft.unroll_loops = !self.config_draft.unroll_loops;
             }
-            ConfigRow::PrintChanged => {
-                self.config_draft.emit_print_changed = !self.config_draft.emit_print_changed;
+            ConfigRow::LoopInterchange => {
+                self.config_draft.loop_interchange = !self.config_draft.loop_interchange;
             }
-            ConfigRow::DebugInfo => {
-                self.config_draft.emit_debug_info = !self.config_draft.emit_debug_info;
+            ConfigRow::LoopDistribute => {
+                self.config_draft.loop_distribute = !self.config_draft.loop_distribute;
+            }
+            ConfigRow::MarchNative => {
+                self.config_draft.march_native = !self.config_draft.march_native;
             }
             ConfigRow::ExtraCFlags | ConfigRow::ExtraLlvmFlags => {}
         }
@@ -2047,7 +2089,7 @@ int s161(void) {
         app.confirm_function_selection();
         assert_eq!(app.page, AppPage::CompileConfig);
 
-        app.config_selected_row = 8; // ExtraCFlags
+        app.config_selected_row = 10; // ExtraCFlags
         app.config_confirm();
         assert!(app.is_config_text_editing());
         app.config_push_char('-');

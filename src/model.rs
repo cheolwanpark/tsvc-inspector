@@ -78,16 +78,102 @@ impl fmt::Display for OptimizationLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForceVectorWidth {
+    Auto,
+    W2,
+    W4,
+    W8,
+    W16,
+}
+
+impl ForceVectorWidth {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::W2,
+            Self::W2 => Self::W4,
+            Self::W4 => Self::W8,
+            Self::W8 => Self::W16,
+            Self::W16 => Self::Auto,
+        }
+    }
+
+    pub fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::W2 => Some("-force-vector-width=2"),
+            Self::W4 => Some("-force-vector-width=4"),
+            Self::W8 => Some("-force-vector-width=8"),
+            Self::W16 => Some("-force-vector-width=16"),
+        }
+    }
+}
+
+impl fmt::Display for ForceVectorWidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Auto => "auto",
+            Self::W2 => "2",
+            Self::W4 => "4",
+            Self::W8 => "8",
+            Self::W16 => "16",
+        };
+        f.write_str(label)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForceInterleave {
+    Auto,
+    I1,
+    I2,
+    I4,
+}
+
+impl ForceInterleave {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::I1,
+            Self::I1 => Self::I2,
+            Self::I2 => Self::I4,
+            Self::I4 => Self::Auto,
+        }
+    }
+
+    pub fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::I1 => Some("-force-vector-interleave=1"),
+            Self::I2 => Some("-force-vector-interleave=2"),
+            Self::I4 => Some("-force-vector-interleave=4"),
+        }
+    }
+}
+
+impl fmt::Display for ForceInterleave {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Auto => "auto",
+            Self::I1 => "1",
+            Self::I2 => "2",
+            Self::I4 => "4",
+        };
+        f.write_str(label)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CompilerConfig {
     pub opt_level: OptimizationLevel,
     pub enable_loop_vectorize: bool,
     pub enable_slp_vectorize: bool,
-    pub emit_rpass: bool,
-    pub emit_rpass_missed: bool,
-    pub emit_rpass_analysis: bool,
-    pub emit_print_changed: bool,
-    pub emit_debug_info: bool,
+    pub fast_math: bool,
+    pub march_native: bool,
+    pub unroll_loops: bool,
+    pub force_vector_width: ForceVectorWidth,
+    pub force_vector_interleave: ForceInterleave,
+    pub loop_interchange: bool,
+    pub loop_distribute: bool,
     pub extra_c_flags: String,
     pub extra_llvm_flags: String,
 }
@@ -98,11 +184,13 @@ impl Default for CompilerConfig {
             opt_level: OptimizationLevel::O3,
             enable_loop_vectorize: true,
             enable_slp_vectorize: true,
-            emit_rpass: true,
-            emit_rpass_missed: true,
-            emit_rpass_analysis: true,
-            emit_print_changed: true,
-            emit_debug_info: true,
+            fast_math: false,
+            march_native: false,
+            unroll_loops: true,
+            force_vector_width: ForceVectorWidth::Auto,
+            force_vector_interleave: ForceInterleave::Auto,
+            loop_interchange: false,
+            loop_distribute: false,
             extra_c_flags: String::new(),
             extra_llvm_flags: String::new(),
         }
@@ -118,30 +206,44 @@ impl CompilerConfig {
         if !self.enable_slp_vectorize {
             flags.push(String::from("-fno-slp-vectorize"));
         }
+        if self.fast_math {
+            flags.push(String::from("-ffast-math"));
+        }
+        if self.march_native {
+            flags.push(String::from("-march=native"));
+        }
+        if !self.unroll_loops {
+            flags.push(String::from("-fno-unroll-loops"));
+        }
+        if let Some(f) = self.force_vector_width.flag() {
+            flags.push(String::from("-mllvm"));
+            flags.push(String::from(f));
+        }
+        if let Some(f) = self.force_vector_interleave.flag() {
+            flags.push(String::from("-mllvm"));
+            flags.push(String::from(f));
+        }
+        if self.loop_interchange {
+            flags.push(String::from("-mllvm"));
+            flags.push(String::from("-enable-loopinterchange"));
+        }
+        if self.loop_distribute {
+            flags.push(String::from("-mllvm"));
+            flags.push(String::from("-enable-loop-distribute"));
+        }
         flags.extend(split_flags(&self.extra_c_flags));
         flags
     }
 
     pub fn analysis_c_flags(&self) -> Vec<String> {
         let mut flags = self.runtime_c_flags();
-        if self.emit_debug_info {
-            flags.push(String::from("-g"));
-        }
-        if self.emit_rpass {
-            flags.push(String::from("-Rpass=loop-vectorize"));
-        }
-        if self.emit_rpass_missed {
-            flags.push(String::from("-Rpass-missed=loop-vectorize"));
-        }
-        if self.emit_rpass_analysis {
-            flags.push(String::from("-Rpass-analysis=loop-vectorize"));
-        }
+        flags.push(String::from("-g"));
+        flags.push(String::from("-Rpass=loop-vectorize"));
+        flags.push(String::from("-Rpass-missed=loop-vectorize"));
+        flags.push(String::from("-Rpass-analysis=loop-vectorize"));
         flags.push(String::from("-fsave-optimization-record"));
-
-        if self.emit_print_changed {
-            flags.push(String::from("-mllvm"));
-            flags.push(String::from("-print-changed"));
-        }
+        flags.push(String::from("-mllvm"));
+        flags.push(String::from("-print-changed"));
 
         for token in split_flags(&self.extra_llvm_flags) {
             flags.push(String::from("-mllvm"));
@@ -160,25 +262,27 @@ impl CompilerConfig {
 
     pub fn label(&self) -> String {
         format!(
-            "{} lv:{} slp:{} trace:{}",
+            "{} lv:{} slp:{} fm:{}",
             self.opt_level,
             on_off(self.enable_loop_vectorize),
             on_off(self.enable_slp_vectorize),
-            on_off(self.emit_print_changed),
+            on_off(self.fast_math),
         )
     }
 
     pub fn canonical_key(&self) -> String {
         format!(
-            "opt={}|lv={}|slp={}|rpass={}|rpass_missed={}|rpass_analysis={}|print_changed={}|dbg={}|extra_c={}|extra_llvm={}",
+            "opt={}|lv={}|slp={}|fm={}|march={}|unroll={}|vw={}|vi={}|interchange={}|distribute={}|extra_c={}|extra_llvm={}",
             self.opt_level.flag(),
             self.enable_loop_vectorize as u8,
             self.enable_slp_vectorize as u8,
-            self.emit_rpass as u8,
-            self.emit_rpass_missed as u8,
-            self.emit_rpass_analysis as u8,
-            self.emit_print_changed as u8,
-            self.emit_debug_info as u8,
+            self.fast_math as u8,
+            self.march_native as u8,
+            self.unroll_loops as u8,
+            self.force_vector_width,
+            self.force_vector_interleave,
+            self.loop_interchange as u8,
+            self.loop_distribute as u8,
             self.extra_c_flags.trim(),
             self.extra_llvm_flags.trim(),
         )
@@ -499,6 +603,9 @@ mod tests {
         assert!(flags.iter().any(|f| f == "-g"));
         assert!(flags.iter().any(|f| f == "-fsave-optimization-record"));
         assert!(flags.iter().any(|f| f == "-print-changed"));
+        assert!(flags.iter().any(|f| f == "-Rpass=loop-vectorize"));
+        assert!(flags.iter().any(|f| f == "-Rpass-missed=loop-vectorize"));
+        assert!(flags.iter().any(|f| f == "-Rpass-analysis=loop-vectorize"));
     }
 
     #[test]
@@ -517,9 +624,59 @@ mod tests {
     fn config_id_changes_when_field_changes() {
         let cfg_a = CompilerConfig::default();
         let cfg_b = CompilerConfig {
-            emit_print_changed: false,
+            fast_math: true,
             ..CompilerConfig::default()
         };
         assert_ne!(cfg_a.config_id(), cfg_b.config_id());
+    }
+
+    #[test]
+    fn runtime_flags_include_fast_math() {
+        let cfg = CompilerConfig {
+            fast_math: true,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-ffast-math"));
+    }
+
+    #[test]
+    fn runtime_flags_include_force_vector_width() {
+        let cfg = CompilerConfig {
+            force_vector_width: ForceVectorWidth::W4,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-force-vector-width=4"));
+    }
+
+    #[test]
+    fn runtime_flags_no_unroll_when_disabled() {
+        let cfg = CompilerConfig {
+            unroll_loops: false,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-fno-unroll-loops"));
+    }
+
+    #[test]
+    fn runtime_flags_include_loop_interchange() {
+        let cfg = CompilerConfig {
+            loop_interchange: true,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-enable-loopinterchange"));
+    }
+
+    #[test]
+    fn runtime_flags_include_loop_distribute() {
+        let cfg = CompilerConfig {
+            loop_distribute: true,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-enable-loop-distribute"));
     }
 }

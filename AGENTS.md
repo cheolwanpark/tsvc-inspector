@@ -21,7 +21,9 @@
 - List-page source text is derived from `tsc.c` and filtered `tsc.inc` sections selected by `#define TESTS ...` for the benchmark; common timing/harness lines are omitted for readability.
 
 ### Compile Config Page
-- Config rows expose compiler knobs only: optimization level, vectorizer toggles, remark toggles, print-changed, debug info, and extra C/LLVM flags.
+- Config rows are grouped into 5 labeled sections: Optimization (opt level, fast math), Vectorization (loop/SLP vectorize, force vector width, force interleave), Loop Transforms (unroll loops, loop interchange, loop distribute), Target (march native), and Advanced (extra C/LLVM flags).
+- Group headers are display-only; navigation (Up/Down) skips them and operates on data rows (0-11) only.
+- Analysis infrastructure flags (`-g`, `-Rpass=...`, `-print-changed`) are always on and not exposed in the UI.
 - `Up`/`Down` moves selected row.
 - `Left`/`Right` changes/toggles selected row.
 - `Enter` toggles config rows or enters/exits text edit mode for extra flag rows.
@@ -78,7 +80,7 @@
 ## Analysis Workflow Notes
 - Optimization-path exploration is primary:
   - Fast tier: parse `-mllvm -print-changed` trace and build function-scoped changed-only timeline with `IrLine` generation and `!dbg` metadata parsing.
-  - When `print-changed` is enabled, analysis compile adds `-mllvm -filter-print-funcs=<selected_symbol>` to keep traces focused and bounded.
+  - Analysis compile always adds `-mllvm -print-changed` and `-mllvm -filter-print-funcs=<selected_symbol>` to keep traces focused and bounded.
 - Runtime (`r`) is secondary and intentionally lightweight; it does not regenerate full IR timelines.
 
 ## Build, Test, and Development Commands
