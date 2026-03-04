@@ -115,7 +115,6 @@ impl DetailFocus {
             Self::IrView => Self::SourceView,
         }
     }
-
 }
 
 pub struct AppState {
@@ -1000,8 +999,7 @@ fn extract_vf_from_remarks(remarks: &[RemarkEntry]) -> Option<u32> {
             for pattern in &["VF = ", "VF="] {
                 if let Some(pos) = msg.find(pattern) {
                     let rest = msg[pos + pattern.len()..].trim_start_matches(' ');
-                    let num: String =
-                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if let Ok(n) = num.parse::<u32>() {
                         return Some(n);
                     }
@@ -1132,7 +1130,10 @@ s161(
     #[test]
     fn detail_source_accessor_returns_unavailable_message_when_missing() {
         let mut app = AppState::new_with_run_mode(
-            vec![benchmark_with_source("A", "int other(void) { return 0; }\n")],
+            vec![benchmark_with_source(
+                "A",
+                "int other(void) { return 0; }\n",
+            )],
             FunctionRunMode::OutputFilter,
         );
         app.selected_function_by_benchmark.insert(
@@ -1425,7 +1426,10 @@ int tail(void) {
         app.select_prev_stage();
         let session = app.active_session_for_selected_benchmark().unwrap();
         let stages = AppState::ordered_stages_with_counts(session);
-        assert_eq!(app.selected_stage, stages[0].0, "should clamp at first stage");
+        assert_eq!(
+            app.selected_stage, stages[0].0,
+            "should clamp at first stage"
+        );
 
         // Navigate to last stage and try to go beyond
         app.selected_stage = stages[stages.len() - 1].0;
@@ -1475,7 +1479,8 @@ int tail(void) {
 
         // Select second pass (index 1)
         app.selected_stage = AnalysisStage::Vectorize;
-        app.selected_pass_by_stage.insert(AnalysisStage::Vectorize, 1);
+        app.selected_pass_by_stage
+            .insert(AnalysisStage::Vectorize, 1);
 
         // Second analysis with only 1 vectorize pass
         app.detail_focus = DetailFocus::PassList; // user already navigated
@@ -1502,7 +1507,10 @@ int tail(void) {
         // Index should clamp: stored=1, len=1, so min(1, 0) = 0
         let session = app.active_session_for_selected_benchmark().unwrap();
         let clamped = app.selected_pass_index_in_stage(session);
-        assert_eq!(clamped, 0, "index should clamp to 0 after reanalysis reduced pass count");
+        assert_eq!(
+            clamped, 0,
+            "index should clamp to 0 after reanalysis reduced pass count"
+        );
     }
 
     #[test]

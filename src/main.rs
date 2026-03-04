@@ -6,6 +6,7 @@ mod input;
 mod model;
 mod parser;
 mod runner;
+mod syntax;
 mod tsvc_patch;
 mod ui;
 
@@ -22,8 +23,8 @@ use crate::app::{AppState, JobEvent, JobOutcome, JobOutcomeData};
 use crate::error::AppResult;
 use crate::input::UserAction;
 use crate::model::{
-    AppPage, BenchmarkFunction, BuildPurpose, CompileProfile, FunctionRunMode, JobKind,
-    LoopResult, RemarkEntry, RemarksSummary,
+    AppPage, BenchmarkFunction, BuildPurpose, CompileProfile, FunctionRunMode, JobKind, LoopResult,
+    RemarkEntry, RemarksSummary,
 };
 use crate::runner::RunnerConfig;
 use crate::tsvc_patch::TsvcPatchOutcome;
@@ -217,9 +218,7 @@ fn run_app(
                         UserAction::BackToBenchmarkList => {
                             if app.is_ir_view_focused() {
                                 app.detail_focus = crate::app::DetailFocus::PassList;
-                            } else if app.is_pass_focused() {
-                                app.detail_focus = crate::app::DetailFocus::StageList;
-                            } else if app.is_source_view_focused() {
+                            } else if app.is_pass_focused() || app.is_source_view_focused() {
                                 app.detail_focus = crate::app::DetailFocus::StageList;
                             } else {
                                 app.back_to_benchmark_list();

@@ -65,23 +65,11 @@ mod tests {
             UserAction::FocusPrevPaneCycle
         );
         // Removed keys return None
-        assert_eq!(
-            map_key_event(key(KeyCode::Char('o'))),
-            UserAction::None
-        );
-        assert_eq!(
-            map_key_event(key(KeyCode::Char('b'))),
-            UserAction::None
-        );
-        assert_eq!(
-            map_key_event(key(KeyCode::Char('X'))),
-            UserAction::None
-        );
+        assert_eq!(map_key_event(key(KeyCode::Char('o'))), UserAction::None);
+        assert_eq!(map_key_event(key(KeyCode::Char('b'))), UserAction::None);
+        assert_eq!(map_key_event(key(KeyCode::Char('X'))), UserAction::None);
         // New bindings
-        assert_eq!(
-            map_key_event(key(KeyCode::Char('a'))),
-            UserAction::Analyze
-        );
+        assert_eq!(map_key_event(key(KeyCode::Char('a'))), UserAction::Analyze);
         assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
     }
 }

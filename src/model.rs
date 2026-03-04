@@ -122,6 +122,7 @@ impl fmt::Display for JobKind {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct LoopResult {
     pub loop_id: String,

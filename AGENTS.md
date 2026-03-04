@@ -3,6 +3,7 @@
 ## Project Structure & Module Organization
 - `src/main.rs` wires CLI parsing, app startup, and the Ratatui event loop.
 - `src/app.rs` owns UI state, page routing (list/detail), per-benchmark sessions, 4-pane detail focus + scroll state, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
+- `src/syntax.rs` provides tree-sitter based syntax highlighting for C and LLVM IR with a bounded in-memory cache and graceful plain-text fallback.
 - `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), runtime/analysis execution, analysis timeline parsing (fast trace + snapshots with `IrLine`/`source_line_map` generation), and TSVC root resolution.
 - `src/model.rs` contains shared domain types (`IrLine`, `AnalysisStep`, `AnalysisStage`, etc.); `src/error.rs` defines common error/result aliases.
 - Build outputs are generated in `target/` and profile-specific folders such as `build-tsvc-o3-remarks-run/` and `build-tsvc-o3-remarks-analysis/`; keep generated artifacts out of commits.
@@ -38,14 +39,16 @@
 
 ### IR View
 - IR View shows full function IR with interleaved diff highlighting:
-  - Inserted lines: `+ ` prefix, white text on green background.
-  - Deleted lines: `- ` prefix, white text on red background.
-  - Unchanged lines: `  ` prefix, normal style.
+  - Inserted lines: `+ ` prefix with syntax-highlighted text over a dark green background (`IR_INSERT_BG`).
+  - Deleted lines: `- ` prefix with syntax-highlighted text over a dark red background (`IR_DELETE_BG`).
+  - Unchanged lines: `  ` prefix with syntax-highlighted text over a dark code background (`CODE_BG`).
 - IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag`) per `AnalysisStep`.
+- LLVM IR syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-llvm`, and diff backgrounds remain visible via style patching.
 
 ### C Source Panel (Detail)
 - Shows only the selected target function's C source with line numbers.
 - Function text is extracted from the benchmark's kernel-focused source; if extraction fails, the panel shows an explicit unavailable message.
+- C syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-c` in both list-page and detail-page source panels.
 - `!dbg` metadata in IR is parsed to build `source_line_map` for potential C<->IR matching.
 - Note: `!dbg` line numbers are absolute file positions; the source panel shows a function-only excerpt with different numbering, so C<->IR highlighting is not yet functional (degrades gracefully with no highlights).
 

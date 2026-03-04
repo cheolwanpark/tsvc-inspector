@@ -7,8 +7,8 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::error::AppResult;
 use crate::model::{
-    AnalysisSource, AnalysisStage, AnalysisStep, IrDiffStep, IrLine, LoopResult,
-    OptimizationStep, RemarkEntry, RemarkKind,
+    AnalysisSource, AnalysisStage, AnalysisStep, IrDiffStep, IrLine, LoopResult, OptimizationStep,
+    RemarkEntry, RemarkKind,
 };
 
 #[allow(dead_code)]
@@ -296,13 +296,13 @@ pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, u32> {
     let re = Regex::new(r"!(\d+) = !DILocation\(line: (\d+)").expect("valid DILocation regex");
     let mut map = HashMap::new();
     for caps in re.captures_iter(module_ir) {
-        if let (Some(id_match), Some(line_match)) = (caps.get(1), caps.get(2)) {
-            if let (Ok(id), Ok(line)) = (
+        if let (Some(id_match), Some(line_match)) = (caps.get(1), caps.get(2))
+            && let (Ok(id), Ok(line)) = (
                 id_match.as_str().parse::<u32>(),
                 line_match.as_str().parse::<u32>(),
-            ) {
-                map.insert(id, line);
-            }
+            )
+        {
+            map.insert(id, line);
         }
     }
     map
@@ -1099,12 +1099,8 @@ entry:
                 snapshot: String::from("define void @foo() {\n  %x = add i32 1, 2\n  ret void\n}"),
             },
         ];
-        let steps = build_analysis_steps_from_snapshots(
-            &snapshots,
-            "foo",
-            &[],
-            AnalysisSource::TraceFast,
-        );
+        let steps =
+            build_analysis_steps_from_snapshots(&snapshots, "foo", &[], AnalysisSource::TraceFast);
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[1].target_function.as_deref(), Some("foo"));
         assert_eq!(steps[1].source, AnalysisSource::TraceFast);
@@ -1161,12 +1157,10 @@ define void @foo() !dbg !5 {
 
     #[test]
     fn source_line_map_graceful_when_no_dbg() {
-        let ir_lines = vec![
-            IrLine {
-                tag: ChangeTag::Equal,
-                text: String::from("  %x = add i32 1, 2"),
-            },
-        ];
+        let ir_lines = vec![IrLine {
+            tag: ChangeTag::Equal,
+            text: String::from("  %x = add i32 1, 2"),
+        }];
         let dbg_locations = HashMap::new();
         let map = build_source_line_map(&ir_lines, &dbg_locations);
         assert_eq!(map, vec![None]);

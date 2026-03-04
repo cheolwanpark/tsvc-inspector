@@ -9,7 +9,16 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use similar::ChangeTag;
 
 use crate::app::{AppState, has_vectorizer_ir_changes};
-use crate::model::{AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession};
+use crate::model::{
+    AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession,
+};
+use crate::syntax::{self, StyledChunk, SyntaxLang};
+
+const CODE_BG: Color = Color::Rgb(14, 20, 28);
+const CODE_TEXT_FG: Color = Color::Gray;
+const SOURCE_LINE_HIGHLIGHT_BG: Color = Color::Rgb(44, 52, 64);
+const IR_INSERT_BG: Color = Color::Rgb(19, 70, 35);
+const IR_DELETE_BG: Color = Color::Rgb(90, 28, 28);
 
 pub fn render(frame: &mut Frame, app: &AppState) {
     match app.page {
@@ -112,7 +121,12 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
     let line = Line::from(vec![
         Span::raw(left),
         Span::raw("     "),
-        Span::styled(verdict_text, Style::default().fg(verdict_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            verdict_text,
+            Style::default()
+                .fg(verdict_color)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
 
     let header = Paragraph::new(line).block(Block::bordered().title("Detail"));
@@ -151,9 +165,7 @@ fn render_stage_list(frame: &mut Frame, app: &AppState, area: ratatui::layout::R
         return;
     }
 
-    let selected_pos = stages
-        .iter()
-        .position(|(s, _)| *s == app.selected_stage);
+    let selected_pos = stages.iter().position(|(s, _)| *s == app.selected_stage);
 
     let items: Vec<ListItem> = stages
         .iter()
@@ -204,8 +216,7 @@ fn render_pass_list_panel(frame: &mut Frame, app: &AppState, area: ratatui::layo
     let passes = AppState::passes_for_stage(session, app.selected_stage);
     if passes.is_empty() {
         frame.render_widget(
-            Paragraph::new("No passes in this stage")
-                .block(Block::bordered().title(title)),
+            Paragraph::new("No passes in this stage").block(Block::bordered().title(title)),
             area,
         );
         return;
@@ -277,31 +288,38 @@ fn render_detail_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::
 
     // Collect highlighted source lines from current step's source_line_map + visible IR range
     let highlighted_lines = collect_highlighted_source_lines(app);
+    let highlighted_source = syntax::highlight(SyntaxLang::C, &source_text);
 
     let lines: Vec<Line> = source_text
         .lines()
         .enumerate()
         .map(|(i, l)| {
             let line_num = (i + 1) as u32;
-            let prefix = if highlighted_lines.contains(&line_num) {
+            let line_emphasis_style = if highlighted_lines.contains(&line_num) {
+                Some(Style::default().bg(SOURCE_LINE_HIGHLIGHT_BG))
+            } else {
+                None
+            };
+            let prefix_char = if line_emphasis_style.is_some() {
                 "*"
             } else {
                 " "
             };
-            let text = format!("{prefix}{:>3}| {}", line_num, l);
-            if highlighted_lines.contains(&line_num) {
-                Line::from(Span::styled(
-                    text,
-                    Style::default().bg(Color::DarkGray).fg(Color::Yellow),
-                ))
+            let prefix = format!("{prefix_char}{:>3}| ", line_num);
+            let prefix_style = if let Some(base) = line_emphasis_style {
+                base.patch(Style::default().fg(Color::Yellow))
             } else {
-                Line::from(text)
-            }
+                Style::default().bg(CODE_BG).fg(CODE_TEXT_FG)
+            };
+            let highlighted = highlighted_source.get(i).map(Vec::as_slice);
+
+            prefixed_highlighted_line(&prefix, prefix_style, highlighted, l, line_emphasis_style)
         })
         .collect();
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
         .scroll((app.source_detail_scroll, 0));
     frame.render_widget(paragraph, area);
 }
@@ -323,10 +341,8 @@ fn collect_highlighted_source_lines(app: &AppState) -> HashSet<u32> {
     let start = app.ir_scroll as usize;
     // Estimate visible height as ~20 lines (will be adjusted by actual terminal size)
     let end = (start + 40).min(step.source_line_map.len());
-    for opt in &step.source_line_map[start..end] {
-        if let Some(line) = opt {
-            result.insert(*line);
-        }
+    for line in step.source_line_map[start..end].iter().flatten() {
+        result.insert(*line);
     }
     result
 }
@@ -365,35 +381,45 @@ fn render_ir_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout
         let lines: Vec<Line> = step.diff_text.lines().map(|l| color_diff_line(l)).collect();
         let paragraph = Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(title))
+            .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
             .scroll((app.ir_scroll, 0));
         frame.render_widget(paragraph, area);
         return;
     }
 
+    let ir_text = step
+        .ir_lines
+        .iter()
+        .map(|ir_line| ir_line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let highlighted_ir = syntax::highlight(SyntaxLang::LlvmIr, &ir_text);
+
     let lines: Vec<Line> = step
         .ir_lines
         .iter()
-        .map(|ir_line| {
-            let (prefix, style) = match ir_line.tag {
-                ChangeTag::Insert => (
-                    "+ ",
-                    Style::default().fg(Color::White).bg(Color::Green),
-                ),
-                ChangeTag::Delete => (
-                    "- ",
-                    Style::default().fg(Color::White).bg(Color::Red),
-                ),
-                ChangeTag::Equal => ("  ", Style::default()),
+        .enumerate()
+        .map(|(idx, ir_line)| {
+            let (prefix, base_style) = match ir_line.tag {
+                ChangeTag::Insert => ("+ ", Style::default().fg(Color::White).bg(IR_INSERT_BG)),
+                ChangeTag::Delete => ("- ", Style::default().fg(Color::White).bg(IR_DELETE_BG)),
+                ChangeTag::Equal => ("  ", Style::default().fg(CODE_TEXT_FG).bg(CODE_BG)),
             };
-            Line::from(Span::styled(
-                format!("{prefix}{}", ir_line.text),
-                style,
-            ))
+
+            let highlighted = highlighted_ir.get(idx).map(Vec::as_slice);
+            prefixed_highlighted_line(
+                prefix,
+                base_style,
+                highlighted,
+                &ir_line.text,
+                Some(base_style),
+            )
         })
         .collect();
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
         .scroll((app.ir_scroll, 0));
     frame.render_widget(paragraph, area);
 }
@@ -454,15 +480,18 @@ fn render_benchmark_source_code(frame: &mut Frame, app: &AppState, area: ratatui
     let lines = if benchmark.source_code.trim().is_empty() {
         vec![Line::from("No source text available.")]
     } else {
+        let highlighted = syntax::highlight(SyntaxLang::C, &benchmark.source_code);
         benchmark
             .source_code
             .lines()
-            .map(|line| Line::from(line.to_string()))
+            .enumerate()
+            .map(|(i, line)| highlighted_line(highlighted.get(i).map(Vec::as_slice), line, None))
             .collect()
     };
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
         .scroll((app.list_source_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -548,6 +577,58 @@ fn centered_rect(
     centered
 }
 
+fn highlighted_line(
+    highlighted: Option<&[StyledChunk]>,
+    plain: &str,
+    overlay_style: Option<Style>,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    append_highlighted_spans(&mut spans, highlighted, plain, overlay_style);
+    Line::from(spans)
+}
+
+fn prefixed_highlighted_line(
+    prefix: &str,
+    prefix_style: Style,
+    highlighted: Option<&[StyledChunk]>,
+    plain: &str,
+    overlay_style: Option<Style>,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(prefix.to_string(), prefix_style));
+    append_highlighted_spans(&mut spans, highlighted, plain, overlay_style);
+    Line::from(spans)
+}
+
+fn append_highlighted_spans(
+    spans: &mut Vec<Span<'static>>,
+    highlighted: Option<&[StyledChunk]>,
+    plain: &str,
+    overlay_style: Option<Style>,
+) {
+    let style_with_overlay =
+        |style: Style| overlay_style.map_or(style, |overlay| overlay.patch(style));
+
+    if let Some(chunks) = highlighted
+        && !chunks.is_empty()
+    {
+        for chunk in chunks {
+            spans.push(Span::styled(
+                chunk.text.clone(),
+                style_with_overlay(chunk.style),
+            ));
+        }
+        return;
+    }
+
+    if !plain.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(
+            plain.to_string(),
+            style_with_overlay(Style::default()),
+        ));
+    }
+}
+
 // --- Helper functions ---
 
 fn pass_display_name(pass_key: &str) -> &str {
@@ -606,8 +687,7 @@ fn extract_vf_from_session(session: &RunSession) -> Option<u32> {
             for pattern in &["VF = ", "VF="] {
                 if let Some(pos) = msg.find(pattern) {
                     let rest = msg[pos + pattern.len()..].trim_start_matches(' ');
-                    let num: String =
-                        rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if let Ok(n) = num.parse::<u32>() {
                         return Some(n);
                     }
@@ -628,11 +708,7 @@ fn pass_remark_summary(step: &AnalysisStep, remarks: &[RemarkEntry]) -> (char, S
             RemarkKind::Missed => '\u{2717}',
             _ => '\u{2014}',
         };
-        let msg = r
-            .message
-            .as_deref()
-            .unwrap_or(r.name.as_str())
-            .to_string();
+        let msg = r.message.as_deref().unwrap_or(r.name.as_str()).to_string();
         return (icon, msg);
     }
     ('\u{2014}', String::from("no remarks"))
