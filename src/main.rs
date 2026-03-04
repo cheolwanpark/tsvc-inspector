@@ -201,8 +201,8 @@ fn run_app(
                     AppPage::BenchmarkList => match action {
                         UserAction::MoveUp => app.list_move_up(),
                         UserAction::MoveDown => app.list_move_down(),
-                        UserAction::FocusPrevPane => app.focus_prev_list_pane(),
-                        UserAction::FocusNextPane => app.focus_next_list_pane(),
+                        UserAction::FocusNextPaneCycle => app.focus_next_list_pane(),
+                        UserAction::FocusPrevPaneCycle => app.focus_prev_list_pane(),
                         UserAction::Confirm => app.open_function_select_modal(),
                         UserAction::Run | UserAction::Analyze => {
                             app.set_status_message(
@@ -214,16 +214,24 @@ fn run_app(
                     AppPage::BenchmarkDetail => match action {
                         UserAction::MoveUp => app.detail_move_up(),
                         UserAction::MoveDown => app.detail_move_down(),
-                        UserAction::BackToBenchmarkList => app.back_to_benchmark_list(),
-                        UserAction::FocusPrevPane => app.focus_prev_pane(),
-                        UserAction::FocusNextPane => app.focus_next_pane(),
+                        UserAction::BackToBenchmarkList => {
+                            if app.is_ir_view_focused() {
+                                app.detail_focus = crate::app::DetailFocus::PassList;
+                            } else if app.is_pass_focused() {
+                                app.detail_focus = crate::app::DetailFocus::StageList;
+                            } else if app.is_source_view_focused() {
+                                app.detail_focus = crate::app::DetailFocus::StageList;
+                            } else {
+                                app.back_to_benchmark_list();
+                            }
+                        }
+                        UserAction::FocusNextPaneCycle => app.focus_cycle_next(),
+                        UserAction::FocusPrevPaneCycle => app.focus_cycle_prev(),
                         UserAction::Confirm => {
                             if app.is_stage_focused() {
-                                app.focus_next_pane();
+                                app.detail_focus = crate::app::DetailFocus::PassList;
                             } else if app.is_pass_focused() {
-                                app.enter_diff_view();
-                            } else if app.is_diff_focused() {
-                                app.exit_diff_view();
+                                app.detail_focus = crate::app::DetailFocus::IrView;
                             }
                         }
                         UserAction::CycleProfile => app.cycle_profile(),

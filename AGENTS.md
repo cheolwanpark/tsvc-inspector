@@ -2,34 +2,56 @@
 
 ## Project Structure & Module Organization
 - `src/main.rs` wires CLI parsing, app startup, and the Ratatui event loop.
-- `src/app.rs` owns UI state, page routing (list/detail), per-benchmark sessions, list/detail focus + scroll state, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
-- `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), runtime/analysis execution, analysis timeline parsing (fast trace + deep snapshots), and TSVC root resolution.
-- `src/model.rs` contains shared domain types; `src/error.rs` defines common error/result aliases.
+- `src/app.rs` owns UI state, page routing (list/detail), per-benchmark sessions, 4-pane detail focus + scroll state, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
+- `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), runtime/analysis execution, analysis timeline parsing (fast trace + snapshots with `IrLine`/`source_line_map` generation), and TSVC root resolution.
+- `src/model.rs` contains shared domain types (`IrLine`, `AnalysisStep`, `AnalysisStage`, etc.); `src/error.rs` defines common error/result aliases.
 - Build outputs are generated in `target/` and profile-specific folders such as `build-tsvc-o3-remarks-run/` and `build-tsvc-o3-remarks-analysis/`; keep generated artifacts out of commits.
 
 ## TUI Navigation Model
 - The app has two pages: `Benchmark List` and `Benchmark Detail`.
 - `Enter` on list opens an intermediate `Select Function` modal first.
 - In `Select Function` modal: `Up`/`Down` moves selection, `Enter` confirms and opens detail, `Esc` cancels.
-- `Esc` on detail returns to the list page.
-- Runtime keys (`b`, `r`, `a`) and analysis keys (`x`, `X`) are active on the benchmark detail page only.
-- `x` runs fast analysis (trace-based function timeline).
-- `X` runs deep analysis (windowed `opt` bisect snapshots around selected step).
 - Benchmark list page has two focus panes: `Benchmarks` and `C Source (kernel-focused)`.
-- On list page, `Left`/`Right` switches focus between `Benchmarks` and `C Source`.
+- On list page, `Tab`/`Shift-Tab` switches focus between `Benchmarks` and `C Source`.
 - On list page, `Up`/`Down` acts on the focused pane:
   - `Benchmarks` focus: move selected benchmark.
   - `C Source` focus: scroll source text.
 - List-page source text is derived from `tsc.c` and filtered `tsc.inc` sections selected by `#define TESTS ...` for the benchmark; common timing/harness lines are omitted for readability.
-- Benchmark detail page has two focus panes: `IR Steps` and `IR Diff`.
-- On detail page, `Left`/`Right` switches focus between `IR Steps` and `IR Diff`.
-- On detail page, `Up`/`Down` acts on the focused pane:
-  - `IR Steps` focus: move selected optimization step.
-  - `IR Diff` focus: scroll IR diff text.
-- `o` toggles remarks/analysis overlay on top of the IR diff.
+
+### Benchmark Detail Page (2x2 Grid Layout)
+- The detail page uses a 2x2 grid layout:
+  - **Top row (30%)**: Stage list (25% width) | Pass list (75% width)
+  - **Bottom row (70%)**: C Source (35% width) | IR View (65% width)
+- Four focus panes: `StageList`, `PassList`, `SourceView`, `IrView`.
+- `Tab`/`Shift-Tab` cycles through all 4 panes (wrapping around).
+- `Up`/`Down` acts on the focused pane:
+  - `StageList`: move selected analysis stage.
+  - `PassList`: move selected pass within stage.
+  - `SourceView`: scroll C source text.
+  - `IrView`: scroll full-function IR (interleaved diff view).
+- `Enter`: StageList -> PassList, PassList -> IrView.
+- `Esc`: IrView -> PassList -> StageList -> back to list page.
+- `a` runs analysis, `r` runs build+run, `p` cycles profile, `c` clears session.
 - Detail sessions are scoped per `benchmark + selected function`.
 - Function selection is required before entering detail.
-- IR-step rows show metadata such as raw pass index, stage, pass occurrence, source (`trace`/`deep`), and matched-remark counts.
+- Minimum terminal size: 100x30.
+
+### IR View
+- IR View shows full function IR with interleaved diff highlighting:
+  - Inserted lines: `+ ` prefix, white text on green background.
+  - Deleted lines: `- ` prefix, white text on red background.
+  - Unchanged lines: `  ` prefix, normal style.
+- IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag`) per `AnalysisStep`.
+
+### C Source Panel (Detail)
+- Shows C source with line numbers.
+- `!dbg` metadata in IR is parsed to build `source_line_map` for potential C<->IR matching.
+- Note: `!dbg` line numbers are absolute file positions; the source panel shows a kernel excerpt with different numbering, so C<->IR highlighting is not yet functional (degrades gracefully with no highlights).
+
+### Verdict System
+- Header shows vectorization verdict based on optimization remarks.
+- Verdict fallback: when remarks are empty but `loopvectorize`/`slpvectorizer` passes made IR changes, shows "~ LIKELY VECTORIZED" (Cyan).
+- Analysis compile flags include `-g` to enable `!dbg` metadata in IR output.
 
 ## Function-Selective Run Notes
 - The app supports function-selective runs with two modes:
@@ -40,10 +62,8 @@
 
 ## Analysis Workflow Notes
 - Optimization-path exploration is primary:
-  - Fast tier: parse `-mllvm -print-changed` trace and build function-scoped changed-only timeline.
-  - Deep tier: compile `tsc.c` to bitcode and reconstruct a local pass window via `opt -opt-bisect-limit`.
-- Runtime (`b`/`r`/`a`) is secondary and intentionally lightweight; it does not regenerate full IR timelines.
-- Running runtime jobs after analysis marks analysis state as `stale`; users should rerun `x` or `X` for refreshed IR steps.
+  - Fast tier: parse `-mllvm -print-changed` trace and build function-scoped changed-only timeline with `IrLine` generation and `!dbg` metadata parsing.
+- Runtime (`r`) is secondary and intentionally lightweight; it does not regenerate full IR timelines.
 
 ## Build, Test, and Development Commands
 - `cargo check`: fast compile validation during development.

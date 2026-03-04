@@ -1,5 +1,13 @@
 use std::fmt;
 
+use similar::ChangeTag;
+
+#[derive(Clone, Debug)]
+pub struct IrLine {
+    pub tag: ChangeTag,
+    pub text: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct BenchmarkItem {
     pub name: String,
@@ -43,13 +51,13 @@ impl CompileProfile {
             (Self::O3NoVec, BuildPurpose::Runtime) => "-O3 -fno-vectorize -fno-slp-vectorize",
             (Self::O3Default, BuildPurpose::Runtime) => "-O3",
             (Self::O3Remarks, BuildPurpose::Analysis) => {
-                "-O3 -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
+                "-O3 -g -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
             }
             (Self::O3NoVec, BuildPurpose::Analysis) => {
-                "-O3 -fno-vectorize -fno-slp-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
+                "-O3 -g -fno-vectorize -fno-slp-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
             }
             (Self::O3Default, BuildPurpose::Analysis) => {
-                "-O3 -fsave-optimization-record -mllvm -print-changed"
+                "-O3 -g -fsave-optimization-record -mllvm -print-changed"
             }
         }
     }
@@ -269,6 +277,8 @@ pub struct AnalysisStep {
     pub target_function: Option<String>,
     pub changed_lines: usize,
     pub diff_text: String,
+    pub ir_lines: Vec<IrLine>,
+    pub source_line_map: Vec<Option<u32>>,
     pub remark_indices: Vec<usize>,
     #[allow(dead_code)]
     pub source: AnalysisSource,

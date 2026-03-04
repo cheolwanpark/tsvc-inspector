@@ -1,10 +1,14 @@
+use std::collections::HashSet;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::AppState;
+use similar::ChangeTag;
+
+use crate::app::{AppState, has_vectorizer_ir_changes};
 use crate::model::{AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession};
 
 pub fn render(frame: &mut Frame, app: &AppState) {
@@ -35,10 +39,10 @@ fn render_benchmark_list_page(frame: &mut Frame, app: &AppState) {
 
 fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
-    if area.width < 80 || area.height < 24 {
+    if area.width < 100 || area.height < 30 {
         frame.render_widget(
             Paragraph::new(format!(
-                "Terminal too small (80×24 minimum). Current: {}×{}",
+                "Terminal too small (100x30 minimum). Current: {}x{}",
                 area.width, area.height
             )),
             area,
@@ -54,10 +58,22 @@ fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
     let [header_area, main_area, footer_area] = vertical.areas(area);
     render_detail_header(frame, app, header_area);
 
-    let horizontal = Layout::horizontal([Constraint::Percentage(22), Constraint::Percentage(78)]);
-    let [stage_area, right_area] = horizontal.areas(main_area);
+    // 2x2 grid: top row (30%) and bottom row (70%)
+    let rows = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]);
+    let [top_row, bottom_row] = rows.areas(main_area);
+
+    // Top row: stage list (25%) | pass list (75%)
+    let top_cols = Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)]);
+    let [stage_area, pass_area] = top_cols.areas(top_row);
+
+    // Bottom row: C source (35%) | IR view (65%)
+    let bottom_cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]);
+    let [source_area, ir_area] = bottom_cols.areas(bottom_row);
+
     render_stage_list(frame, app, stage_area);
-    render_right_panel(frame, app, right_area);
+    render_pass_list_panel(frame, app, pass_area);
+    render_detail_source_panel(frame, app, source_area);
+    render_ir_view_panel(frame, app, ir_area);
     render_detail_footer(frame, app, footer_area);
 }
 
@@ -90,9 +106,9 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
     let session = app.active_session_for_selected_benchmark();
     let (verdict_text, verdict_color) = session
         .map(format_verdict)
-        .unwrap_or_else(|| ("—".to_string(), Color::DarkGray));
+        .unwrap_or_else(|| ("\u{2014}".to_string(), Color::DarkGray));
 
-    let left = format!("{benchmark_name} · {loop_id} · {profile}");
+    let left = format!("{benchmark_name} \u{00b7} {loop_id} \u{00b7} {profile}");
     let line = Line::from(vec![
         Span::raw(left),
         Span::raw("     "),
@@ -120,7 +136,7 @@ fn render_stage_list(frame: &mut Frame, app: &AppState, area: ratatui::layout::R
 
     if session.analysis_state == AnalysisState::Running {
         frame.render_widget(
-            Paragraph::new("⟳ Analyzing...").block(Block::bordered().title(title)),
+            Paragraph::new("\u{27f3} Analyzing...").block(Block::bordered().title(title)),
             area,
         );
         return;
@@ -143,7 +159,7 @@ fn render_stage_list(frame: &mut Frame, app: &AppState, area: ratatui::layout::R
         .iter()
         .map(|(stage, count)| {
             let marker = if *stage == AnalysisStage::Vectorize {
-                "★"
+                "\u{2605}"
             } else {
                 " "
             };
@@ -166,82 +182,10 @@ fn render_stage_list(frame: &mut Frame, app: &AppState, area: ratatui::layout::R
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_right_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let source_lines = app
-        .selected_benchmark()
-        .map(|b| b.source_code.lines().count())
-        .unwrap_or(0);
-    let source_h = (source_lines.clamp(3, 10) as u16) + 2;
-
-    let pass_count = app
-        .active_session_for_selected_benchmark()
-        .map(|s| AppState::passes_for_stage(s, app.selected_stage).len())
-        .unwrap_or(0);
-    let pass_h = (pass_count.clamp(2, 8) as u16) + 2;
-
-    let vertical = Layout::vertical([
-        Constraint::Length(source_h),
-        Constraint::Length(pass_h),
-        Constraint::Min(5),
-    ]);
-    let [source_area, pass_area, detail_area] = vertical.areas(area);
-
-    render_c_source_panel(frame, app, source_area);
-    render_pass_list_panel(frame, app, pass_area);
-    render_pass_detail_panel(frame, app, detail_area);
-}
-
-fn render_c_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let Some(benchmark) = app.selected_benchmark() else {
-        frame.render_widget(
-            Paragraph::new("Source not available").block(Block::bordered().title("C Source")),
-            area,
-        );
-        return;
-    };
-
-    let mut lines: Vec<Line> = if benchmark.source_code.trim().is_empty() {
-        vec![Line::from("(source not available)".dark_gray())]
-    } else {
-        benchmark
-            .source_code
-            .lines()
-            .map(|l| Line::from(l.to_string()))
-            .collect()
-    };
-
-    let session = app.active_session_for_selected_benchmark();
-    let runtime_line = if let Some(s) = session {
-        if let Some(result) = s.loop_results.first() {
-            format!(
-                "Runtime: {:.3}ms · Checksum: {}",
-                result.time_sec * 1000.0,
-                result.checksum
-            )
-        } else {
-            String::from("(not run yet)")
-        }
-    } else {
-        String::from("(not run yet)")
-    };
-
-    lines.push(Line::from(Span::styled(
-        "─".repeat(40),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        runtime_line,
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let paragraph = Paragraph::new(Text::from(lines)).block(Block::bordered().title("C Source"));
-    frame.render_widget(paragraph, area);
-}
-
 fn render_pass_list_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let stage_label = app.selected_stage.ui_label();
     let is_vectorize = app.selected_stage == AnalysisStage::Vectorize;
-    let star = if is_vectorize { " ★" } else { "" };
+    let star = if is_vectorize { " \u{2605}" } else { "" };
     let title_base = format!("Passes in {stage_label}{star}");
     let title = if app.is_pass_focused() {
         format!("{title_base} [Focus]")
@@ -275,17 +219,17 @@ fn render_pass_list_panel(frame: &mut Frame, app: &AppState, area: ratatui::layo
         .map(|(i, step)| {
             let (icon, _msg) = pass_remark_summary(step, &session.remarks);
             let marker = if step.stage == AnalysisStage::Vectorize {
-                "★"
+                "\u{2605}"
             } else {
                 " "
             };
-            let cursor = if i == selected_idx && app.is_diff_focused() {
-                "◀"
+            let cursor = if i == selected_idx && app.is_ir_view_focused() {
+                "\u{25c0}"
             } else {
                 " "
             };
             let text = format!(
-                "{marker} {}  {} [Δ{}] {cursor}",
+                "{marker} {}  {} [\u{0394}{}] {cursor}",
                 pass_display_name(&step.pass_key),
                 icon,
                 step.changed_lines,
@@ -308,11 +252,91 @@ fn render_pass_list_panel(frame: &mut Frame, app: &AppState, area: ratatui::layo
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_pass_detail_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let title = if app.is_diff_focused() {
-        "IR Diff [Focus]"
+fn render_detail_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let title = if app.is_source_view_focused() {
+        "C Source [Focus]"
     } else {
-        "IR Diff"
+        "C Source"
+    };
+
+    let Some(benchmark) = app.selected_benchmark() else {
+        frame.render_widget(
+            Paragraph::new("Source not available").block(Block::bordered().title(title)),
+            area,
+        );
+        return;
+    };
+
+    if benchmark.source_code.trim().is_empty() {
+        frame.render_widget(
+            Paragraph::new("(source not available)").block(Block::bordered().title(title)),
+            area,
+        );
+        return;
+    }
+
+    // Collect highlighted source lines from current step's source_line_map + visible IR range
+    let highlighted_lines = collect_highlighted_source_lines(app);
+
+    let lines: Vec<Line> = benchmark
+        .source_code
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let line_num = (i + 1) as u32;
+            let prefix = if highlighted_lines.contains(&line_num) {
+                "*"
+            } else {
+                " "
+            };
+            let text = format!("{prefix}{:>3}| {}", line_num, l);
+            if highlighted_lines.contains(&line_num) {
+                Line::from(Span::styled(
+                    text,
+                    Style::default().bg(Color::DarkGray).fg(Color::Yellow),
+                ))
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title(title))
+        .scroll((app.source_detail_scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
+/// Collect source line numbers that correspond to currently visible IR lines.
+fn collect_highlighted_source_lines(app: &AppState) -> HashSet<u32> {
+    let mut result = HashSet::new();
+
+    let Some(session) = app.active_session_for_selected_benchmark() else {
+        return result;
+    };
+    let Some(step) = app.selected_step_in_stage(session) else {
+        return result;
+    };
+    if step.source_line_map.is_empty() {
+        return result;
+    }
+
+    let start = app.ir_scroll as usize;
+    // Estimate visible height as ~20 lines (will be adjusted by actual terminal size)
+    let end = (start + 40).min(step.source_line_map.len());
+    for opt in &step.source_line_map[start..end] {
+        if let Some(line) = opt {
+            result.insert(*line);
+        }
+    }
+    result
+}
+
+fn render_ir_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let title = if app.is_ir_view_focused() {
+        "IR View [Focus]"
+    } else {
+        "IR View"
     };
 
     let Some(session) = app.active_session_for_selected_benchmark() else {
@@ -326,8 +350,8 @@ fn render_pass_detail_panel(frame: &mut Frame, app: &AppState, area: ratatui::la
     let Some(step) = app.selected_step_in_stage(session) else {
         let hint = match session.analysis_state {
             AnalysisState::None => "Press 'a' to analyze",
-            AnalysisState::Running => "⟳ Analyzing...",
-            AnalysisState::Ready => "Select a pass above",
+            AnalysisState::Running => "\u{27f3} Analyzing...",
+            AnalysisState::Ready => "Select a pass",
             AnalysisState::Failed => "Analysis failed",
         };
         frame.render_widget(
@@ -337,35 +361,41 @@ fn render_pass_detail_panel(frame: &mut Frame, app: &AppState, area: ratatui::la
         return;
     };
 
-    let (icon, remark_msg) = pass_remark_summary(step, &session.remarks);
-    let display_name = pass_display_name(&step.pass_key);
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            display_name.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("{icon} {remark_msg}")),
-        Line::from(Span::styled(
-            "── IR Diff ↕ ─────────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    if step.diff_text.trim().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "(no diff for this pass)",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for line in step.diff_text.lines() {
-            lines.push(color_diff_line(line));
-        }
+    if step.ir_lines.is_empty() {
+        // Fallback: show unified diff text if ir_lines not populated
+        let lines: Vec<Line> = step.diff_text.lines().map(|l| color_diff_line(l)).collect();
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(Block::bordered().title(title))
+            .scroll((app.ir_scroll, 0));
+        frame.render_widget(paragraph, area);
+        return;
     }
+
+    let lines: Vec<Line> = step
+        .ir_lines
+        .iter()
+        .map(|ir_line| {
+            let (prefix, style) = match ir_line.tag {
+                ChangeTag::Insert => (
+                    "+ ",
+                    Style::default().fg(Color::White).bg(Color::Green),
+                ),
+                ChangeTag::Delete => (
+                    "- ",
+                    Style::default().fg(Color::White).bg(Color::Red),
+                ),
+                ChangeTag::Equal => ("  ", Style::default()),
+            };
+            Line::from(Span::styled(
+                format!("{prefix}{}", ir_line.text),
+                style,
+            ))
+        })
+        .collect();
 
     let paragraph = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title(title))
-        .scroll((app.diff_scroll, 0));
+        .scroll((app.ir_scroll, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -440,7 +470,7 @@ fn render_benchmark_source_code(frame: &mut Frame, app: &AppState, area: ratatui
 }
 
 fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "q quit | ←→ focus pane | ↑↓ select-or-scroll | enter select function";
+    let hints = "q quit | \u{2190}\u{2192} focus pane | \u{2191}\u{2193} select-or-scroll | enter select function";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -451,7 +481,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "q quit · esc back · ←→ focus · ↑↓ navigate · ↵ confirm · a analyze · r run · p profile · c clear";
+    let hints = "Tab/S-Tab cycle pane \u{00b7} \u{2191}\u{2193} navigate \u{00b7} a analyze \u{00b7} r run \u{00b7} p profile \u{00b7} c clear";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -494,7 +524,7 @@ fn render_function_select_modal(frame: &mut Frame, app: &AppState) {
     }
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    let hint = Paragraph::new("↑↓ move | enter confirm | esc cancel")
+    let hint = Paragraph::new("\u{2191}\u{2193} move | enter confirm | esc cancel")
         .block(Block::bordered().title("Modal"));
     frame.render_widget(hint, hint_area);
 }
@@ -544,26 +574,28 @@ fn pass_display_name(pass_key: &str) -> &str {
 
 fn format_verdict(session: &RunSession) -> (String, Color) {
     match session.analysis_state {
-        AnalysisState::Running => ("⟳ Analyzing...".to_string(), Color::Cyan),
-        AnalysisState::Failed => ("✗ Analysis Failed".to_string(), Color::Red),
+        AnalysisState::Running => ("\u{27f3} Analyzing...".to_string(), Color::Cyan),
+        AnalysisState::Failed => ("\u{2717} Analysis Failed".to_string(), Color::Red),
         AnalysisState::Ready => {
             let summary = &session.remarks_summary;
             if summary.vectorized > 0 {
                 let vf = extract_vf_from_session(session);
                 let verdict = match vf {
-                    Some(n) => format!("✓ VECTORIZED  VF={n}"),
-                    None => "✓ VECTORIZED".to_string(),
+                    Some(n) => format!("\u{2713} VECTORIZED  VF={n}"),
+                    None => "\u{2713} VECTORIZED".to_string(),
                 };
                 (verdict, Color::Green)
             } else if summary.missed_details > 0 {
-                ("✗ NOT VECTORIZED".to_string(), Color::Red)
+                ("\u{2717} NOT VECTORIZED".to_string(), Color::Red)
             } else if summary.not_beneficial > 0 {
-                ("○ SKIPPED".to_string(), Color::Yellow)
+                ("\u{25cb} SKIPPED".to_string(), Color::Yellow)
+            } else if has_vectorizer_ir_changes(session) {
+                ("~ LIKELY VECTORIZED".to_string(), Color::Cyan)
             } else {
-                ("—".to_string(), Color::DarkGray)
+                ("\u{2014}".to_string(), Color::DarkGray)
             }
         }
-        AnalysisState::None => ("—".to_string(), Color::DarkGray),
+        AnalysisState::None => ("\u{2014}".to_string(), Color::DarkGray),
     }
 }
 
@@ -593,9 +625,9 @@ fn pass_remark_summary(step: &AnalysisStep, remarks: &[RemarkEntry]) -> (char, S
             continue;
         };
         let icon = match r.kind {
-            RemarkKind::Passed => '✓',
-            RemarkKind::Missed => '✗',
-            _ => '—',
+            RemarkKind::Passed => '\u{2713}',
+            RemarkKind::Missed => '\u{2717}',
+            _ => '\u{2014}',
         };
         let msg = r
             .message
@@ -604,7 +636,7 @@ fn pass_remark_summary(step: &AnalysisStep, remarks: &[RemarkEntry]) -> (char, S
             .to_string();
         return (icon, msg);
     }
-    ('—', String::from("no remarks"))
+    ('\u{2014}', String::from("no remarks"))
 }
 
 fn color_diff_line(line: &str) -> Line<'_> {

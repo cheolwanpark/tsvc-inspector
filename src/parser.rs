@@ -7,8 +7,8 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::error::AppResult;
 use crate::model::{
-    AnalysisSource, AnalysisStage, AnalysisStep, IrDiffStep, LoopResult, OptimizationStep,
-    RemarkEntry, RemarkKind,
+    AnalysisSource, AnalysisStage, AnalysisStep, IrDiffStep, IrLine, LoopResult,
+    OptimizationStep, RemarkEntry, RemarkKind,
 };
 
 #[allow(dead_code)]
@@ -290,6 +290,40 @@ pub fn build_fast_analysis_steps(
     )
 }
 
+/// Scans module IR for `!N = !DILocation(line: X, ...)` entries.
+/// Returns metadata ID → source line number.
+pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, u32> {
+    let re = Regex::new(r"!(\d+) = !DILocation\(line: (\d+)").expect("valid DILocation regex");
+    let mut map = HashMap::new();
+    for caps in re.captures_iter(module_ir) {
+        if let (Some(id_match), Some(line_match)) = (caps.get(1), caps.get(2)) {
+            if let (Ok(id), Ok(line)) = (
+                id_match.as_str().parse::<u32>(),
+                line_match.as_str().parse::<u32>(),
+            ) {
+                map.insert(id, line);
+            }
+        }
+    }
+    map
+}
+
+/// For each IrLine, extracts `!dbg !N` and looks up the source line number.
+pub fn build_source_line_map(
+    ir_lines: &[IrLine],
+    dbg_locations: &HashMap<u32, u32>,
+) -> Vec<Option<u32>> {
+    let dbg_re = Regex::new(r"!dbg !(\d+)").expect("valid dbg ref regex");
+    ir_lines
+        .iter()
+        .map(|ir_line| {
+            let caps = dbg_re.captures(&ir_line.text)?;
+            let id: u32 = caps.get(1)?.as_str().parse().ok()?;
+            dbg_locations.get(&id).copied()
+        })
+        .collect()
+}
+
 pub fn build_analysis_steps_from_snapshots(
     snapshots: &[IrSnapshot],
     selected_function_symbol: &str,
@@ -311,7 +345,17 @@ pub fn build_analysis_steps_from_snapshots(
         let remark_indices =
             collect_analysis_remark_indices(&snapshot.pass, target_function.as_deref(), remarks);
 
+        let dbg_locations = parse_dbg_locations(&snapshot.snapshot);
+
         if prev_ir.is_none() {
+            let ir_lines: Vec<IrLine> = function_ir
+                .lines()
+                .map(|l| IrLine {
+                    tag: ChangeTag::Equal,
+                    text: l.to_string(),
+                })
+                .collect();
+            let source_line_map = build_source_line_map(&ir_lines, &dbg_locations);
             out.push(AnalysisStep {
                 visible_index: out.len(),
                 raw_index: snapshot.raw_index,
@@ -323,6 +367,8 @@ pub fn build_analysis_steps_from_snapshots(
                 target_function,
                 changed_lines: 0,
                 diff_text: String::from("No previous step. This is the initial IR snapshot."),
+                ir_lines,
+                source_line_map,
                 remark_indices,
                 source,
             });
@@ -343,6 +389,16 @@ pub fn build_analysis_steps_from_snapshots(
             .iter_all_changes()
             .filter(|change| change.tag() != ChangeTag::Equal)
             .count();
+
+        let ir_lines: Vec<IrLine> = diff
+            .iter_all_changes()
+            .map(|change| IrLine {
+                tag: change.tag(),
+                text: change.value().trim_end_matches('\n').to_string(),
+            })
+            .collect();
+        let source_line_map = build_source_line_map(&ir_lines, &dbg_locations);
+
         let mut diff_text = diff
             .unified_diff()
             .context_radius(3)
@@ -368,6 +424,8 @@ pub fn build_analysis_steps_from_snapshots(
             target_function,
             changed_lines,
             diff_text,
+            ir_lines,
+            source_line_map,
             remark_indices,
             source,
         });
@@ -1050,5 +1108,67 @@ entry:
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[1].target_function.as_deref(), Some("foo"));
         assert_eq!(steps[1].source, AnalysisSource::TraceFast);
+    }
+
+    #[test]
+    fn parses_dbg_locations_from_module_ir() {
+        let ir = r#"
+define void @foo() !dbg !5 {
+  %1 = load float, ptr %p, !dbg !10
+  ret void
+}
+
+!5 = distinct !DISubprogram(name: "foo")
+!10 = !DILocation(line: 42, column: 5, scope: !5)
+!11 = !DILocation(line: 43, column: 3, scope: !5)
+"#;
+        let locs = parse_dbg_locations(ir);
+        assert_eq!(locs.get(&10), Some(&42));
+        assert_eq!(locs.get(&11), Some(&43));
+        assert_eq!(locs.get(&5), None);
+    }
+
+    #[test]
+    fn builds_source_line_map_from_ir_lines() {
+        let ir_lines = vec![
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("define void @foo() {"),
+            },
+            IrLine {
+                tag: ChangeTag::Delete,
+                text: String::from("  %1 = load float, ptr %p, !dbg !10"),
+            },
+            IrLine {
+                tag: ChangeTag::Insert,
+                text: String::from("  %wide = load <4 x float>, ptr %p, !dbg !10"),
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("  ret void"),
+            },
+        ];
+        let mut dbg_locations = HashMap::new();
+        dbg_locations.insert(10, 42);
+
+        let map = build_source_line_map(&ir_lines, &dbg_locations);
+        assert_eq!(map.len(), 4);
+        assert_eq!(map[0], None);
+        assert_eq!(map[1], Some(42));
+        assert_eq!(map[2], Some(42));
+        assert_eq!(map[3], None);
+    }
+
+    #[test]
+    fn source_line_map_graceful_when_no_dbg() {
+        let ir_lines = vec![
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("  %x = add i32 1, 2"),
+            },
+        ];
+        let dbg_locations = HashMap::new();
+        let map = build_source_line_map(&ir_lines, &dbg_locations);
+        assert_eq!(map, vec![None]);
     }
 }

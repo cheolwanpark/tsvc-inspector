@@ -8,8 +8,8 @@ pub enum UserAction {
     MoveDown,
     Confirm,             // Enter
     BackToBenchmarkList, // Esc
-    FocusPrevPane,       // Left
-    FocusNextPane,       // Right
+    FocusNextPaneCycle,  // Tab
+    FocusPrevPaneCycle,  // Shift-Tab
     CycleProfile,        // 'p'
     Run,                 // 'r' → BuildAndRun
     Analyze,             // 'a' → AnalyzeFast
@@ -23,8 +23,8 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Down => UserAction::MoveDown,
         KeyCode::Enter => UserAction::Confirm,
         KeyCode::Esc => UserAction::BackToBenchmarkList,
-        KeyCode::Left => UserAction::FocusPrevPane,
-        KeyCode::Right => UserAction::FocusNextPane,
+        KeyCode::Tab => UserAction::FocusNextPaneCycle,
+        KeyCode::BackTab => UserAction::FocusPrevPaneCycle,
         KeyCode::Char('p') => UserAction::CycleProfile,
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::Analyze,
@@ -54,13 +54,15 @@ mod tests {
             map_key_event(key(KeyCode::Esc)),
             UserAction::BackToBenchmarkList
         );
+        assert_eq!(map_key_event(key(KeyCode::Left)), UserAction::None);
+        assert_eq!(map_key_event(key(KeyCode::Right)), UserAction::None);
         assert_eq!(
-            map_key_event(key(KeyCode::Left)),
-            UserAction::FocusPrevPane
+            map_key_event(key(KeyCode::Tab)),
+            UserAction::FocusNextPaneCycle
         );
         assert_eq!(
-            map_key_event(key(KeyCode::Right)),
-            UserAction::FocusNextPane
+            map_key_event(key(KeyCode::BackTab)),
+            UserAction::FocusPrevPaneCycle
         );
         // Removed keys return None
         assert_eq!(

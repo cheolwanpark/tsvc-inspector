@@ -81,7 +81,8 @@ impl ListFocus {
 pub enum DetailFocus {
     StageList,
     PassList,
-    DiffView,
+    SourceView,
+    IrView,
 }
 
 impl DetailFocus {
@@ -90,9 +91,31 @@ impl DetailFocus {
         match self {
             Self::StageList => "Stages",
             Self::PassList => "Passes",
-            Self::DiffView => "Diff",
+            Self::SourceView => "C Source",
+            Self::IrView => "IR View",
         }
     }
+
+    /// Tab: cycle forward through all 4 panes, wrapping around.
+    pub fn cycle_next(self) -> Self {
+        match self {
+            Self::StageList => Self::PassList,
+            Self::PassList => Self::SourceView,
+            Self::SourceView => Self::IrView,
+            Self::IrView => Self::StageList,
+        }
+    }
+
+    /// Shift-Tab: cycle backward through all 4 panes, wrapping around.
+    pub fn cycle_prev(self) -> Self {
+        match self {
+            Self::StageList => Self::IrView,
+            Self::PassList => Self::StageList,
+            Self::SourceView => Self::PassList,
+            Self::IrView => Self::SourceView,
+        }
+    }
+
 }
 
 pub struct AppState {
@@ -107,7 +130,8 @@ pub struct AppState {
     pub list_focus: ListFocus,
     pub list_source_scroll: u16,
     pub detail_focus: DetailFocus,
-    pub diff_scroll: u16,
+    pub ir_scroll: u16,
+    pub source_detail_scroll: u16,
     pub function_modal_open: bool,
     pub function_modal_selected_idx: usize,
     pub function_run_mode: FunctionRunMode,
@@ -133,7 +157,8 @@ impl AppState {
             list_focus: ListFocus::Benchmarks,
             list_source_scroll: 0,
             detail_focus: DetailFocus::StageList,
-            diff_scroll: 0,
+            ir_scroll: 0,
+            source_detail_scroll: 0,
             function_modal_open: false,
             function_modal_selected_idx: 0,
             function_run_mode,
@@ -337,7 +362,8 @@ impl AppState {
 
         self.page = AppPage::BenchmarkDetail;
         self.detail_focus = DetailFocus::StageList;
-        self.diff_scroll = 0;
+        self.ir_scroll = 0;
+        self.source_detail_scroll = 0;
     }
 
     pub fn back_to_benchmark_list(&mut self) {
@@ -356,7 +382,8 @@ impl AppState {
         let key = session_key(&benchmark.name, &function.symbol);
 
         if self.sessions_by_key.remove(&key).is_some() {
-            self.diff_scroll = 0;
+            self.ir_scroll = 0;
+            self.source_detail_scroll = 0;
             self.selected_pass_by_stage.clear();
             self.detail_focus = DetailFocus::StageList;
             self.status_message = String::from("Session cleared");
@@ -434,34 +461,22 @@ impl AppState {
         self.detail_focus == DetailFocus::PassList
     }
 
-    pub fn is_diff_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::DiffView
+    pub fn is_source_view_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::SourceView
     }
 
-    /// Advance focus: StageList→PassList→DiffView (clamped at DiffView).
-    pub fn focus_next_pane(&mut self) {
-        self.detail_focus = match self.detail_focus {
-            DetailFocus::StageList => DetailFocus::PassList,
-            DetailFocus::PassList => DetailFocus::DiffView,
-            DetailFocus::DiffView => DetailFocus::DiffView,
-        };
+    pub fn is_ir_view_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::IrView
     }
 
-    /// Retreat focus: DiffView→PassList→StageList (clamped at StageList).
-    pub fn focus_prev_pane(&mut self) {
-        self.detail_focus = match self.detail_focus {
-            DetailFocus::StageList => DetailFocus::StageList,
-            DetailFocus::PassList => DetailFocus::StageList,
-            DetailFocus::DiffView => DetailFocus::PassList,
-        };
+    /// Tab: cycle forward through all 4 panes.
+    pub fn focus_cycle_next(&mut self) {
+        self.detail_focus = self.detail_focus.cycle_next();
     }
 
-    pub fn enter_diff_view(&mut self) {
-        self.detail_focus = DetailFocus::DiffView;
-    }
-
-    pub fn exit_diff_view(&mut self) {
-        self.detail_focus = DetailFocus::PassList;
+    /// Shift-Tab: cycle backward through all 4 panes.
+    pub fn focus_cycle_prev(&mut self) {
+        self.detail_focus = self.detail_focus.cycle_prev();
     }
 
     pub fn select_prev_stage(&mut self) {
@@ -513,7 +528,7 @@ impl AppState {
             .unwrap_or(0);
         self.selected_pass_by_stage
             .insert(self.selected_stage, idx.saturating_sub(1));
-        self.diff_scroll = 0;
+        self.ir_scroll = 0;
     }
 
     pub fn select_next_pass(&mut self) {
@@ -532,14 +547,15 @@ impl AppState {
         let new_idx = (idx + 1).min(count - 1);
         self.selected_pass_by_stage
             .insert(self.selected_stage, new_idx);
-        self.diff_scroll = 0;
+        self.ir_scroll = 0;
     }
 
     pub fn detail_move_up(&mut self) {
         match self.detail_focus {
             DetailFocus::StageList => self.select_prev_stage(),
             DetailFocus::PassList => self.select_prev_pass(),
-            DetailFocus::DiffView => self.scroll_diff_up(),
+            DetailFocus::SourceView => self.scroll_source_detail_up(),
+            DetailFocus::IrView => self.scroll_ir_up(),
         }
     }
 
@@ -547,28 +563,81 @@ impl AppState {
         match self.detail_focus {
             DetailFocus::StageList => self.select_next_stage(),
             DetailFocus::PassList => self.select_next_pass(),
-            DetailFocus::DiffView => self.scroll_diff_down(),
+            DetailFocus::SourceView => self.scroll_source_detail_down(),
+            DetailFocus::IrView => self.scroll_ir_down(),
         }
     }
 
-    fn scroll_diff_up(&mut self) {
-        self.diff_scroll = self.diff_scroll.saturating_sub(1);
+    fn scroll_ir_up(&mut self) {
+        self.ir_scroll = self.ir_scroll.saturating_sub(1);
     }
 
-    fn scroll_diff_down(&mut self) {
-        let max_scroll = self.max_diff_scroll();
-        self.diff_scroll = self.diff_scroll.saturating_add(1).min(max_scroll);
+    fn scroll_ir_down(&mut self) {
+        let max_scroll = self.max_ir_scroll();
+        self.ir_scroll = self.ir_scroll.saturating_add(1).min(max_scroll);
     }
 
-    fn max_diff_scroll(&self) -> u16 {
+    fn max_ir_scroll(&self) -> u16 {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return 0;
         };
         let Some(step) = self.selected_step_in_stage(session) else {
             return 0;
         };
-        let max = step.diff_text.lines().count().saturating_sub(1);
+        let max = step.ir_lines.len().saturating_sub(1);
         max.min(u16::MAX as usize) as u16
+    }
+
+    fn scroll_source_detail_up(&mut self) {
+        self.source_detail_scroll = self.source_detail_scroll.saturating_sub(1);
+    }
+
+    fn scroll_source_detail_down(&mut self) {
+        let max_scroll = self.max_source_detail_scroll();
+        self.source_detail_scroll = self.source_detail_scroll.saturating_add(1).min(max_scroll);
+    }
+
+    fn max_source_detail_scroll(&self) -> u16 {
+        let Some(benchmark) = self.selected_benchmark() else {
+            return 0;
+        };
+        let max = benchmark.source_code.lines().count().saturating_sub(1);
+        max.min(u16::MAX as usize) as u16
+    }
+
+    /// When IR scroll changes, find source lines corresponding to visible IR region
+    /// and auto-scroll C source to center those lines.
+    /// Currently disabled: !dbg line numbers are absolute file positions but source_code
+    /// is a kernel excerpt with different line numbering. Needs line offset tracking.
+    #[allow(dead_code)]
+    fn sync_source_to_ir(&mut self) {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return;
+        };
+        let Some(step) = self.selected_step_in_stage(session) else {
+            return;
+        };
+        // Skip if no dbg metadata at all (entire map is None)
+        if step.source_line_map.is_empty() || step.source_line_map.iter().all(|v| v.is_none()) {
+            return;
+        }
+
+        let start = self.ir_scroll as usize;
+        let end = (start + 20).min(step.source_line_map.len());
+        let visible_source_lines: Vec<u32> = step.source_line_map[start..end]
+            .iter()
+            .filter_map(|opt| *opt)
+            .collect();
+
+        if visible_source_lines.is_empty() {
+            return; // no matches in visible range — don't move source scroll
+        }
+
+        // Center on the median visible source line
+        let mid = visible_source_lines[visible_source_lines.len() / 2];
+        let max = self.max_source_detail_scroll();
+        let target = mid.saturating_sub(5);
+        self.source_detail_scroll = (target as u16).min(max);
     }
 
     /// After analysis completes, auto-navigate to Vectorize stage + PassList focus.
@@ -617,6 +686,8 @@ impl AppState {
                     ("✗".to_string(), Color::Red)
                 } else if summary.not_beneficial > 0 {
                     ("○".to_string(), Color::Yellow)
+                } else if has_vectorizer_ir_changes(session) {
+                    ("~".to_string(), Color::Cyan)
                 } else {
                     ("—".to_string(), Color::DarkGray)
                 }
@@ -667,7 +738,7 @@ impl AppState {
         };
         self.sessions_by_key.insert(key, session);
 
-        self.diff_scroll = 0;
+        self.ir_scroll = 0;
         self.status_message = format!(
             "{kind} started for {benchmark} [{}] ({profile})",
             selected_function.loop_id
@@ -807,6 +878,15 @@ fn session_key(benchmark: &str, function_symbol: &str) -> String {
     format!("{benchmark}::{function_symbol}")
 }
 
+/// Checks if vectorizer passes (loopvectorize/slpvectorizer) made IR changes.
+pub fn has_vectorizer_ir_changes(session: &RunSession) -> bool {
+    session.analysis_steps.iter().any(|step| {
+        step.stage == AnalysisStage::Vectorize
+            && step.changed_lines > 0
+            && matches!(step.pass_key.as_str(), "loopvectorize" | "slpvectorizer")
+    })
+}
+
 /// Extracts the vectorization factor from a session's remarks.
 fn extract_vf_from_remarks(remarks: &[RemarkEntry]) -> Option<u32> {
     for r in remarks {
@@ -865,6 +945,8 @@ mod tests {
             target_function: Some(String::from("s161")),
             changed_lines: 3,
             diff_text: String::from("@@ -1 +1 @@\n-old\n+new"),
+            ir_lines: vec![],
+            source_line_map: vec![],
             remark_indices: vec![],
             source: AnalysisSource::TraceFast,
         }
@@ -1206,30 +1288,78 @@ mod tests {
     }
 
     #[test]
-    fn focus_transitions_complete_cycle() {
+    fn focus_tab_cycles_through_all_4_panes() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         assert_eq!(app.detail_focus, DetailFocus::StageList);
 
-        app.focus_next_pane();
+        app.focus_cycle_next();
         assert_eq!(app.detail_focus, DetailFocus::PassList);
 
-        app.focus_next_pane();
-        assert_eq!(app.detail_focus, DetailFocus::DiffView);
+        app.focus_cycle_next();
+        assert_eq!(app.detail_focus, DetailFocus::SourceView);
 
-        // Clamped at DiffView
-        app.focus_next_pane();
-        assert_eq!(app.detail_focus, DetailFocus::DiffView);
+        app.focus_cycle_next();
+        assert_eq!(app.detail_focus, DetailFocus::IrView);
 
-        // Back via prev
-        app.focus_prev_pane();
+        // Wraps around
+        app.focus_cycle_next();
+        assert_eq!(app.detail_focus, DetailFocus::StageList);
+
+        // Reverse cycle
+        app.focus_cycle_prev();
+        assert_eq!(app.detail_focus, DetailFocus::IrView);
+
+        app.focus_cycle_prev();
+        assert_eq!(app.detail_focus, DetailFocus::SourceView);
+
+        app.focus_cycle_prev();
         assert_eq!(app.detail_focus, DetailFocus::PassList);
 
-        app.focus_prev_pane();
+        app.focus_cycle_prev();
         assert_eq!(app.detail_focus, DetailFocus::StageList);
+    }
 
-        // Clamped at StageList
-        app.focus_prev_pane();
-        assert_eq!(app.detail_focus, DetailFocus::StageList);
+    #[test]
+    fn verdict_fallback_likely_vectorized() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        // Create outcome with vectorizer IR changes but no vectorize remarks
+        let remarks: Vec<RemarkEntry> = vec![];
+        let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
+        step.changed_lines = 10;
+
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(JobOutcome {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            profile: CompileProfile::O3Remarks,
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+            data: JobOutcomeData::Analysis {
+                analysis_steps: vec![step],
+                remarks: remarks.clone(),
+                remarks_summary: RemarksSummary::from_entries(&remarks),
+            },
+        })));
+
+        let badge = app.verdict_badge_for_benchmark("A");
+        assert!(badge.is_some());
+        let (text, color) = badge.unwrap();
+        assert_eq!(text, "~");
+        assert_eq!(color, Color::Cyan);
     }
 }
