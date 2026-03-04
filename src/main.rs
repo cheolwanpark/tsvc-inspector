@@ -1,4 +1,5 @@
 mod app;
+mod benchmark_manifest;
 mod bootstrap;
 mod clipboard;
 mod discovery;
@@ -24,8 +25,7 @@ use crate::app::{AppState, JobEvent, JobOutcome, JobOutcomeData};
 use crate::error::AppResult;
 use crate::input::UserAction;
 use crate::model::{
-    AppPage, BenchmarkFunction, BuildPurpose, CompileProfile, FunctionRunMode, JobKind, LoopResult,
-    RemarkEntry, RemarksSummary,
+    AppPage, BenchmarkFunction, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary,
 };
 use crate::runner::RunnerConfig;
 use crate::tsvc_patch::TsvcPatchOutcome;
@@ -43,20 +43,11 @@ struct Cli {
     #[arg(long, default_value = "clang")]
     clang: String,
 
-    #[arg(long, default_value = "cmake")]
-    cmake: String,
-
-    #[arg(long, default_value = "opt")]
-    opt: String,
-
     #[arg(long, default_value = ".")]
     build_root: PathBuf,
 
     #[arg(long, default_value_t = default_jobs())]
     jobs: usize,
-
-    #[arg(long, default_value_t = 80)]
-    analysis_window: usize,
 }
 
 fn default_jobs() -> usize {
@@ -77,11 +68,8 @@ fn main() -> AppResult<()> {
     let runner_config = RunnerConfig {
         tsvc_root: resolved_tsvc_root.clone(),
         clang: cli.clang,
-        cmake: cli.cmake,
-        opt: cli.opt,
         build_root: cli.build_root,
         jobs: cli.jobs,
-        analysis_window: cli.analysis_window,
     };
 
     let (function_run_mode, startup_status) = configure_function_run_mode(&runner_config)?;
@@ -130,7 +118,7 @@ fn configure_function_run_mode(
             Some(String::from("Function mode: real-selective")),
         )),
         Ok(TsvcPatchOutcome::Patched) => {
-            if let Err(err) = reset_profile_build_dirs(config) {
+            if let Err(err) = reset_native_build_dirs(config) {
                 eprintln!("warning: patched TSVC source but failed to reset build dirs: {err:#}");
             }
             Ok((
@@ -152,17 +140,25 @@ fn configure_function_run_mode(
     }
 }
 
-fn reset_profile_build_dirs(config: &RunnerConfig) -> AppResult<()> {
-    for profile in [
-        CompileProfile::O3Remarks,
-        CompileProfile::O3NoVec,
-        CompileProfile::O3Default,
+fn reset_native_build_dirs(config: &RunnerConfig) -> AppResult<()> {
+    let native_root = config.build_root.join("build-tsvc-native");
+    if native_root.exists() {
+        fs::remove_dir_all(&native_root)
+            .with_context(|| format!("remove {}", native_root.display()))?;
+    }
+
+    // Cleanup legacy profile build dirs from older versions.
+    for name in [
+        "build-tsvc-o3-remarks-run",
+        "build-tsvc-o3-novec-run",
+        "build-tsvc-o3-default-run",
+        "build-tsvc-o3-remarks-analysis",
+        "build-tsvc-o3-novec-analysis",
+        "build-tsvc-o3-default-analysis",
     ] {
-        for purpose in [BuildPurpose::Runtime, BuildPurpose::Analysis] {
-            let dir = config.build_root.join(profile.build_dir_name_for(purpose));
-            if dir.exists() {
-                fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-            }
+        let dir = config.build_root.join(name);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
         }
     }
     Ok(())
@@ -186,6 +182,17 @@ fn run_app(
             && let Event::Key(key) = event::read()?
         {
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            if app.page == AppPage::CompileConfig && app.is_config_text_editing() {
+                match key.code {
+                    crossterm::event::KeyCode::Esc => app.config_back_or_cancel(),
+                    crossterm::event::KeyCode::Enter => app.config_confirm(),
+                    crossterm::event::KeyCode::Backspace => app.config_backspace(),
+                    crossterm::event::KeyCode::Char(ch) => app.config_push_char(ch),
+                    _ => {}
+                }
                 continue;
             }
 
@@ -213,6 +220,18 @@ fn run_app(
                         }
                         _ => {}
                     },
+                    AppPage::CompileConfig => match action {
+                        UserAction::MoveUp => app.config_move_up(),
+                        UserAction::MoveDown => app.config_move_down(),
+                        UserAction::MoveLeft => app.config_adjust_left(),
+                        UserAction::MoveRight => app.config_adjust_right(),
+                        UserAction::Confirm => app.config_confirm(),
+                        UserAction::OpenDetailPage => app.config_open_detail_shortcut(),
+                        UserAction::BackToBenchmarkList => app.config_back_or_cancel(),
+                        UserAction::Backspace => app.config_backspace(),
+                        UserAction::TextChar(ch) => app.config_push_char(ch),
+                        _ => {}
+                    },
                     AppPage::BenchmarkDetail => match action {
                         UserAction::MoveUp => app.detail_move_up(),
                         UserAction::MoveDown => app.detail_move_down(),
@@ -234,7 +253,6 @@ fn run_app(
                                 app.detail_focus = crate::app::DetailFocus::IrView;
                             }
                         }
-                        UserAction::CycleProfile => app.cycle_profile(),
                         UserAction::ClearSession => app.clear_session(),
                         UserAction::Run => {
                             maybe_spawn_job(app, config, job_tx, JobKind::BuildAndRun);
@@ -286,7 +304,7 @@ fn maybe_spawn_job(
         return;
     };
 
-    let profile = app.active_profile;
+    let compiler_config = app.current_compiler_config();
     let run_mode = app.function_run_mode;
     let tx = job_tx.clone();
     let cfg = config.clone();
@@ -295,7 +313,7 @@ fn maybe_spawn_job(
         let _ = tx.send(JobEvent::Started {
             kind,
             benchmark: benchmark.name.clone(),
-            profile,
+            compiler_config: compiler_config.clone(),
             selected_function: selected_function.clone(),
             run_mode,
         });
@@ -305,7 +323,7 @@ fn maybe_spawn_job(
                 let exec_result = runner::execute_runtime_job(
                     &cfg,
                     &benchmark,
-                    profile,
+                    &compiler_config,
                     &selected_function.symbol,
                     run_mode,
                     |line| {
@@ -336,7 +354,7 @@ fn maybe_spawn_job(
                         let outcome = JobOutcome {
                             kind,
                             benchmark: benchmark.name.clone(),
-                            profile,
+                            compiler_config: compiler_config.clone(),
                             selected_function: selected_function.clone(),
                             run_mode,
                             data: JobOutcomeData::Runtime {
@@ -353,10 +371,15 @@ fn maybe_spawn_job(
                 }
             }
             JobKind::AnalyzeFast => {
-                let exec_result =
-                    runner::execute_analysis_fast(&cfg, &benchmark, profile, |line| {
+                let exec_result = runner::execute_analysis_fast(
+                    &cfg,
+                    &benchmark,
+                    &compiler_config,
+                    &selected_function.symbol,
+                    |line| {
                         let _ = tx.send(JobEvent::LogLine(line));
-                    });
+                    },
+                );
                 match exec_result {
                     Ok(raw) => {
                         let parsed_remarks = parse_remarks_with_log(raw.remark_file, &tx);
@@ -381,7 +404,7 @@ fn maybe_spawn_job(
                         let outcome = JobOutcome {
                             kind,
                             benchmark: benchmark.name.clone(),
-                            profile,
+                            compiler_config: compiler_config.clone(),
                             selected_function: selected_function.clone(),
                             run_mode,
                             data: JobOutcomeData::Analysis {

@@ -2,22 +2,32 @@
 
 ## Project Structure & Module Organization
 - `src/main.rs` wires CLI parsing, app startup, and the Ratatui event loop.
-- `src/app.rs` owns UI state, page routing (list/detail), per-benchmark sessions, 4-pane detail focus + scroll state, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
+- `src/app.rs` owns UI state, page routing (`list -> compile-config -> detail`), per-benchmark sessions, 4-pane detail focus + scroll state, and job events; `src/ui.rs` renders views; `src/input.rs` maps keys to actions.
+- `src/benchmark_manifest.rs` is the source of truth for benchmark names and run options.
 - `src/syntax.rs` provides tree-sitter based syntax highlighting for C and LLVM IR with a bounded in-memory cache and graceful plain-text fallback.
-- `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), runtime/analysis execution, analysis timeline parsing (fast trace + snapshots with `IrLine`/`source_line_map` generation), and TSVC root resolution.
+- `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), native clang runtime/analysis execution, analysis timeline parsing (fast trace + snapshots with `IrLine`/`source_line_map` generation), and TSVC root resolution.
 - `src/model.rs` contains shared domain types (`IrLine`, `AnalysisStep`, `AnalysisStage`, etc.); `src/error.rs` defines common error/result aliases.
-- Build outputs are generated in `target/` and profile-specific folders such as `build-tsvc-o3-remarks-run/` and `build-tsvc-o3-remarks-analysis/`; keep generated artifacts out of commits.
+- Build outputs are generated in `target/` and config-scoped native folders like `build-tsvc-native/run/<config_id>/...` and `build-tsvc-native/analysis/<config_id>/...`; keep generated artifacts out of commits.
 
 ## TUI Navigation Model
-- The app has two pages: `Benchmark List` and `Benchmark Detail`.
+- The app has three pages: `Benchmark List`, `Compile Config`, and `Benchmark Detail`.
 - `Enter` on list opens an intermediate `Select Function` modal first.
-- In `Select Function` modal: `Up`/`Down` moves selection, `Enter` confirms and opens detail, `Esc` cancels.
+- In `Select Function` modal: `Up`/`Down` moves selection, `Enter` confirms and opens `Compile Config`, `Esc` cancels.
 - Benchmark list page has two focus panes: `Benchmarks` and `C Source (kernel-focused)`.
 - On list page, `Tab`/`Shift-Tab` switches focus between `Benchmarks` and `C Source`.
 - On list page, `Up`/`Down` acts on the focused pane:
   - `Benchmarks` focus: move selected benchmark.
   - `C Source` focus: scroll source text.
 - List-page source text is derived from `tsc.c` and filtered `tsc.inc` sections selected by `#define TESTS ...` for the benchmark; common timing/harness lines are omitted for readability.
+
+### Compile Config Page
+- Config rows expose compiler knobs only: optimization level, vectorizer toggles, remark toggles, print-changed, debug info, and extra C/LLVM flags.
+- `Up`/`Down` moves selected row.
+- `Left`/`Right` changes/toggles selected row.
+- `Enter` toggles config rows or enters/exits text edit mode for extra flag rows.
+- `d` persists config for the selected benchmark/function and opens detail page.
+- `Esc` cancels text editing (if active) or returns to benchmark list page.
+- Config/session scope is `benchmark + selected function + config_id`.
 
 ### Benchmark Detail Page (2x2 Grid Layout)
 - The detail page uses a 2x2 grid layout:
@@ -32,8 +42,8 @@
   - `IrView`: scroll full-function IR (interleaved diff view).
 - `Enter`: StageList -> PassList, PassList -> IrView.
 - `Esc`: IrView -> PassList -> StageList -> back to list page.
-- `a` runs analysis, `r` runs build+run, `y` copies a detail snapshot to clipboard, `p` cycles profile, `c` clears session.
-- Detail sessions are scoped per `benchmark + selected function`.
+- `a` runs analysis, `r` runs build+run, `y` copies a detail snapshot to clipboard, `c` clears session.
+- Detail sessions are scoped per `benchmark + selected function + config_id`.
 - Function selection is required before entering detail.
 - Minimum terminal size: 100x30.
 
@@ -63,16 +73,17 @@
   - `real-selective`: available when using app-managed fallback TSVC root and patching `tsc.inc` succeeds.
   - `output-filter`: used for external TSVC roots or when fallback patching fails.
 - In both modes, runtime output is filtered by selected function (loop rows, remarks).
-- Build path is incremental and parallelized (`-j`), without `--clean-first`.
+- Build path uses a native clang compile/link pipeline (no CMake configure step), incremental target cleanup, and parallelism hint (`jobs`) for consistency with app settings.
 
 ## Analysis Workflow Notes
 - Optimization-path exploration is primary:
   - Fast tier: parse `-mllvm -print-changed` trace and build function-scoped changed-only timeline with `IrLine` generation and `!dbg` metadata parsing.
+  - When `print-changed` is enabled, analysis compile adds `-mllvm -filter-print-funcs=<selected_symbol>` to keep traces focused and bounded.
 - Runtime (`r`) is secondary and intentionally lightweight; it does not regenerate full IR timelines.
 
 ## Build, Test, and Development Commands
 - `cargo check`: fast compile validation during development.
-- `cargo run -- --tsvc-root /path/to/llvm-test-suite --build-root . --opt /path/to/opt --analysis-window 80`: start the TUI with explicit analysis tooling/options.
+- `cargo run -- --tsvc-root /path/to/llvm-test-suite --build-root . --clang /path/to/clang --jobs 8`: start the TUI with explicit toolchain/build settings.
 - `cargo run`: start with defaults (`--tsvc-root llvm-test-suite`), with fallback clone logic in `bootstrap.rs`.
 - `cargo test`: run unit tests embedded in module `#[cfg(test)]` blocks.
 - `cargo fmt --check`: verify formatting.
@@ -86,7 +97,7 @@
 
 ## Testing Guidelines
 - Place tests next to the code they validate (`#[cfg(test)] mod tests` in each module).
-- Use descriptive test names such as `parses_tsvc_rows` and `profile_build_dir_names_are_stable`.
+- Use descriptive test names such as `parses_tsvc_rows` and `config_build_dir_contains_config_id`.
 - Cover both happy paths and failure/edge handling (missing files, malformed output, absent binaries, missing function IR in snapshots).
 - Keep tests deterministic; avoid network- or environment-dependent behavior.
 

@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 
 use similar::ChangeTag;
 
-use crate::app::{AppState, has_vectorizer_ir_changes};
+use crate::app::{AppState, ConfigRow, has_vectorizer_ir_changes};
 use crate::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession,
 };
@@ -23,6 +23,7 @@ const IR_DELETE_BG: Color = Color::Rgb(90, 28, 28);
 pub fn render(frame: &mut Frame, app: &AppState) {
     match app.page {
         AppPage::BenchmarkList => render_benchmark_list_page(frame, app),
+        AppPage::CompileConfig => render_compile_config_page(frame, app),
         AppPage::BenchmarkDetail => render_benchmark_detail_page(frame, app),
     }
 }
@@ -44,6 +45,168 @@ fn render_benchmark_list_page(frame: &mut Frame, app: &AppState) {
     if app.is_function_modal_open() {
         render_function_select_modal(frame, app);
     }
+}
+
+fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
+    let area = frame.area();
+    let vertical = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ]);
+    let [header_area, main_area, footer_area] = vertical.areas(area);
+
+    let benchmark_name = app
+        .selected_benchmark()
+        .map(|b| b.name.as_str())
+        .unwrap_or("-");
+    let loop_id = app.selected_function_loop_id().unwrap_or("-");
+    let header = Paragraph::new(Line::from(vec![
+        Span::raw("TSVC TUI  "),
+        Span::styled("Page: ", Style::default().fg(Color::Gray)),
+        Span::styled("Compile Config", Style::default().fg(Color::Yellow)),
+        Span::raw("  "),
+        Span::styled(
+            format!("{benchmark_name} · {loop_id}"),
+            Style::default().fg(Color::Green),
+        ),
+    ]))
+    .block(Block::bordered().title("Session"));
+    frame.render_widget(header, header_area);
+
+    let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]);
+    let [left, right] = cols.areas(main_area);
+
+    let items = app
+        .config_rows()
+        .iter()
+        .map(|row| {
+            let value = app.config_row_value_text(*row);
+            let row_suffix =
+                if *row == app.config_selected_row_kind() && app.is_config_text_editing() {
+                    " [editing]"
+                } else {
+                    ""
+                };
+            ListItem::new(format!("{:<18} : {}{}", row.title(), value, row_suffix))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .block(Block::bordered().title("Configuration"))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    let mut state = ListState::default();
+    state.select(Some(app.config_selected_row));
+    frame.render_stateful_widget(list, left, &mut state);
+
+    let right_rows = Layout::vertical([Constraint::Percentage(54), Constraint::Percentage(46)]);
+    let [guide_area, preview_area] = right_rows.areas(right);
+
+    let selected_row = app.config_selected_row_kind();
+    let guide = Paragraph::new(Text::from(config_help_lines(app, selected_row)))
+        .block(Block::bordered().title("Option Guide"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(guide, guide_area);
+
+    let preview_text = Text::from(vec![
+        Line::from("Runtime C Flags"),
+        Line::from(app.config_runtime_flags_preview()),
+        Line::from(""),
+        Line::from("Analysis C Flags"),
+        Line::from(app.config_analysis_flags_preview()),
+    ]);
+    let preview = Paragraph::new(preview_text)
+        .block(Block::bordered().title("Flag Preview"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(preview, preview_area);
+
+    let hints = if app.is_config_text_editing() {
+        "type text · backspace delete · enter finish · esc cancel edit"
+    } else {
+        "↑↓ row · ←→ change · enter toggle/edit · d open detail · esc back"
+    };
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from(hints),
+        Line::from(format!("Status: {}", app.status_message)),
+    ]))
+    .block(Block::bordered().title("Keys"));
+    frame.render_widget(footer, footer_area);
+}
+
+fn config_help_lines(app: &AppState, row: ConfigRow) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!("Selected: {}", row.title())));
+    lines.push(Line::from(""));
+
+    let body = match row {
+        ConfigRow::OptLevel => vec![
+            "What: Chooses optimization aggressiveness (-O0..-Oz).",
+            "Why: Lower levels show simpler pass effects; higher levels show full pipeline behavior.",
+            "Tip: Start with -O1 to learn pass order, then raise to -O3.",
+        ],
+        ConfigRow::LoopVectorize => vec![
+            "What: Enables/disables loop vectorization (-fno-vectorize when off).",
+            "Why: Isolates vectorizer impact from other loop optimizations.",
+            "Tip: Compare on/off with same -O level to inspect changed passes.",
+        ],
+        ConfigRow::SlpVectorize => vec![
+            "What: Enables/disables SLP vectorization (-fno-slp-vectorize when off).",
+            "Why: Separates basic-block vectorization effects from loop vectorization.",
+            "Tip: Disable this when focusing only on loop-vectorize remarks.",
+        ],
+        ConfigRow::Rpass => vec![
+            "What: Emits successful vectorization remarks (-Rpass=loop-vectorize).",
+            "Why: Quickly confirms where vectorization actually happened.",
+            "Tip: Keep on when validating vectorization wins.",
+        ],
+        ConfigRow::RpassMissed => vec![
+            "What: Emits missed vectorization remarks (-Rpass-missed=loop-vectorize).",
+            "Why: Shows why loops were not vectorized.",
+            "Tip: Enable when diagnosing performance gaps.",
+        ],
+        ConfigRow::RpassAnalysis => vec![
+            "What: Emits analysis remarks from loop-vectorize.",
+            "Why: Reveals internal decision context before pass success/failure.",
+            "Tip: Useful for understanding profitability heuristics.",
+        ],
+        ConfigRow::PrintChanged => vec![
+            "What: Enables LLVM changed-IR trace (-mllvm -print-changed).",
+            "Why: Powers pass-by-pass IR timeline in this TUI.",
+            "Tip: Keep on for optimization workflow exploration.",
+        ],
+        ConfigRow::DebugInfo => vec![
+            "What: Emits debug metadata (-g).",
+            "Why: Keeps !dbg locations needed for source/IR mapping data.",
+            "Tip: Keep on during analysis unless compile speed is critical.",
+        ],
+        ConfigRow::ExtraCFlags => vec![
+            "What: Appends extra clang C flags to compile/link commands.",
+            "Why: Lets you quickly test hypotheses without changing code.",
+            "Tip: Example: -march=native or -fno-unroll-loops",
+        ],
+        ConfigRow::ExtraLlvmFlags => vec![
+            "What: Appends LLVM backend flags (each token passed via -mllvm).",
+            "Why: Enables fine-grained pass tuning/diagnostics.",
+            "Tip: Example: -debug-pass-manager",
+        ],
+    };
+
+    for line in body {
+        lines.push(Line::from(line.to_string()));
+    }
+
+    lines.push(Line::from(""));
+    let workflow_hint = if app.is_config_text_editing() {
+        "Workflow: You are editing text; Enter commits this field."
+    } else {
+        "Workflow: For pass tracking, try -O1 with vectorizers off, then re-enable selectively. Press 'd' to enter detail."
+    };
+    lines.push(Line::from(workflow_hint.to_string()));
+    lines
 }
 
 fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
@@ -110,14 +273,14 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
         .map(|b| b.name.as_str())
         .unwrap_or("-");
     let loop_id = app.selected_function_loop_id().unwrap_or("-");
-    let profile = app.active_profile.label();
+    let config_label = app.current_compiler_config().label();
 
     let session = app.active_session_for_selected_benchmark();
     let (verdict_text, verdict_color) = session
         .map(format_verdict)
         .unwrap_or_else(|| ("\u{2014}".to_string(), Color::DarkGray));
 
-    let left = format!("{benchmark_name} \u{00b7} {loop_id} \u{00b7} {profile}");
+    let left = format!("{benchmark_name} \u{00b7} {loop_id} \u{00b7} {config_label}");
     let line = Line::from(vec![
         Span::raw(left),
         Span::raw("     "),
@@ -498,7 +661,8 @@ fn render_benchmark_source_code(frame: &mut Frame, app: &AppState, area: ratatui
 }
 
 fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "q quit | \u{2190}\u{2192} focus pane | \u{2191}\u{2193} select-or-scroll | enter select function";
+    let hints =
+        "q quit | tab/s-tab focus pane | \u{2191}\u{2193} select-or-scroll | enter select function";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -509,7 +673,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "Tab/S-Tab cycle pane \u{00b7} \u{2191}\u{2193} navigate \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} p profile \u{00b7} c clear";
+    let hints = "Tab/S-Tab cycle pane \u{00b7} \u{2191}\u{2193} navigate \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} c clear";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -552,7 +716,7 @@ fn render_function_select_modal(frame: &mut Frame, app: &AppState) {
     }
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    let hint = Paragraph::new("\u{2191}\u{2193} move | enter confirm | esc cancel")
+    let hint = Paragraph::new("\u{2191}\u{2193} move | enter configure | esc cancel")
         .block(Block::bordered().title("Modal"));
     frame.render_widget(hint, hint_area);
 }

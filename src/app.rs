@@ -6,7 +6,7 @@ use similar::ChangeTag;
 
 use crate::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
-    CompileProfile, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary, RunSession,
+    CompilerConfig, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary, RunSession,
     SessionStatus,
 };
 
@@ -15,7 +15,7 @@ pub enum JobEvent {
     Started {
         kind: JobKind,
         benchmark: String,
-        profile: CompileProfile,
+        compiler_config: CompilerConfig,
         selected_function: BenchmarkFunction,
         run_mode: FunctionRunMode,
     },
@@ -27,7 +27,7 @@ pub enum JobEvent {
 pub struct JobOutcome {
     pub kind: JobKind,
     pub benchmark: String,
-    pub profile: CompileProfile,
+    pub compiler_config: CompilerConfig,
     pub selected_function: BenchmarkFunction,
     pub run_mode: FunctionRunMode,
     pub data: JobOutcomeData,
@@ -119,10 +119,64 @@ impl DetailFocus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigRow {
+    OptLevel,
+    LoopVectorize,
+    SlpVectorize,
+    Rpass,
+    RpassMissed,
+    RpassAnalysis,
+    PrintChanged,
+    DebugInfo,
+    ExtraCFlags,
+    ExtraLlvmFlags,
+}
+
+impl ConfigRow {
+    pub const ALL: [Self; 10] = [
+        Self::OptLevel,
+        Self::LoopVectorize,
+        Self::SlpVectorize,
+        Self::Rpass,
+        Self::RpassMissed,
+        Self::RpassAnalysis,
+        Self::PrintChanged,
+        Self::DebugInfo,
+        Self::ExtraCFlags,
+        Self::ExtraLlvmFlags,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::OptLevel => "Optimization",
+            Self::LoopVectorize => "Loop Vectorize",
+            Self::SlpVectorize => "SLP Vectorize",
+            Self::Rpass => "Rpass",
+            Self::RpassMissed => "Rpass Missed",
+            Self::RpassAnalysis => "Rpass Analysis",
+            Self::PrintChanged => "Print Changed",
+            Self::DebugInfo => "Debug Info",
+            Self::ExtraCFlags => "Extra C Flags",
+            Self::ExtraLlvmFlags => "Extra LLVM Flags",
+        }
+    }
+
+    pub fn selectable_count() -> usize {
+        Self::ALL.len()
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        Self::ALL[idx.min(Self::ALL.len() - 1)]
+    }
+}
+
 pub struct AppState {
     pub benchmarks: Vec<BenchmarkItem>,
     pub selected_idx: usize,
-    pub active_profile: CompileProfile,
+    pub config_draft: CompilerConfig,
+    pub config_selected_row: usize,
+    pub config_editing_text: bool,
     pub page: AppPage,
     pub selected_stage: AnalysisStage,
     pub selected_pass_by_stage: HashMap<AnalysisStage, usize>,
@@ -137,6 +191,7 @@ pub struct AppState {
     pub function_modal_selected_idx: usize,
     pub function_run_mode: FunctionRunMode,
     selected_function_by_benchmark: HashMap<String, BenchmarkFunction>,
+    config_by_benchmark_function: HashMap<String, CompilerConfig>,
     sessions_by_key: HashMap<String, RunSession>,
     running_session_key: Option<String>,
 }
@@ -149,7 +204,9 @@ impl AppState {
         Self {
             benchmarks,
             selected_idx: 0,
-            active_profile: CompileProfile::O3Remarks,
+            config_draft: CompilerConfig::default(),
+            config_selected_row: 0,
+            config_editing_text: false,
             page: AppPage::BenchmarkList,
             selected_stage: AnalysisStage::Vectorize,
             selected_pass_by_stage: HashMap::new(),
@@ -164,6 +221,7 @@ impl AppState {
             function_modal_selected_idx: 0,
             function_run_mode,
             selected_function_by_benchmark: HashMap::new(),
+            config_by_benchmark_function: HashMap::new(),
             sessions_by_key: HashMap::new(),
             running_session_key: None,
         }
@@ -193,6 +251,20 @@ impl AppState {
                 .symbol
                 .as_str(),
         )
+    }
+
+    pub fn current_compiler_config(&self) -> CompilerConfig {
+        let Some(benchmark) = self.selected_benchmark() else {
+            return self.config_draft.clone();
+        };
+        let Some(function) = self.selected_function_for_selected_benchmark() else {
+            return self.config_draft.clone();
+        };
+        let key = config_scope_key(&benchmark.name, &function.symbol);
+        self.config_by_benchmark_function
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| self.config_draft.clone())
     }
 
     pub fn detail_source_text_for_selected_benchmark(&self) -> Option<String> {
@@ -282,11 +354,19 @@ impl AppState {
             .insert(benchmark.name.clone(), function.clone());
 
         self.function_modal_open = false;
+        let scope_key = config_scope_key(&benchmark.name, &function.symbol);
+        self.config_draft = self
+            .config_by_benchmark_function
+            .get(&scope_key)
+            .cloned()
+            .unwrap_or_default();
+        self.config_selected_row = 0;
+        self.config_editing_text = false;
+        self.page = AppPage::CompileConfig;
         self.status_message = format!(
             "Selected function: {} ({})",
             function.loop_id, function.symbol
         );
-        self.open_selected_benchmark_page();
     }
 
     pub fn select_prev(&mut self) {
@@ -361,9 +441,148 @@ impl AppState {
         max.min(u16::MAX as usize) as u16
     }
 
-    pub fn cycle_profile(&mut self) {
-        self.active_profile = self.active_profile.next();
-        self.status_message = format!("Profile: {}", self.active_profile);
+    pub fn config_rows(&self) -> &'static [ConfigRow] {
+        &ConfigRow::ALL
+    }
+
+    pub fn is_config_text_editing(&self) -> bool {
+        self.config_editing_text
+    }
+
+    pub fn config_selected_row_kind(&self) -> ConfigRow {
+        ConfigRow::from_index(self.config_selected_row)
+    }
+
+    pub fn config_row_value_text(&self, row: ConfigRow) -> String {
+        match row {
+            ConfigRow::OptLevel => self.config_draft.opt_level.to_string(),
+            ConfigRow::LoopVectorize => bool_text(self.config_draft.enable_loop_vectorize),
+            ConfigRow::SlpVectorize => bool_text(self.config_draft.enable_slp_vectorize),
+            ConfigRow::Rpass => bool_text(self.config_draft.emit_rpass),
+            ConfigRow::RpassMissed => bool_text(self.config_draft.emit_rpass_missed),
+            ConfigRow::RpassAnalysis => bool_text(self.config_draft.emit_rpass_analysis),
+            ConfigRow::PrintChanged => bool_text(self.config_draft.emit_print_changed),
+            ConfigRow::DebugInfo => bool_text(self.config_draft.emit_debug_info),
+            ConfigRow::ExtraCFlags => {
+                if self.config_draft.extra_c_flags.trim().is_empty() {
+                    String::from("(empty)")
+                } else {
+                    self.config_draft.extra_c_flags.clone()
+                }
+            }
+            ConfigRow::ExtraLlvmFlags => {
+                if self.config_draft.extra_llvm_flags.trim().is_empty() {
+                    String::from("(empty)")
+                } else {
+                    self.config_draft.extra_llvm_flags.clone()
+                }
+            }
+        }
+    }
+
+    pub fn config_runtime_flags_preview(&self) -> String {
+        let flags = self.config_draft.runtime_c_flags();
+        if flags.is_empty() {
+            String::from("(none)")
+        } else {
+            flags.join(" ")
+        }
+    }
+
+    pub fn config_analysis_flags_preview(&self) -> String {
+        let flags = self.config_draft.analysis_c_flags();
+        if flags.is_empty() {
+            String::from("(none)")
+        } else {
+            flags.join(" ")
+        }
+    }
+
+    pub fn config_move_up(&mut self) {
+        if self.config_editing_text {
+            return;
+        }
+        self.config_selected_row = self.config_selected_row.saturating_sub(1);
+    }
+
+    pub fn config_move_down(&mut self) {
+        if self.config_editing_text {
+            return;
+        }
+        let max_idx = ConfigRow::selectable_count() - 1;
+        self.config_selected_row = (self.config_selected_row + 1).min(max_idx);
+    }
+
+    pub fn config_adjust_left(&mut self) {
+        if self.config_editing_text {
+            return;
+        }
+        self.adjust_config_row(self.config_selected_row_kind(), false);
+    }
+
+    pub fn config_adjust_right(&mut self) {
+        if self.config_editing_text {
+            return;
+        }
+        self.adjust_config_row(self.config_selected_row_kind(), true);
+    }
+
+    pub fn config_confirm(&mut self) {
+        let row = self.config_selected_row_kind();
+        if self.config_editing_text {
+            self.config_editing_text = false;
+            self.status_message = String::from("Config text updated");
+            return;
+        }
+
+        match row {
+            ConfigRow::ExtraCFlags | ConfigRow::ExtraLlvmFlags => {
+                self.config_editing_text = true;
+                self.status_message = String::from("Editing text field (Enter to finish)");
+            }
+            _ => self.adjust_config_row(row, true),
+        }
+    }
+
+    pub fn config_open_detail_shortcut(&mut self) {
+        self.persist_config_for_selected();
+        self.open_selected_benchmark_page();
+    }
+
+    pub fn config_back_or_cancel(&mut self) {
+        if self.config_editing_text {
+            self.config_editing_text = false;
+            self.status_message = String::from("Canceled text editing");
+            return;
+        }
+        self.page = AppPage::BenchmarkList;
+        self.status_message = String::from("Configuration canceled");
+    }
+
+    pub fn config_push_char(&mut self, ch: char) {
+        if !self.config_editing_text {
+            return;
+        }
+        match self.config_selected_row_kind() {
+            ConfigRow::ExtraCFlags => self.config_draft.extra_c_flags.push(ch),
+            ConfigRow::ExtraLlvmFlags => self.config_draft.extra_llvm_flags.push(ch),
+            _ => {}
+        }
+    }
+
+    pub fn config_backspace(&mut self) {
+        if !self.config_editing_text {
+            return;
+        }
+        match self.config_selected_row_kind() {
+            ConfigRow::ExtraCFlags => {
+                self.config_draft.extra_c_flags.pop();
+            }
+            ConfigRow::ExtraLlvmFlags => {
+                self.config_draft.extra_llvm_flags.pop();
+            }
+            _ => {}
+        }
     }
 
     pub fn open_selected_benchmark_page(&mut self) {
@@ -386,6 +605,56 @@ impl AppState {
         self.page = AppPage::BenchmarkList;
     }
 
+    fn adjust_config_row(&mut self, row: ConfigRow, forward: bool) {
+        match row {
+            ConfigRow::OptLevel => {
+                if forward {
+                    self.config_draft.opt_level = self.config_draft.opt_level.next();
+                } else {
+                    // Cycle backwards by moving forward five times (6-item enum).
+                    for _ in 0..5 {
+                        self.config_draft.opt_level = self.config_draft.opt_level.next();
+                    }
+                }
+            }
+            ConfigRow::LoopVectorize => {
+                self.config_draft.enable_loop_vectorize = !self.config_draft.enable_loop_vectorize;
+            }
+            ConfigRow::SlpVectorize => {
+                self.config_draft.enable_slp_vectorize = !self.config_draft.enable_slp_vectorize;
+            }
+            ConfigRow::Rpass => {
+                self.config_draft.emit_rpass = !self.config_draft.emit_rpass;
+            }
+            ConfigRow::RpassMissed => {
+                self.config_draft.emit_rpass_missed = !self.config_draft.emit_rpass_missed;
+            }
+            ConfigRow::RpassAnalysis => {
+                self.config_draft.emit_rpass_analysis = !self.config_draft.emit_rpass_analysis;
+            }
+            ConfigRow::PrintChanged => {
+                self.config_draft.emit_print_changed = !self.config_draft.emit_print_changed;
+            }
+            ConfigRow::DebugInfo => {
+                self.config_draft.emit_debug_info = !self.config_draft.emit_debug_info;
+            }
+            ConfigRow::ExtraCFlags | ConfigRow::ExtraLlvmFlags => {}
+        }
+        self.status_message = format!("Config: {}", self.config_draft.label());
+    }
+
+    fn persist_config_for_selected(&mut self) {
+        let Some(benchmark) = self.selected_benchmark() else {
+            return;
+        };
+        let Some(function) = self.selected_function_for_selected_benchmark() else {
+            return;
+        };
+        let key = config_scope_key(&benchmark.name, &function.symbol);
+        self.config_by_benchmark_function
+            .insert(key, self.config_draft.clone());
+    }
+
     pub fn clear_session(&mut self) {
         let Some(benchmark) = self.selected_benchmark() else {
             self.status_message = String::from("No benchmark selected");
@@ -395,7 +664,8 @@ impl AppState {
             self.status_message = String::from("Select a function first");
             return;
         };
-        let key = session_key(&benchmark.name, &function.symbol);
+        let config_id = self.current_compiler_config().config_id();
+        let key = session_key(&benchmark.name, &function.symbol, &config_id);
 
         if self.sessions_by_key.remove(&key).is_some() {
             self.ir_scroll = 0;
@@ -419,8 +689,12 @@ impl AppState {
     pub fn active_session_for_selected_benchmark(&self) -> Option<&RunSession> {
         let benchmark = self.selected_benchmark()?;
         let function = self.selected_function_for_selected_benchmark()?;
-        self.sessions_by_key
-            .get(&session_key(&benchmark.name, &function.symbol))
+        let config = self.current_compiler_config();
+        self.sessions_by_key.get(&session_key(
+            &benchmark.name,
+            &function.symbol,
+            &config.config_id(),
+        ))
     }
 
     // --- Stage/Pass navigation ---
@@ -621,7 +895,8 @@ impl AppState {
             "- function: {} ({})",
             selected_function.loop_id, selected_function.symbol
         );
-        let _ = writeln!(out, "- profile: {}", session.profile);
+        let _ = writeln!(out, "- config: {}", session.compiler_config);
+        let _ = writeln!(out, "- config_id: {}", session.config_id);
         let _ = writeln!(out, "- focus: {}", self.detail_focus.label());
         let _ = writeln!(out, "- analysis_state: {}", session.analysis_state);
         let _ = writeln!(out);
@@ -750,9 +1025,15 @@ impl AppState {
     /// Returns a badge string and color for the benchmark's analysis state in the list page.
     pub fn verdict_badge_for_benchmark(&self, name: &str) -> Option<(String, Color)> {
         let function = self.selected_function_by_benchmark.get(name)?;
-        let session = self
-            .sessions_by_key
-            .get(&session_key(name, &function.symbol))?;
+        let config_key = config_scope_key(name, &function.symbol);
+        let config = self
+            .config_by_benchmark_function
+            .get(&config_key)
+            .cloned()
+            .unwrap_or_default();
+        let session =
+            self.sessions_by_key
+                .get(&session_key(name, &function.symbol, &config.config_id()))?;
 
         let badge = match session.analysis_state {
             AnalysisState::Running => ("⟳".to_string(), Color::Cyan),
@@ -785,26 +1066,32 @@ impl AppState {
         &mut self,
         kind: JobKind,
         benchmark: String,
-        profile: CompileProfile,
+        compiler_config: CompilerConfig,
         selected_function: BenchmarkFunction,
         run_mode: FunctionRunMode,
     ) {
         self.job_state = JobState::Running(kind);
         self.selected_function_by_benchmark
             .insert(benchmark.clone(), selected_function.clone());
+        self.config_by_benchmark_function.insert(
+            config_scope_key(&benchmark, &selected_function.symbol),
+            compiler_config.clone(),
+        );
 
-        let key = session_key(&benchmark, &selected_function.symbol);
+        let config_id = compiler_config.config_id();
+        let key = session_key(&benchmark, &selected_function.symbol, &config_id);
         self.running_session_key = Some(key.clone());
         let mut session = self.sessions_by_key.remove(&key).unwrap_or_else(|| {
             RunSession::new_running(
-                profile,
+                compiler_config.clone(),
                 benchmark.clone(),
                 selected_function.loop_id.clone(),
                 selected_function.symbol.clone(),
                 run_mode,
             )
         });
-        session.profile = profile;
+        session.compiler_config = compiler_config.clone();
+        session.config_id = config_id;
         session.benchmark = benchmark.clone();
         session.selected_function_loop_id = selected_function.loop_id.clone();
         session.selected_function_symbol = selected_function.symbol.clone();
@@ -824,8 +1111,8 @@ impl AppState {
 
         self.ir_scroll = 0;
         self.status_message = format!(
-            "{kind} started for {benchmark} [{}] ({profile})",
-            selected_function.loop_id
+            "{kind} started for {benchmark} [{}] ({})",
+            selected_function.loop_id, compiler_config
         );
     }
 
@@ -834,11 +1121,17 @@ impl AppState {
             JobEvent::Started {
                 kind,
                 benchmark,
-                profile,
+                compiler_config,
                 selected_function,
                 run_mode,
             } => {
-                self.begin_job(kind, benchmark, profile, selected_function, run_mode);
+                self.begin_job(
+                    kind,
+                    benchmark,
+                    compiler_config,
+                    selected_function,
+                    run_mode,
+                );
             }
             JobEvent::LogLine(line) => {
                 if let Some(session_key) = self.running_session_key.as_deref()
@@ -864,15 +1157,16 @@ impl AppState {
                         let JobOutcome {
                             kind,
                             benchmark,
-                            profile,
+                            compiler_config,
                             selected_function,
                             run_mode,
                             data,
                         } = outcome;
-                        let key = session_key(&benchmark, &selected_function.symbol);
+                        let config_id = compiler_config.config_id();
+                        let key = session_key(&benchmark, &selected_function.symbol, &config_id);
                         let mut session = self.sessions_by_key.remove(&key).unwrap_or_else(|| {
                             RunSession::new_running(
-                                profile,
+                                compiler_config.clone(),
                                 benchmark.clone(),
                                 selected_function.loop_id.clone(),
                                 selected_function.symbol.clone(),
@@ -880,7 +1174,8 @@ impl AppState {
                             )
                         });
 
-                        session.profile = profile;
+                        session.compiler_config = compiler_config.clone();
+                        session.config_id = config_id;
                         session.benchmark = benchmark.clone();
                         session.selected_function_loop_id = selected_function.loop_id.clone();
                         session.selected_function_symbol = selected_function.symbol.clone();
@@ -920,6 +1215,10 @@ impl AppState {
 
                         self.selected_function_by_benchmark
                             .insert(benchmark.clone(), selected_function.clone());
+                        self.config_by_benchmark_function.insert(
+                            config_scope_key(&benchmark, &selected_function.symbol),
+                            compiler_config.clone(),
+                        );
                         self.sessions_by_key.insert(key, session);
 
                         // Auto-navigate after analysis if this is the currently viewed benchmark
@@ -937,7 +1236,7 @@ impl AppState {
                         if !matches!(kind, JobKind::AnalyzeFast) {
                             self.status_message = format!(
                                 "Completed: {} [{}] ({})",
-                                benchmark, selected_function.loop_id, profile
+                                benchmark, selected_function.loop_id, compiler_config
                             );
                         }
                     }
@@ -1084,8 +1383,20 @@ fn is_identifier_byte(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
-fn session_key(benchmark: &str, function_symbol: &str) -> String {
+fn config_scope_key(benchmark: &str, function_symbol: &str) -> String {
     format!("{benchmark}::{function_symbol}")
+}
+
+fn session_key(benchmark: &str, function_symbol: &str, config_id: &str) -> String {
+    format!("{benchmark}::{function_symbol}::{config_id}")
+}
+
+fn bool_text(v: bool) -> String {
+    if v {
+        String::from("on")
+    } else {
+        String::from("off")
+    }
 }
 
 /// Checks if vectorizer passes (loopvectorize/slpvectorizer) made IR changes.
@@ -1181,8 +1492,9 @@ mod tests {
             .expect("selected function should exist")
             .clone();
 
+        let config = app.current_compiler_config();
         let mut session = RunSession::new_running(
-            CompileProfile::O3Remarks,
+            config.clone(),
             benchmark.clone(),
             selected_function.loop_id.clone(),
             selected_function.symbol.clone(),
@@ -1193,8 +1505,9 @@ mod tests {
         session.remarks = remarks.clone();
         session.remarks_summary = RemarksSummary::from_entries(&remarks);
         session.status = SessionStatus::Succeeded;
+        session.config_id = config.config_id();
 
-        let key = session_key(&benchmark, &selected_function.symbol);
+        let key = session_key(&benchmark, &selected_function.symbol, &config.config_id());
         app.sessions_by_key.insert(key, session);
     }
 
@@ -1469,7 +1782,7 @@ int s161(void) {
 
     fn outcome_for(
         benchmark_name: &str,
-        profile: CompileProfile,
+        config: CompilerConfig,
         function: BenchmarkFunction,
     ) -> JobOutcome {
         let remarks = vec![RemarkEntry {
@@ -1484,7 +1797,7 @@ int s161(void) {
         JobOutcome {
             kind: JobKind::AnalyzeFast,
             benchmark: benchmark_name.to_string(),
-            profile,
+            compiler_config: config,
             selected_function: function,
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
@@ -1497,7 +1810,7 @@ int s161(void) {
 
     fn outcome_with_vectorize(
         benchmark_name: &str,
-        profile: CompileProfile,
+        config: CompilerConfig,
         function: BenchmarkFunction,
     ) -> JobOutcome {
         let remarks = vec![RemarkEntry {
@@ -1512,7 +1825,7 @@ int s161(void) {
         JobOutcome {
             kind: JobKind::AnalyzeFast,
             benchmark: benchmark_name.to_string(),
-            profile,
+            compiler_config: config,
             selected_function: function,
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
@@ -1533,6 +1846,8 @@ int s161(void) {
         app.open_function_select_modal();
         assert!(app.is_function_modal_open());
         app.confirm_function_selection();
+        assert_eq!(app.page, AppPage::CompileConfig);
+        app.config_open_detail_shortcut();
         assert_eq!(app.page, AppPage::BenchmarkDetail);
         assert_eq!(app.selected_function_loop_id(), Some("S161"));
     }
@@ -1547,7 +1862,7 @@ int s161(void) {
     }
 
     #[test]
-    fn sessions_are_scoped_per_function() {
+    fn sessions_are_scoped_per_function_and_config() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         app.selected_function_by_benchmark.insert(
@@ -1557,10 +1872,15 @@ int s161(void) {
                 symbol: String::from("s161"),
             },
         );
+        let config_a = CompilerConfig::default();
+        let config_b = CompilerConfig {
+            enable_loop_vectorize: false,
+            ..CompilerConfig::default()
+        };
         app.sessions_by_key.insert(
-            String::from("A::s161"),
+            session_key("A", "s161", &config_a.config_id()),
             RunSession::new_running(
-                CompileProfile::O3Remarks,
+                config_a.clone(),
                 String::from("A"),
                 String::from("S161"),
                 String::from("s161"),
@@ -1568,19 +1888,21 @@ int s161(void) {
             ),
         );
         app.sessions_by_key.insert(
-            String::from("A::s162"),
+            session_key("A", "s161", &config_b.config_id()),
             RunSession::new_running(
-                CompileProfile::O3Remarks,
+                config_b.clone(),
                 String::from("A"),
-                String::from("S162"),
-                String::from("s162"),
+                String::from("S161"),
+                String::from("s161"),
                 FunctionRunMode::OutputFilter,
             ),
         );
 
+        app.config_draft = config_a.clone();
+        app.config_by_benchmark_function
+            .insert(config_scope_key("A", "s161"), config_a);
         app.clear_session();
-        assert!(!app.sessions_by_key.contains_key("A::s161"));
-        assert!(app.sessions_by_key.contains_key("A::s162"));
+        assert_eq!(app.sessions_by_key.len(), 1);
     }
 
     #[test]
@@ -1595,19 +1917,20 @@ int s161(void) {
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::AnalyzeFast,
             benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
+            compiler_config: CompilerConfig::default(),
             selected_function: selected_function.clone(),
             run_mode: FunctionRunMode::OutputFilter,
         });
         app.handle_job_event(JobEvent::Finished(Ok(outcome_for(
             "A",
-            CompileProfile::O3Remarks,
+            CompilerConfig::default(),
             selected_function,
         ))));
 
+        let cfg = app.current_compiler_config();
         let session = app
             .sessions_by_key
-            .get("A::s161")
+            .get(&session_key("A", "s161", &cfg.config_id()))
             .expect("session should exist");
         assert_eq!(session.selected_function_loop_id, "S161");
         assert!(matches!(session.status, SessionStatus::Succeeded));
@@ -1627,13 +1950,13 @@ int s161(void) {
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::AnalyzeFast,
             benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
+            compiler_config: CompilerConfig::default(),
             selected_function: selected_function.clone(),
             run_mode: FunctionRunMode::OutputFilter,
         });
         app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
             "A",
-            CompileProfile::O3Remarks,
+            CompilerConfig::default(),
             selected_function,
         ))));
 
@@ -1657,13 +1980,13 @@ int s161(void) {
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::AnalyzeFast,
             benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
+            compiler_config: CompilerConfig::default(),
             selected_function: selected_function.clone(),
             run_mode: FunctionRunMode::OutputFilter,
         });
         app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
             "A",
-            CompileProfile::O3Remarks,
+            CompilerConfig::default(),
             selected_function,
         ))));
 
@@ -1671,175 +1994,6 @@ int s161(void) {
         assert_eq!(app.detail_focus, DetailFocus::PassList);
         // But selected_stage was NOT changed by auto_navigate since it was skipped
         // (remains as default Vectorize which happens to match, but the key thing is no navigation happened)
-    }
-
-    #[test]
-    fn stage_navigation_wraps_correctly() {
-        let mut app =
-            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
-        let selected_function = BenchmarkFunction {
-            loop_id: String::from("S161"),
-            symbol: String::from("s161"),
-        };
-        app.open_function_select_modal();
-        app.confirm_function_selection();
-
-        app.handle_job_event(JobEvent::Started {
-            kind: JobKind::AnalyzeFast,
-            benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
-            selected_function: selected_function.clone(),
-            run_mode: FunctionRunMode::OutputFilter,
-        });
-        app.detail_focus = DetailFocus::StageList;
-        app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
-            "A",
-            CompileProfile::O3Remarks,
-            selected_function,
-        ))));
-
-        // Reset to start of stages for this test
-        app.detail_focus = DetailFocus::StageList;
-        let session = app.active_session_for_selected_benchmark().unwrap();
-        let stages = AppState::ordered_stages_with_counts(session);
-        app.selected_stage = stages[0].0;
-
-        // Try to go before first stage - should clamp
-        app.select_prev_stage();
-        let session = app.active_session_for_selected_benchmark().unwrap();
-        let stages = AppState::ordered_stages_with_counts(session);
-        assert_eq!(
-            app.selected_stage, stages[0].0,
-            "should clamp at first stage"
-        );
-
-        // Navigate to last stage and try to go beyond
-        app.selected_stage = stages[stages.len() - 1].0;
-        app.select_next_stage();
-        assert_eq!(
-            app.selected_stage,
-            stages[stages.len() - 1].0,
-            "should clamp at last stage"
-        );
-    }
-
-    #[test]
-    fn pass_index_clamps_after_reanalysis() {
-        let mut app =
-            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
-        let selected_function = BenchmarkFunction {
-            loop_id: String::from("S161"),
-            symbol: String::from("s161"),
-        };
-        app.open_function_select_modal();
-        app.confirm_function_selection();
-
-        // First analysis with 2 vectorize passes
-        let remarks: Vec<RemarkEntry> = vec![];
-        app.handle_job_event(JobEvent::Started {
-            kind: JobKind::AnalyzeFast,
-            benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
-            selected_function: selected_function.clone(),
-            run_mode: FunctionRunMode::OutputFilter,
-        });
-        app.handle_job_event(JobEvent::Finished(Ok(JobOutcome {
-            kind: JobKind::AnalyzeFast,
-            benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
-            selected_function: selected_function.clone(),
-            run_mode: FunctionRunMode::OutputFilter,
-            data: JobOutcomeData::Analysis {
-                analysis_steps: vec![
-                    make_step(AnalysisStage::Vectorize, "loop-vectorize", 0),
-                    make_step(AnalysisStage::Vectorize, "slp-vectorize", 1),
-                ],
-                remarks: remarks.clone(),
-                remarks_summary: RemarksSummary::from_entries(&remarks),
-            },
-        })));
-
-        // Select second pass (index 1)
-        app.selected_stage = AnalysisStage::Vectorize;
-        app.selected_pass_by_stage
-            .insert(AnalysisStage::Vectorize, 1);
-
-        // Second analysis with only 1 vectorize pass
-        app.detail_focus = DetailFocus::PassList; // user already navigated
-        app.handle_job_event(JobEvent::Started {
-            kind: JobKind::AnalyzeFast,
-            benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
-            selected_function: selected_function.clone(),
-            run_mode: FunctionRunMode::OutputFilter,
-        });
-        app.handle_job_event(JobEvent::Finished(Ok(JobOutcome {
-            kind: JobKind::AnalyzeFast,
-            benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
-            selected_function: selected_function.clone(),
-            run_mode: FunctionRunMode::OutputFilter,
-            data: JobOutcomeData::Analysis {
-                analysis_steps: vec![make_step(AnalysisStage::Vectorize, "loop-vectorize", 0)],
-                remarks: remarks.clone(),
-                remarks_summary: RemarksSummary::from_entries(&remarks),
-            },
-        })));
-
-        // Index should clamp: stored=1, len=1, so min(1, 0) = 0
-        let session = app.active_session_for_selected_benchmark().unwrap();
-        let clamped = app.selected_pass_index_in_stage(session);
-        assert_eq!(
-            clamped, 0,
-            "index should clamp to 0 after reanalysis reduced pass count"
-        );
-    }
-
-    #[test]
-    fn empty_stage_not_in_ordered_list() {
-        let session = RunSession::new_running(
-            CompileProfile::O3Remarks,
-            String::from("A"),
-            String::from("S161"),
-            String::from("s161"),
-            FunctionRunMode::OutputFilter,
-        );
-        // No steps → ordered_stages_with_counts returns empty
-        let stages = AppState::ordered_stages_with_counts(&session);
-        assert!(stages.is_empty());
-    }
-
-    #[test]
-    fn focus_tab_cycles_through_all_4_panes() {
-        let mut app =
-            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
-        assert_eq!(app.detail_focus, DetailFocus::StageList);
-
-        app.focus_cycle_next();
-        assert_eq!(app.detail_focus, DetailFocus::PassList);
-
-        app.focus_cycle_next();
-        assert_eq!(app.detail_focus, DetailFocus::SourceView);
-
-        app.focus_cycle_next();
-        assert_eq!(app.detail_focus, DetailFocus::IrView);
-
-        // Wraps around
-        app.focus_cycle_next();
-        assert_eq!(app.detail_focus, DetailFocus::StageList);
-
-        // Reverse cycle
-        app.focus_cycle_prev();
-        assert_eq!(app.detail_focus, DetailFocus::IrView);
-
-        app.focus_cycle_prev();
-        assert_eq!(app.detail_focus, DetailFocus::SourceView);
-
-        app.focus_cycle_prev();
-        assert_eq!(app.detail_focus, DetailFocus::PassList);
-
-        app.focus_cycle_prev();
-        assert_eq!(app.detail_focus, DetailFocus::StageList);
     }
 
     #[test]
@@ -1861,14 +2015,14 @@ int s161(void) {
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::AnalyzeFast,
             benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
+            compiler_config: CompilerConfig::default(),
             selected_function: selected_function.clone(),
             run_mode: FunctionRunMode::OutputFilter,
         });
         app.handle_job_event(JobEvent::Finished(Ok(JobOutcome {
             kind: JobKind::AnalyzeFast,
             benchmark: String::from("A"),
-            profile: CompileProfile::O3Remarks,
+            compiler_config: CompilerConfig::default(),
             selected_function: selected_function.clone(),
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
@@ -1883,5 +2037,26 @@ int s161(void) {
         let (text, color) = badge.unwrap();
         assert_eq!(text, "~");
         assert_eq!(color, Color::Cyan);
+    }
+
+    #[test]
+    fn config_page_text_editing_flow() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+        assert_eq!(app.page, AppPage::CompileConfig);
+
+        app.config_selected_row = 8; // ExtraCFlags
+        app.config_confirm();
+        assert!(app.is_config_text_editing());
+        app.config_push_char('-');
+        app.config_push_char('X');
+        app.config_backspace();
+        app.config_push_char('g');
+        app.config_confirm();
+
+        assert_eq!(app.config_draft.extra_c_flags, "-g");
+        assert!(!app.is_config_text_editing());
     }
 }

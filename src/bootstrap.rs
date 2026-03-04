@@ -87,10 +87,7 @@ fn clone_llvm_test_suite(target_dir: &Path) -> AppResult<()> {
             .arg(target_dir)
             .arg("sparse-checkout")
             .arg("set")
-            .arg("MultiSource/Benchmarks/TSVC")
-            .arg("cmake")
-            .arg("litsupport")
-            .arg("tools"),
+            .arg("MultiSource/Benchmarks/TSVC"),
         "git sparse-checkout set",
     )?;
 

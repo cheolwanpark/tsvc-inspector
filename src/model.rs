@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use similar::ChangeTag;
 
@@ -27,15 +28,18 @@ pub struct BenchmarkFunction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppPage {
     BenchmarkList,
+    CompileConfig,
     BenchmarkDetail,
 }
 
-#[allow(clippy::enum_variant_names)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CompileProfile {
-    O3Remarks,
-    O3NoVec,
-    O3Default,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OptimizationLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+    Os,
+    Oz,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,66 +48,161 @@ pub enum BuildPurpose {
     Analysis,
 }
 
-impl CompileProfile {
-    pub fn c_flags_for(self, purpose: BuildPurpose) -> &'static str {
-        match (self, purpose) {
-            (Self::O3Remarks, BuildPurpose::Runtime) => "-O3",
-            (Self::O3NoVec, BuildPurpose::Runtime) => "-O3 -fno-vectorize -fno-slp-vectorize",
-            (Self::O3Default, BuildPurpose::Runtime) => "-O3",
-            (Self::O3Remarks, BuildPurpose::Analysis) => {
-                "-O3 -g -Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
-            }
-            (Self::O3NoVec, BuildPurpose::Analysis) => {
-                "-O3 -g -fno-vectorize -fno-slp-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize -fsave-optimization-record -mllvm -print-changed"
-            }
-            (Self::O3Default, BuildPurpose::Analysis) => {
-                "-O3 -g -fsave-optimization-record -mllvm -print-changed"
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn c_flags(self) -> &'static str {
-        self.c_flags_for(BuildPurpose::Analysis)
-    }
-
-    pub fn build_dir_name_for(self, purpose: BuildPurpose) -> &'static str {
-        match (self, purpose) {
-            (Self::O3Remarks, BuildPurpose::Runtime) => "build-tsvc-o3-remarks-run",
-            (Self::O3NoVec, BuildPurpose::Runtime) => "build-tsvc-o3-novec-run",
-            (Self::O3Default, BuildPurpose::Runtime) => "build-tsvc-o3-default-run",
-            (Self::O3Remarks, BuildPurpose::Analysis) => "build-tsvc-o3-remarks-analysis",
-            (Self::O3NoVec, BuildPurpose::Analysis) => "build-tsvc-o3-novec-analysis",
-            (Self::O3Default, BuildPurpose::Analysis) => "build-tsvc-o3-default-analysis",
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn build_dir_name(self) -> &'static str {
-        self.build_dir_name_for(BuildPurpose::Analysis)
-    }
-
-    pub fn label(self) -> &'static str {
+impl OptimizationLevel {
+    pub fn flag(self) -> &'static str {
         match self {
-            Self::O3Remarks => "O3 + remarks",
-            Self::O3NoVec => "O3 no-vectorize",
-            Self::O3Default => "O3 default",
+            Self::O0 => "-O0",
+            Self::O1 => "-O1",
+            Self::O2 => "-O2",
+            Self::O3 => "-O3",
+            Self::Os => "-Os",
+            Self::Oz => "-Oz",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::O3Remarks => Self::O3NoVec,
-            Self::O3NoVec => Self::O3Default,
-            Self::O3Default => Self::O3Remarks,
+            Self::O0 => Self::O1,
+            Self::O1 => Self::O2,
+            Self::O2 => Self::O3,
+            Self::O3 => Self::Os,
+            Self::Os => Self::Oz,
+            Self::Oz => Self::O0,
         }
     }
 }
 
-impl fmt::Display for CompileProfile {
+impl fmt::Display for OptimizationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.flag())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CompilerConfig {
+    pub opt_level: OptimizationLevel,
+    pub enable_loop_vectorize: bool,
+    pub enable_slp_vectorize: bool,
+    pub emit_rpass: bool,
+    pub emit_rpass_missed: bool,
+    pub emit_rpass_analysis: bool,
+    pub emit_print_changed: bool,
+    pub emit_debug_info: bool,
+    pub extra_c_flags: String,
+    pub extra_llvm_flags: String,
+}
+
+impl Default for CompilerConfig {
+    fn default() -> Self {
+        Self {
+            opt_level: OptimizationLevel::O3,
+            enable_loop_vectorize: true,
+            enable_slp_vectorize: true,
+            emit_rpass: true,
+            emit_rpass_missed: true,
+            emit_rpass_analysis: true,
+            emit_print_changed: true,
+            emit_debug_info: true,
+            extra_c_flags: String::new(),
+            extra_llvm_flags: String::new(),
+        }
+    }
+}
+
+impl CompilerConfig {
+    pub fn runtime_c_flags(&self) -> Vec<String> {
+        let mut flags = vec![self.opt_level.flag().to_string()];
+        if !self.enable_loop_vectorize {
+            flags.push(String::from("-fno-vectorize"));
+        }
+        if !self.enable_slp_vectorize {
+            flags.push(String::from("-fno-slp-vectorize"));
+        }
+        flags.extend(split_flags(&self.extra_c_flags));
+        flags
+    }
+
+    pub fn analysis_c_flags(&self) -> Vec<String> {
+        let mut flags = self.runtime_c_flags();
+        if self.emit_debug_info {
+            flags.push(String::from("-g"));
+        }
+        if self.emit_rpass {
+            flags.push(String::from("-Rpass=loop-vectorize"));
+        }
+        if self.emit_rpass_missed {
+            flags.push(String::from("-Rpass-missed=loop-vectorize"));
+        }
+        if self.emit_rpass_analysis {
+            flags.push(String::from("-Rpass-analysis=loop-vectorize"));
+        }
+        flags.push(String::from("-fsave-optimization-record"));
+
+        if self.emit_print_changed {
+            flags.push(String::from("-mllvm"));
+            flags.push(String::from("-print-changed"));
+        }
+
+        for token in split_flags(&self.extra_llvm_flags) {
+            flags.push(String::from("-mllvm"));
+            flags.push(token);
+        }
+
+        flags
+    }
+
+    pub fn c_flags_for(&self, purpose: BuildPurpose) -> Vec<String> {
+        match purpose {
+            BuildPurpose::Runtime => self.runtime_c_flags(),
+            BuildPurpose::Analysis => self.analysis_c_flags(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!(
+            "{} lv:{} slp:{} trace:{}",
+            self.opt_level,
+            on_off(self.enable_loop_vectorize),
+            on_off(self.enable_slp_vectorize),
+            on_off(self.emit_print_changed),
+        )
+    }
+
+    pub fn canonical_key(&self) -> String {
+        format!(
+            "opt={}|lv={}|slp={}|rpass={}|rpass_missed={}|rpass_analysis={}|print_changed={}|dbg={}|extra_c={}|extra_llvm={}",
+            self.opt_level.flag(),
+            self.enable_loop_vectorize as u8,
+            self.enable_slp_vectorize as u8,
+            self.emit_rpass as u8,
+            self.emit_rpass_missed as u8,
+            self.emit_rpass_analysis as u8,
+            self.emit_print_changed as u8,
+            self.emit_debug_info as u8,
+            self.extra_c_flags.trim(),
+            self.extra_llvm_flags.trim(),
+        )
+    }
+
+    pub fn config_id(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.canonical_key().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+}
+
+impl fmt::Display for CompilerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.label())
     }
+}
+
+fn split_flags(text: &str) -> Vec<String> {
+    text.split_whitespace().map(ToString::to_string).collect()
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,7 +446,8 @@ impl fmt::Display for SessionStatus {
 
 #[derive(Clone, Debug)]
 pub struct RunSession {
-    pub profile: CompileProfile,
+    pub compiler_config: CompilerConfig,
+    pub config_id: String,
     pub benchmark: String,
     pub selected_function_loop_id: String,
     pub selected_function_symbol: String,
@@ -363,14 +463,16 @@ pub struct RunSession {
 
 impl RunSession {
     pub fn new_running(
-        profile: CompileProfile,
+        compiler_config: CompilerConfig,
         benchmark: String,
         selected_function_loop_id: String,
         selected_function_symbol: String,
         run_mode: FunctionRunMode,
     ) -> Self {
+        let config_id = compiler_config.config_id();
         Self {
-            profile,
+            compiler_config,
+            config_id,
             benchmark,
             selected_function_loop_id,
             selected_function_symbol,
@@ -383,5 +485,41 @@ impl RunSession {
             logs: Vec::new(),
             status: SessionStatus::Running,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_compiler_config_has_analysis_features_enabled() {
+        let cfg = CompilerConfig::default();
+        let flags = cfg.analysis_c_flags();
+        assert!(flags.iter().any(|f| f == "-g"));
+        assert!(flags.iter().any(|f| f == "-fsave-optimization-record"));
+        assert!(flags.iter().any(|f| f == "-print-changed"));
+    }
+
+    #[test]
+    fn runtime_flags_reflect_vectorizer_toggles() {
+        let cfg = CompilerConfig {
+            enable_loop_vectorize: false,
+            enable_slp_vectorize: false,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-fno-vectorize"));
+        assert!(flags.iter().any(|f| f == "-fno-slp-vectorize"));
+    }
+
+    #[test]
+    fn config_id_changes_when_field_changes() {
+        let cfg_a = CompilerConfig::default();
+        let cfg_b = CompilerConfig {
+            emit_print_changed: false,
+            ..CompilerConfig::default()
+        };
+        assert_ne!(cfg_a.config_id(), cfg_b.config_id());
     }
 }

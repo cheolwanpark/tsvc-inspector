@@ -6,31 +6,39 @@ pub enum UserAction {
     Quit,
     MoveUp,
     MoveDown,
+    MoveLeft,
+    MoveRight,
     Confirm,               // Enter
     BackToBenchmarkList,   // Esc
     FocusNextPaneCycle,    // Tab
     FocusPrevPaneCycle,    // Shift-Tab
-    CycleProfile,          // 'p'
     Run,                   // 'r' → BuildAndRun
     Analyze,               // 'a' → AnalyzeFast
+    OpenDetailPage,        // 'd' → Enter BenchmarkDetail from CompileConfig
     ClearSession,          // 'c'
     CopyDetailToClipboard, // 'y'
+    Backspace,             // Backspace
+    TextChar(char),        // Generic text input for config page
 }
 
 pub fn map_key_event(key: KeyEvent) -> UserAction {
     match key.code {
         KeyCode::Char('q') => UserAction::Quit,
-        KeyCode::Up => UserAction::MoveUp,
-        KeyCode::Down => UserAction::MoveDown,
-        KeyCode::Enter => UserAction::Confirm,
-        KeyCode::Esc => UserAction::BackToBenchmarkList,
-        KeyCode::Tab => UserAction::FocusNextPaneCycle,
-        KeyCode::BackTab => UserAction::FocusPrevPaneCycle,
-        KeyCode::Char('p') => UserAction::CycleProfile,
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::Analyze,
+        KeyCode::Char('d') => UserAction::OpenDetailPage,
         KeyCode::Char('c') => UserAction::ClearSession,
         KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
+        KeyCode::Char(ch) => UserAction::TextChar(ch),
+        KeyCode::Up => UserAction::MoveUp,
+        KeyCode::Down => UserAction::MoveDown,
+        KeyCode::Left => UserAction::MoveLeft,
+        KeyCode::Right => UserAction::MoveRight,
+        KeyCode::Enter => UserAction::Confirm,
+        KeyCode::Esc => UserAction::BackToBenchmarkList,
+        KeyCode::Backspace => UserAction::Backspace,
+        KeyCode::Tab => UserAction::FocusNextPaneCycle,
+        KeyCode::BackTab => UserAction::FocusPrevPaneCycle,
         _ => UserAction::None,
     }
 }
@@ -56,8 +64,8 @@ mod tests {
             map_key_event(key(KeyCode::Esc)),
             UserAction::BackToBenchmarkList
         );
-        assert_eq!(map_key_event(key(KeyCode::Left)), UserAction::None);
-        assert_eq!(map_key_event(key(KeyCode::Right)), UserAction::None);
+        assert_eq!(map_key_event(key(KeyCode::Left)), UserAction::MoveLeft);
+        assert_eq!(map_key_event(key(KeyCode::Right)), UserAction::MoveRight);
         assert_eq!(
             map_key_event(key(KeyCode::Tab)),
             UserAction::FocusNextPaneCycle
@@ -66,16 +74,24 @@ mod tests {
             map_key_event(key(KeyCode::BackTab)),
             UserAction::FocusPrevPaneCycle
         );
-        // Removed keys return None
-        assert_eq!(map_key_event(key(KeyCode::Char('o'))), UserAction::None);
-        assert_eq!(map_key_event(key(KeyCode::Char('b'))), UserAction::None);
-        assert_eq!(map_key_event(key(KeyCode::Char('X'))), UserAction::None);
-        // New bindings
+
         assert_eq!(map_key_event(key(KeyCode::Char('a'))), UserAction::Analyze);
         assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
         assert_eq!(
+            map_key_event(key(KeyCode::Char('d'))),
+            UserAction::OpenDetailPage
+        );
+        assert_eq!(
             map_key_event(key(KeyCode::Char('y'))),
             UserAction::CopyDetailToClipboard
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('o'))),
+            UserAction::TextChar('o')
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Backspace)),
+            UserAction::Backspace
         );
     }
 }
