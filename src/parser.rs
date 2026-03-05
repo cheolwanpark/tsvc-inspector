@@ -8,8 +8,8 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::error::AppResult;
 use crate::model::{
-    AnalysisSource, AnalysisStage, AnalysisStep, IrDiffStep, IrLine, LoopResult, OptimizationStep,
-    RemarkEntry, RemarkKind,
+    AnalysisSource, AnalysisStage, AnalysisStep, DbgLocation, IrDiffStep, IrLine, LoopResult,
+    OptimizationStep, RemarkEntry, RemarkKind,
 };
 
 #[allow(dead_code)]
@@ -295,17 +295,92 @@ pub fn build_fast_analysis_steps(
 
 /// Scans module IR for `!N = !DILocation(line: X, ...)` entries.
 /// Returns metadata ID → source line number.
-pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, u32> {
-    let re = Regex::new(r"!(\d+) = !DILocation\(line: (\d+)").expect("valid DILocation regex");
+fn resolve_scope_names(module_ir: &str) -> HashMap<u32, String> {
+    let subprogram_re =
+        Regex::new(r#"!(\d+)\s*=\s*distinct\s+!DISubprogram\(.*?name:\s*"([^"]+)""#)
+            .expect("valid DISubprogram regex");
+    let block_re =
+        Regex::new(r"!(\d+)\s*=\s*distinct\s+!DILexicalBlock\(.*?scope:\s*!(\d+)")
+            .expect("valid DILexicalBlock regex");
+
+    let mut subprogram_names: HashMap<u32, String> = HashMap::new();
+    let mut block_parents: HashMap<u32, u32> = HashMap::new();
+
+    for caps in subprogram_re.captures_iter(module_ir) {
+        if let (Some(id_m), Some(name_m)) = (caps.get(1), caps.get(2))
+            && let Ok(id) = id_m.as_str().parse::<u32>()
+        {
+            subprogram_names.insert(id, name_m.as_str().to_string());
+        }
+    }
+
+    for caps in block_re.captures_iter(module_ir) {
+        if let (Some(id_m), Some(parent_m)) = (caps.get(1), caps.get(2))
+            && let (Ok(id), Ok(parent)) =
+                (id_m.as_str().parse::<u32>(), parent_m.as_str().parse::<u32>())
+        {
+            block_parents.insert(id, parent);
+        }
+    }
+
+    let mut resolved: HashMap<u32, String> = HashMap::new();
+
+    let all_ids: Vec<u32> = subprogram_names
+        .keys()
+        .chain(block_parents.keys())
+        .copied()
+        .collect();
+
+    for id in all_ids {
+        if resolved.contains_key(&id) {
+            continue;
+        }
+        let mut current = id;
+        let mut depth = 0;
+        loop {
+            if let Some(name) = subprogram_names.get(&current) {
+                resolved.insert(id, name.clone());
+                break;
+            }
+            if let Some(&parent) = block_parents.get(&current) {
+                depth += 1;
+                if depth > 20 {
+                    break;
+                }
+                current = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    resolved
+}
+
+pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, DbgLocation> {
+    let re = Regex::new(
+        r"!(\d+) = !DILocation\(line: (\d+),.*?scope: !(\d+)(?:.*?(inlinedAt))?.*?\)",
+    )
+    .expect("valid DILocation regex");
+
+    let scope_names = resolve_scope_names(module_ir);
     let mut map = HashMap::new();
+
     for caps in re.captures_iter(module_ir) {
-        if let (Some(id_match), Some(line_match)) = (caps.get(1), caps.get(2))
-            && let (Ok(id), Ok(line)) = (
+        if let (Some(id_match), Some(line_match), Some(scope_match)) =
+            (caps.get(1), caps.get(2), caps.get(3))
+            && let (Ok(id), Ok(line), Ok(scope_id)) = (
                 id_match.as_str().parse::<u32>(),
                 line_match.as_str().parse::<u32>(),
+                scope_match.as_str().parse::<u32>(),
             )
         {
-            map.insert(id, line);
+            let inlined_from = if caps.get(4).is_some() {
+                scope_names.get(&scope_id).cloned()
+            } else {
+                None
+            };
+            map.insert(id, DbgLocation { line, inlined_from });
         }
     }
     map
@@ -315,7 +390,7 @@ pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, u32> {
 #[allow(dead_code)]
 pub fn build_source_line_map(
     ir_lines: &[IrLine],
-    dbg_locations: &HashMap<u32, u32>,
+    dbg_locations: &HashMap<u32, DbgLocation>,
 ) -> Vec<Option<u32>> {
     let dbg_re = Regex::new(r"!dbg !(\d+)").expect("valid dbg ref regex");
     ir_lines
@@ -323,7 +398,7 @@ pub fn build_source_line_map(
         .map(|ir_line| {
             let caps = dbg_re.captures(&ir_line.text)?;
             let id: u32 = caps.get(1)?.as_str().parse().ok()?;
-            dbg_locations.get(&id).copied()
+            dbg_locations.get(&id).map(|loc| loc.line)
         })
         .collect()
 }
@@ -339,7 +414,8 @@ pub fn build_source_line_map(
 /// Returns the filtered/annotated IR lines and the corresponding source_line_map.
 pub fn annotate_ir_lines(
     ir_lines: Vec<IrLine>,
-    dbg_locations: &HashMap<u32, u32>,
+    dbg_after: &HashMap<u32, DbgLocation>,
+    dbg_before: Option<&HashMap<u32, DbgLocation>>,
     source_lines: &[&str],
 ) -> (Vec<IrLine>, Vec<Option<u32>>) {
     static DBG_RE: LazyLock<Regex> =
@@ -350,7 +426,8 @@ pub fn annotate_ir_lines(
 
     let mut out_lines = Vec::with_capacity(ir_lines.len());
     let mut out_map = Vec::with_capacity(ir_lines.len());
-    let mut prev_src_line_no: Option<u32> = None;
+    // Track (line_number, inlined_from) to dedup — same line from different functions stays separate
+    let mut prev_src_key: Option<(u32, Option<String>)> = None;
 
     for ir_line in ir_lines {
         // Strip #dbg_* intrinsic lines entirely
@@ -358,32 +435,46 @@ pub fn annotate_ir_lines(
             continue;
         }
 
-        // Extract source line number from !dbg reference
-        let src_line_no = DBG_RE.captures(&ir_line.text).and_then(|caps| {
-            let id: u32 = caps.get(1)?.as_str().parse().ok()?;
-            dbg_locations.get(&id).copied()
-        });
+        // Choose the correct dbg map: deleted lines come from the previous snapshot
+        let dbg_map = if ir_line.tag == ChangeTag::Delete {
+            dbg_before.unwrap_or(dbg_after)
+        } else {
+            dbg_after
+        };
 
-        // Insert source annotation header when source line changes
-        if let Some(n) = src_line_no
-            && prev_src_line_no != Some(n)
-        {
-            // Try to resolve the source text for the annotation
-            if let Some(src) = source_lines
-                .get((n as usize).checked_sub(1).unwrap_or(usize::MAX))
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-            {
-                out_lines.push(IrLine {
-                    tag: ChangeTag::Equal,
-                    text: format!(";; {src}"),
-                    is_source_annotation: true,
-                });
-                out_map.push(Some(n));
+        // Extract DbgLocation from !dbg reference
+        let dbg_loc = DBG_RE.captures(&ir_line.text).and_then(|caps| {
+            let id: u32 = caps.get(1)?.as_str().parse().ok()?;
+            dbg_map.get(&id)
+        });
+        let src_line_no = dbg_loc.map(|loc| loc.line);
+
+        // Insert source annotation header when source line or origin changes
+        if let Some(loc) = dbg_loc {
+            let current_key = (loc.line, loc.inlined_from.clone());
+            let changed = prev_src_key.as_ref() != Some(&current_key);
+            if changed {
+                // Try to resolve the source text for the annotation
+                if let Some(src) = source_lines
+                    .get((loc.line as usize).checked_sub(1).unwrap_or(usize::MAX))
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    let annotation = match &loc.inlined_from {
+                        Some(name) => format!(";; [{name}] {src}"),
+                        None => format!(";; {src}"),
+                    };
+                    out_lines.push(IrLine {
+                        tag: ChangeTag::Equal,
+                        text: annotation,
+                        is_source_annotation: true,
+                    });
+                    out_map.push(Some(loc.line));
+                }
+                prev_src_key = Some(current_key);
             }
-            prev_src_line_no = Some(n);
         }
-        // Lines with no !dbg do NOT reset prev_src_line_no
+        // Lines with no !dbg do NOT reset prev_src_key
 
         // Strip trailing metadata
         let stripped = META_RE.replace_all(&ir_line.text, "");
@@ -413,6 +504,7 @@ pub fn build_analysis_steps_from_snapshots(
 
     let mut out = Vec::new();
     let mut prev_ir: Option<String> = None;
+    let mut prev_dbg_locations: Option<HashMap<u32, DbgLocation>> = None;
     let mut prev_raw_index = 0usize;
 
     for snapshot in snapshots {
@@ -438,7 +530,7 @@ pub fn build_analysis_steps_from_snapshots(
                 })
                 .collect();
             let (ir_lines, source_line_map) =
-                annotate_ir_lines(ir_lines, &dbg_locations, &src_lines);
+                annotate_ir_lines(ir_lines, &dbg_locations, None, &src_lines);
             out.push(AnalysisStep {
                 visible_index: out.len(),
                 raw_index: snapshot.raw_index,
@@ -456,6 +548,7 @@ pub fn build_analysis_steps_from_snapshots(
                 source,
             });
             prev_raw_index = snapshot.raw_index;
+            prev_dbg_locations = Some(dbg_locations);
             prev_ir = Some(function_ir);
             continue;
         }
@@ -482,7 +575,7 @@ pub fn build_analysis_steps_from_snapshots(
             })
             .collect();
         let (ir_lines, source_line_map) =
-            annotate_ir_lines(ir_lines, &dbg_locations, &src_lines);
+            annotate_ir_lines(ir_lines, &dbg_locations, prev_dbg_locations.as_ref(), &src_lines);
 
         let mut diff_text = diff
             .unified_diff()
@@ -516,6 +609,7 @@ pub fn build_analysis_steps_from_snapshots(
         });
 
         prev_raw_index = snapshot.raw_index;
+        prev_dbg_locations = Some(dbg_locations);
         prev_ir = Some(function_ir);
     }
 
@@ -1200,12 +1294,28 @@ define void @foo() !dbg !5 {
 }
 
 !5 = distinct !DISubprogram(name: "foo")
+!6 = distinct !DILexicalBlock(scope: !5, file: !1, line: 10)
+!8 = distinct !DISubprogram(name: "check")
 !10 = !DILocation(line: 42, column: 5, scope: !5)
-!11 = !DILocation(line: 43, column: 3, scope: !5)
+!11 = !DILocation(line: 43, column: 3, scope: !6)
+!12 = !DILocation(line: 10, column: 1, scope: !8, inlinedAt: !10)
 "#;
         let locs = parse_dbg_locations(ir);
-        assert_eq!(locs.get(&10), Some(&42));
-        assert_eq!(locs.get(&11), Some(&43));
+        // Direct location — no inlining
+        assert_eq!(
+            locs.get(&10),
+            Some(&DbgLocation { line: 42, inlined_from: None })
+        );
+        // Location via lexical block — no inlining
+        assert_eq!(
+            locs.get(&11),
+            Some(&DbgLocation { line: 43, inlined_from: None })
+        );
+        // Inlined location — scope points to "check"
+        assert_eq!(
+            locs.get(&12),
+            Some(&DbgLocation { line: 10, inlined_from: Some("check".to_string()) })
+        );
         assert_eq!(locs.get(&5), None);
     }
 
@@ -1234,7 +1344,7 @@ define void @foo() !dbg !5 {
             },
         ];
         let mut dbg_locations = HashMap::new();
-        dbg_locations.insert(10, 42);
+        dbg_locations.insert(10, DbgLocation { line: 42, inlined_from: None });
 
         let map = build_source_line_map(&ir_lines, &dbg_locations);
         assert_eq!(map.len(), 4);
@@ -1281,10 +1391,10 @@ define void @foo() !dbg !5 {
             },
         ];
         let mut dbg_locations = HashMap::new();
-        dbg_locations.insert(10, 5);
+        dbg_locations.insert(10, DbgLocation { line: 5, inlined_from: None });
         let source_lines = vec!["line1", "line2", "line3", "line4", "for (int i = 0; i < n; i++) {"];
 
-        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, None, &source_lines);
         // #dbg_declare and #dbg_value removed; annotation header inserted before first IR line
         assert_eq!(annotated.len(), 3); // annotation + call + ret
         // First line is source annotation
@@ -1311,10 +1421,10 @@ define void @foo() !dbg !5 {
             is_source_annotation: false,
         }];
         let mut dbg_locations = HashMap::new();
-        dbg_locations.insert(10, 2);
+        dbg_locations.insert(10, DbgLocation { line: 2, inlined_from: None });
         let source_lines = vec!["int x = 0;", "a[i] = c[i] + d[i] * e[i];"];
 
-        let (annotated, _) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        let (annotated, _) = annotate_ir_lines(ir_lines, &dbg_locations, None, &source_lines);
         // annotation header + IR line
         assert_eq!(annotated.len(), 2);
         assert!(annotated[0].is_source_annotation);
@@ -1335,9 +1445,9 @@ define void @foo() !dbg !5 {
             is_source_annotation: false,
         }];
         let mut dbg_locations = HashMap::new();
-        dbg_locations.insert(10, 3);
+        dbg_locations.insert(10, DbgLocation { line: 3, inlined_from: None });
         // No source lines provided — no annotation header inserted
-        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, &[]);
+        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, None, &[]);
         assert_eq!(annotated.len(), 1);
         assert_eq!(annotated[0].text, "  br label %9");
         assert!(!annotated[0].is_source_annotation);
@@ -1352,7 +1462,7 @@ define void @foo() !dbg !5 {
             is_source_annotation: false,
         }];
         // dbg_locations has no entry for !99
-        let (annotated, map) = annotate_ir_lines(ir_lines, &HashMap::new(), &["src line"]);
+        let (annotated, map) = annotate_ir_lines(ir_lines, &HashMap::new(), None, &["src line"]);
         assert_eq!(annotated.len(), 1);
         assert_eq!(annotated[0].text, "  %x = add i32 1, 2");
         assert_eq!(map[0], None);
@@ -1366,9 +1476,9 @@ define void @foo() !dbg !5 {
             is_source_annotation: false,
         }];
         let mut dbg_locations = HashMap::new();
-        dbg_locations.insert(10, 999); // Line 999 doesn't exist — no annotation inserted
+        dbg_locations.insert(10, DbgLocation { line: 999, inlined_from: None }); // Line 999 doesn't exist — no annotation inserted
         let source_lines = vec!["only one line"];
-        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, None, &source_lines);
         assert_eq!(annotated.len(), 1);
         assert_eq!(annotated[0].text, "  ret void");
         assert_eq!(map[0], Some(999));
@@ -1383,9 +1493,9 @@ define void @foo() !dbg !5 {
             is_source_annotation: false,
         }];
         let mut dbg_locations = HashMap::new();
-        dbg_locations.insert(5, 1);
+        dbg_locations.insert(5, DbgLocation { line: 1, inlined_from: None });
         let source_lines = vec!["int s161() {"];
-        let (annotated, _) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        let (annotated, _) = annotate_ir_lines(ir_lines, &dbg_locations, None, &source_lines);
         assert_eq!(annotated.len(), 2);
         assert!(annotated[0].is_source_annotation);
         assert_eq!(annotated[0].text, ";; int s161() {");
@@ -1401,9 +1511,9 @@ define void @foo() !dbg !5 {
             IrLine { tag: ChangeTag::Equal, text: String::from("  br i1 %2, label %3, label %4, !dbg !10"), is_source_annotation: false },
         ];
         let mut dbg = HashMap::new();
-        dbg.insert(10, 2);
+        dbg.insert(10, DbgLocation { line: 2, inlined_from: None });
         let src = vec!["line1", "if (b[i] < 0.) {"];
-        let (out, map) = annotate_ir_lines(ir_lines, &dbg, &src);
+        let (out, map) = annotate_ir_lines(ir_lines, &dbg, None, &src);
         assert_eq!(out.len(), 4); // 1 annotation + 3 IR
         assert!(out[0].is_source_annotation);
         assert_eq!(out[0].text, ";; if (b[i] < 0.) {");
@@ -1422,10 +1532,10 @@ define void @foo() !dbg !5 {
             IrLine { tag: ChangeTag::Equal, text: String::from("  %c = mul i32 5, 6, !dbg !20"), is_source_annotation: false },
         ];
         let mut dbg = HashMap::new();
-        dbg.insert(10, 5);
-        dbg.insert(20, 8);
+        dbg.insert(10, DbgLocation { line: 5, inlined_from: None });
+        dbg.insert(20, DbgLocation { line: 8, inlined_from: None });
         let src = vec!["l1", "l2", "l3", "l4", "x = a + b;", "l6", "l7", "y = c * d;"];
-        let (out, _) = annotate_ir_lines(ir_lines, &dbg, &src);
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, None, &src);
         // annotation(5), IR, IR, annotation(8), IR
         assert_eq!(out.len(), 5);
         assert!(out[0].is_source_annotation);
@@ -1446,9 +1556,9 @@ define void @foo() !dbg !5 {
             IrLine { tag: ChangeTag::Equal, text: String::from("  %b = add i32 3, 4, !dbg !10"), is_source_annotation: false },
         ];
         let mut dbg = HashMap::new();
-        dbg.insert(10, 5);
+        dbg.insert(10, DbgLocation { line: 5, inlined_from: None });
         let src = vec!["l1", "l2", "l3", "l4", "x = a + b;"];
-        let (out, _) = annotate_ir_lines(ir_lines, &dbg, &src);
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, None, &src);
         // annotation(5), IR, label, IR — no second annotation
         assert_eq!(out.len(), 4);
         let annotations: Vec<_> = out.iter().filter(|l| l.is_source_annotation).collect();
@@ -1463,13 +1573,74 @@ define void @foo() !dbg !5 {
             IrLine { tag: ChangeTag::Insert, text: String::from("  %new = add i32 3, 4, !dbg !10"), is_source_annotation: false },
         ];
         let mut dbg = HashMap::new();
-        dbg.insert(10, 1);
+        dbg.insert(10, DbgLocation { line: 1, inlined_from: None });
         let src = vec!["x = a + b;"];
-        let (out, _) = annotate_ir_lines(ir_lines, &dbg, &src);
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, None, &src);
         assert_eq!(out.len(), 3); // annotation + delete + insert
         assert!(out[0].is_source_annotation);
         assert_eq!(out[0].tag, ChangeTag::Equal);
         assert_eq!(out[1].tag, ChangeTag::Delete);
         assert_eq!(out[2].tag, ChangeTag::Insert);
+    }
+
+    #[test]
+    fn resolve_scope_names_walks_lexical_block_chain() {
+        let ir = r#"
+!5 = distinct !DISubprogram(name: "check")
+!6 = distinct !DILexicalBlock(scope: !5, file: !1, line: 10)
+!7 = distinct !DILexicalBlock(scope: !6, file: !1, line: 12)
+"#;
+        let names = resolve_scope_names(ir);
+        assert_eq!(names.get(&5), Some(&"check".to_string()));
+        assert_eq!(names.get(&6), Some(&"check".to_string()));
+        assert_eq!(names.get(&7), Some(&"check".to_string()));
+    }
+
+    #[test]
+    fn resolve_scope_names_handles_missing_parent() {
+        let ir = r#"
+!10 = distinct !DILexicalBlock(scope: !99, file: !1, line: 5)
+"#;
+        let names = resolve_scope_names(ir);
+        // !99 doesn't exist → !10 cannot be resolved → absent from map
+        assert_eq!(names.get(&10), None);
+    }
+
+    #[test]
+    fn annotate_ir_lines_marks_inlined_source() {
+        let ir_lines = vec![
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %x = add i32 1, 2, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %y = mul i32 3, 4, !dbg !20"), is_source_annotation: false },
+        ];
+        let mut dbg = HashMap::new();
+        dbg.insert(10, DbgLocation { line: 1, inlined_from: None });
+        dbg.insert(20, DbgLocation { line: 2, inlined_from: Some("check".to_string()) });
+        let src = vec!["x = a + b;", "suma += a[i];"];
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, None, &src);
+        // annotation(direct), IR, annotation(inlined), IR
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].text, ";; x = a + b;");
+        assert_eq!(out[2].text, ";; [check] suma += a[i];");
+        assert!(out[2].is_source_annotation);
+    }
+
+    #[test]
+    fn annotate_ir_lines_dedup_separates_inlined_and_direct() {
+        // Same line number from different functions → two separate annotations
+        let ir_lines = vec![
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %a = load ptr, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %b = load ptr, !dbg !20"), is_source_annotation: false },
+        ];
+        let mut dbg = HashMap::new();
+        dbg.insert(10, DbgLocation { line: 5, inlined_from: None });
+        dbg.insert(20, DbgLocation { line: 5, inlined_from: Some("callee".to_string()) });
+        let src = vec!["l1", "l2", "l3", "l4", "x = foo();"];
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, None, &src);
+        // annotation(direct) + IR + annotation(inlined) + IR
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].text, ";; x = foo();");
+        assert_eq!(out[2].text, ";; [callee] x = foo();");
+        let annotations: Vec<_> = out.iter().filter(|l| l.is_source_annotation).collect();
+        assert_eq!(annotations.len(), 2);
     }
 }

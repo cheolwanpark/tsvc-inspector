@@ -6,7 +6,7 @@
 - `src/benchmark_manifest.rs` is the source of truth for benchmark names and run options.
 - `src/syntax.rs` provides tree-sitter based syntax highlighting for C and LLVM IR with a bounded in-memory cache and graceful plain-text fallback.
 - `src/discovery.rs`, `src/runner.rs`, `src/parser.rs`, and `src/bootstrap.rs` cover benchmark discovery (including kernel-focused source extraction), native clang runtime/analysis execution, analysis timeline parsing (fast trace + snapshots with `IrLine`/`source_line_map` generation), and TSVC root resolution.
-- `src/model.rs` contains shared domain types (`IrLine`, `AnalysisStep`, `AnalysisStage`, etc.); `src/error.rs` defines common error/result aliases.
+- `src/model.rs` contains shared domain types (`IrLine`, `DbgLocation`, `AnalysisStep`, `AnalysisStage`, etc.); `src/error.rs` defines common error/result aliases.
 - Build outputs are generated in `target/` and config-scoped native folders like `build-tsvc-native/run/<config_id>/...` and `build-tsvc-native/analysis/<config_id>/...`; keep generated artifacts out of commits.
 
 ## TUI Navigation Model
@@ -54,12 +54,13 @@
   - Inserted lines: `+ ` prefix with syntax-highlighted text over a dark green background (`IR_INSERT_BG`).
   - Deleted lines: `- ` prefix with syntax-highlighted text over a dark red background (`IR_DELETE_BG`).
   - Unchanged lines: `  ` prefix with syntax-highlighted text over a dark code background (`CODE_BG`).
-  - Source annotations: `;; <source line>` in italic amber (`SOURCE_ANNOTATION_FG`), no diff prefix.
+  - Source annotations: `;; <source line>` (or `;; [fn_name] <source line>` for inlined code) in italic amber (`SOURCE_ANNOTATION_FG`), no diff prefix.
 - IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag` and `is_source_annotation` flag) per `AnalysisStep`.
 - Source annotation interleaving (`annotate_ir_lines` in `parser.rs`):
   - Strips `#dbg_declare`/`#dbg_value`/`#dbg_label` intrinsic lines entirely.
   - Strips trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) from all IR lines.
-  - Inserts `;; <source text>` annotation headers when the source line number changes, using the actual source file content.
+  - Inserts `;; <source text>` annotation headers when the source line or inlined-from origin changes, using the actual source file content; inlined code is prefixed with the callee function name (`[fn_name]`).
+  - Deleted diff lines resolve `!dbg` references against the previous snapshot's debug metadata to ensure correct source annotations across IR changes.
   - Source file is resolved from `!DISubprogram`/`!DIFile` debug metadata in the build trace (`find_function_source_file` in `runner.rs`).
 - LLVM IR syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-llvm`, and diff backgrounds remain visible via style patching.
 - Clipboard snapshot (`y`) includes the selected stage/pass metadata, linked remarks, selected-function C source, and full IR diff for the selected pass.
@@ -84,7 +85,7 @@
 ## Analysis Workflow Notes
 - Optimization-path exploration is primary:
   - Fast tier: parse `-mllvm -print-changed` trace and build function-scoped changed-only timeline with `IrLine` generation and `!dbg` metadata parsing.
-  - Analysis compile always adds `-mllvm -print-changed` and `-mllvm -filter-print-funcs=<selected_symbol>` to keep traces focused and bounded.
+  - Analysis compile always adds `-mllvm -print-changed`, `-mllvm -print-module-scope`, and `-mllvm -filter-print-funcs=<selected_symbol>` to keep traces focused and bounded.
 - Runtime (`r`) is secondary and intentionally lightweight; it does not regenerate full IR timelines.
 
 ## Build, Test, and Development Commands

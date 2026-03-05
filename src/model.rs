@@ -10,6 +10,12 @@ pub struct IrLine {
     pub is_source_annotation: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbgLocation {
+    pub line: u32,
+    pub inlined_from: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BenchmarkItem {
     pub name: String,
@@ -245,6 +251,8 @@ impl CompilerConfig {
         flags.push(String::from("-fsave-optimization-record"));
         flags.push(String::from("-mllvm"));
         flags.push(String::from("-print-changed"));
+        flags.push(String::from("-mllvm"));
+        flags.push(String::from("-print-module-scope"));
 
         for token in split_flags(&self.extra_llvm_flags) {
             flags.push(String::from("-mllvm"));
@@ -604,6 +612,7 @@ mod tests {
         assert!(flags.iter().any(|f| f == "-g"));
         assert!(flags.iter().any(|f| f == "-fsave-optimization-record"));
         assert!(flags.iter().any(|f| f == "-print-changed"));
+        assert!(flags.iter().any(|f| f == "-print-module-scope"));
         assert!(flags.iter().any(|f| f == "-Rpass=loop-vectorize"));
         assert!(flags.iter().any(|f| f == "-Rpass-missed=loop-vectorize"));
         assert!(flags.iter().any(|f| f == "-Rpass-analysis=loop-vectorize"));
