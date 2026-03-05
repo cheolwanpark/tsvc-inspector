@@ -19,6 +19,7 @@ const CODE_TEXT_FG: Color = Color::Gray;
 const SOURCE_LINE_HIGHLIGHT_BG: Color = Color::Rgb(44, 52, 64);
 const IR_INSERT_BG: Color = Color::Rgb(19, 70, 35);
 const IR_DELETE_BG: Color = Color::Rgb(90, 28, 28);
+const SOURCE_ANNOTATION_FG: Color = Color::Rgb(200, 160, 80);
 
 pub fn render(frame: &mut Frame, app: &AppState) {
     match app.page {
@@ -591,6 +592,14 @@ fn render_ir_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout
         .iter()
         .enumerate()
         .map(|(idx, ir_line)| {
+            if ir_line.is_source_annotation {
+                let style = Style::default()
+                    .fg(SOURCE_ANNOTATION_FG)
+                    .bg(CODE_BG)
+                    .add_modifier(Modifier::ITALIC);
+                return Line::from(Span::styled(format!("  {}", ir_line.text), style));
+            }
+
             let (prefix, base_style) = match ir_line.tag {
                 ChangeTag::Insert => ("+ ", Style::default().fg(Color::White).bg(IR_INSERT_BG)),
                 ChangeTag::Delete => ("- ", Style::default().fg(Color::White).bg(IR_DELETE_BG)),

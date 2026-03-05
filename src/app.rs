@@ -1325,6 +1325,9 @@ fn build_full_pass_diff(step: &AnalysisStep) -> String {
     step.ir_lines
         .iter()
         .map(|line| {
+            if line.is_source_annotation {
+                return line.text.clone();
+            }
             let prefix = match line.tag {
                 ChangeTag::Insert => "+ ",
                 ChangeTag::Delete => "- ",
@@ -1719,18 +1722,22 @@ int s161(void) {
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("x"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("old"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("new"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("y"),
+                is_source_annotation: false,
             },
         ];
         step.source_line_map = vec![None; step.ir_lines.len()];
@@ -1780,30 +1787,37 @@ int s161(void) {
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("l1"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("old1"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("new1"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("l2"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("old2"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("new2"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("l3"),
+                is_source_annotation: false,
             },
         ];
         step.source_line_map = vec![None; step.ir_lines.len()];

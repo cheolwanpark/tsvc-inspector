@@ -7,6 +7,7 @@ use similar::ChangeTag;
 pub struct IrLine {
     pub tag: ChangeTag,
     pub text: String,
+    pub is_source_annotation: bool,
 }
 
 #[derive(Clone, Debug)]

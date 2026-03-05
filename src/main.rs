@@ -391,6 +391,7 @@ fn maybe_spawn_job(
                             &raw.build_trace,
                             &selected_function.symbol,
                             &remarks,
+                            raw.source_file_content.as_deref(),
                         );
                         if analysis_steps.is_empty() {
                             let _ = tx.send(JobEvent::Finished(Err(format!(

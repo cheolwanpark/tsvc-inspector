@@ -54,7 +54,13 @@
   - Inserted lines: `+ ` prefix with syntax-highlighted text over a dark green background (`IR_INSERT_BG`).
   - Deleted lines: `- ` prefix with syntax-highlighted text over a dark red background (`IR_DELETE_BG`).
   - Unchanged lines: `  ` prefix with syntax-highlighted text over a dark code background (`CODE_BG`).
-- IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag`) per `AnalysisStep`.
+  - Source annotations: `;; <source line>` in italic amber (`SOURCE_ANNOTATION_FG`), no diff prefix.
+- IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag` and `is_source_annotation` flag) per `AnalysisStep`.
+- Source annotation interleaving (`annotate_ir_lines` in `parser.rs`):
+  - Strips `#dbg_declare`/`#dbg_value`/`#dbg_label` intrinsic lines entirely.
+  - Strips trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) from all IR lines.
+  - Inserts `;; <source text>` annotation headers when the source line number changes, using the actual source file content.
+  - Source file is resolved from `!DISubprogram`/`!DIFile` debug metadata in the build trace (`find_function_source_file` in `runner.rs`).
 - LLVM IR syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-llvm`, and diff backgrounds remain visible via style patching.
 - Clipboard snapshot (`y`) includes the selected stage/pass metadata, linked remarks, selected-function C source, and full IR diff for the selected pass.
 
@@ -62,8 +68,6 @@
 - Shows only the selected target function's C source with line numbers.
 - Function text is extracted from the benchmark's kernel-focused source; if extraction fails, the panel shows an explicit unavailable message.
 - C syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-c` in both list-page and detail-page source panels.
-- `!dbg` metadata in IR is parsed to build `source_line_map` for potential C<->IR matching.
-- Note: `!dbg` line numbers are absolute file positions; the source panel shows a function-only excerpt with different numbering, so C<->IR highlighting is not yet functional (degrades gracefully with no highlights).
 
 ### Verdict System
 - Header shows vectorization verdict based on optimization remarks.

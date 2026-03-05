@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use similar::{ChangeTag, TextDiff};
@@ -280,6 +281,7 @@ pub fn build_fast_analysis_steps(
     build_trace: &str,
     selected_function_symbol: &str,
     remarks: &[RemarkEntry],
+    source_file_content: Option<&str>,
 ) -> Vec<AnalysisStep> {
     let snapshots = parse_ir_snapshots_from_trace(build_trace);
     build_analysis_steps_from_snapshots(
@@ -287,6 +289,7 @@ pub fn build_fast_analysis_steps(
         selected_function_symbol,
         remarks,
         AnalysisSource::TraceFast,
+        source_file_content,
     )
 }
 
@@ -309,6 +312,7 @@ pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, u32> {
 }
 
 /// For each IrLine, extracts `!dbg !N` and looks up the source line number.
+#[allow(dead_code)]
 pub fn build_source_line_map(
     ir_lines: &[IrLine],
     dbg_locations: &HashMap<u32, u32>,
@@ -324,12 +328,89 @@ pub fn build_source_line_map(
         .collect()
 }
 
+/// Annotates IR lines with interleaved source header lines and strips debug noise.
+///
+/// For each IrLine:
+/// - `#dbg_value`/`#dbg_declare`/`#dbg_label` lines are removed entirely
+/// - Trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) is stripped
+/// - When the source line number changes, a separate annotation `IrLine` is inserted
+///   above the group with `is_source_annotation: true` and text `;; <source>`
+///
+/// Returns the filtered/annotated IR lines and the corresponding source_line_map.
+pub fn annotate_ir_lines(
+    ir_lines: Vec<IrLine>,
+    dbg_locations: &HashMap<u32, u32>,
+    source_lines: &[&str],
+) -> (Vec<IrLine>, Vec<Option<u32>>) {
+    static DBG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"!dbg !(\d+)").expect("valid dbg ref regex"));
+    static META_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:,\s*|\s+)![\w.]+\s+!\d+").expect("valid trailing metadata regex")
+    });
+
+    let mut out_lines = Vec::with_capacity(ir_lines.len());
+    let mut out_map = Vec::with_capacity(ir_lines.len());
+    let mut prev_src_line_no: Option<u32> = None;
+
+    for ir_line in ir_lines {
+        // Strip #dbg_* intrinsic lines entirely
+        if ir_line.text.trim_start().starts_with("#dbg_") {
+            continue;
+        }
+
+        // Extract source line number from !dbg reference
+        let src_line_no = DBG_RE.captures(&ir_line.text).and_then(|caps| {
+            let id: u32 = caps.get(1)?.as_str().parse().ok()?;
+            dbg_locations.get(&id).copied()
+        });
+
+        // Insert source annotation header when source line changes
+        if let Some(n) = src_line_no
+            && prev_src_line_no != Some(n)
+        {
+            // Try to resolve the source text for the annotation
+            if let Some(src) = source_lines
+                .get((n as usize).checked_sub(1).unwrap_or(usize::MAX))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                out_lines.push(IrLine {
+                    tag: ChangeTag::Equal,
+                    text: format!(";; {src}"),
+                    is_source_annotation: true,
+                });
+                out_map.push(Some(n));
+            }
+            prev_src_line_no = Some(n);
+        }
+        // Lines with no !dbg do NOT reset prev_src_line_no
+
+        // Strip trailing metadata
+        let stripped = META_RE.replace_all(&ir_line.text, "");
+        let stripped = stripped.trim_end();
+
+        out_map.push(src_line_no);
+        out_lines.push(IrLine {
+            tag: ir_line.tag,
+            text: stripped.to_string(),
+            is_source_annotation: false,
+        });
+    }
+
+    (out_lines, out_map)
+}
+
 pub fn build_analysis_steps_from_snapshots(
     snapshots: &[IrSnapshot],
     selected_function_symbol: &str,
     remarks: &[RemarkEntry],
     source: AnalysisSource,
+    source_file_content: Option<&str>,
 ) -> Vec<AnalysisStep> {
+    let src_lines: Vec<&str> = source_file_content
+        .map(|s| s.lines().collect())
+        .unwrap_or_default();
+
     let mut out = Vec::new();
     let mut prev_ir: Option<String> = None;
     let mut prev_raw_index = 0usize;
@@ -353,9 +434,11 @@ pub fn build_analysis_steps_from_snapshots(
                 .map(|l| IrLine {
                     tag: ChangeTag::Equal,
                     text: l.to_string(),
+                    is_source_annotation: false,
                 })
                 .collect();
-            let source_line_map = build_source_line_map(&ir_lines, &dbg_locations);
+            let (ir_lines, source_line_map) =
+                annotate_ir_lines(ir_lines, &dbg_locations, &src_lines);
             out.push(AnalysisStep {
                 visible_index: out.len(),
                 raw_index: snapshot.raw_index,
@@ -395,9 +478,11 @@ pub fn build_analysis_steps_from_snapshots(
             .map(|change| IrLine {
                 tag: change.tag(),
                 text: change.value().trim_end_matches('\n').to_string(),
+                is_source_annotation: false,
             })
             .collect();
-        let source_line_map = build_source_line_map(&ir_lines, &dbg_locations);
+        let (ir_lines, source_line_map) =
+            annotate_ir_lines(ir_lines, &dbg_locations, &src_lines);
 
         let mut diff_text = diff
             .unified_diff()
@@ -1067,7 +1152,7 @@ entry:
             },
         ];
 
-        let steps = build_fast_analysis_steps(trace, "foo", &remarks);
+        let steps = build_fast_analysis_steps(trace, "foo", &remarks, None);
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[0].visible_index, 0);
         assert_eq!(steps[0].raw_index, 0);
@@ -1100,7 +1185,7 @@ entry:
             },
         ];
         let steps =
-            build_analysis_steps_from_snapshots(&snapshots, "foo", &[], AnalysisSource::TraceFast);
+            build_analysis_steps_from_snapshots(&snapshots, "foo", &[], AnalysisSource::TraceFast, None);
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[1].target_function.as_deref(), Some("foo"));
         assert_eq!(steps[1].source, AnalysisSource::TraceFast);
@@ -1130,18 +1215,22 @@ define void @foo() !dbg !5 {
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("define void @foo() {"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("  %1 = load float, ptr %p, !dbg !10"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("  %wide = load <4 x float>, ptr %p, !dbg !10"),
+                is_source_annotation: false,
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("  ret void"),
+                is_source_annotation: false,
             },
         ];
         let mut dbg_locations = HashMap::new();
@@ -1160,9 +1249,227 @@ define void @foo() !dbg !5 {
         let ir_lines = vec![IrLine {
             tag: ChangeTag::Equal,
             text: String::from("  %x = add i32 1, 2"),
+            is_source_annotation: false,
         }];
         let dbg_locations = HashMap::new();
         let map = build_source_line_map(&ir_lines, &dbg_locations);
         assert_eq!(map, vec![None]);
+    }
+
+    #[test]
+    fn annotate_ir_lines_strips_dbg_intrinsics() {
+        let ir_lines = vec![
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("  call void @llvm.lifetime.start.p0(ptr %1), !dbg !10"),
+                is_source_annotation: false,
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("    #dbg_declare(ptr %1, !20, !DIExpression(), !10)"),
+                is_source_annotation: false,
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("    #dbg_value(i32 0, !21, !DIExpression(), !10)"),
+                is_source_annotation: false,
+            },
+            IrLine {
+                tag: ChangeTag::Equal,
+                text: String::from("  ret void"),
+                is_source_annotation: false,
+            },
+        ];
+        let mut dbg_locations = HashMap::new();
+        dbg_locations.insert(10, 5);
+        let source_lines = vec!["line1", "line2", "line3", "line4", "for (int i = 0; i < n; i++) {"];
+
+        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        // #dbg_declare and #dbg_value removed; annotation header inserted before first IR line
+        assert_eq!(annotated.len(), 3); // annotation + call + ret
+        // First line is source annotation
+        assert!(annotated[0].is_source_annotation);
+        assert_eq!(annotated[0].text, ";; for (int i = 0; i < n; i++) {");
+        // Second line is the IR instruction with metadata stripped
+        assert!(!annotated[1].is_source_annotation);
+        assert!(!annotated[1].text.contains("!dbg"));
+        assert!(annotated[1].text.contains("call void @llvm.lifetime.start"));
+        // Last line has no dbg, left as-is
+        assert_eq!(annotated[2].text, "  ret void");
+        assert!(!annotated[2].is_source_annotation);
+        // source_line_map: annotation, IR line, ret
+        assert_eq!(map[0], Some(5));
+        assert_eq!(map[1], Some(5));
+        assert_eq!(map[2], None);
+    }
+
+    #[test]
+    fn annotate_ir_lines_strips_all_trailing_metadata() {
+        let ir_lines = vec![IrLine {
+            tag: ChangeTag::Insert,
+            text: String::from("  store double %40, ptr %43, align 8, !dbg !10, !tbaa !99"),
+            is_source_annotation: false,
+        }];
+        let mut dbg_locations = HashMap::new();
+        dbg_locations.insert(10, 2);
+        let source_lines = vec!["int x = 0;", "a[i] = c[i] + d[i] * e[i];"];
+
+        let (annotated, _) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        // annotation header + IR line
+        assert_eq!(annotated.len(), 2);
+        assert!(annotated[0].is_source_annotation);
+        assert_eq!(annotated[0].text, ";; a[i] = c[i] + d[i] * e[i];");
+        assert_eq!(annotated[0].tag, ChangeTag::Equal);
+        assert_eq!(
+            annotated[1].text,
+            "  store double %40, ptr %43, align 8"
+        );
+        assert_eq!(annotated[1].tag, ChangeTag::Insert);
+    }
+
+    #[test]
+    fn annotate_ir_lines_no_source_leaves_metadata_stripped() {
+        let ir_lines = vec![IrLine {
+            tag: ChangeTag::Equal,
+            text: String::from("  br label %9, !dbg !10, !llvm.loop !20"),
+            is_source_annotation: false,
+        }];
+        let mut dbg_locations = HashMap::new();
+        dbg_locations.insert(10, 3);
+        // No source lines provided — no annotation header inserted
+        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, &[]);
+        assert_eq!(annotated.len(), 1);
+        assert_eq!(annotated[0].text, "  br label %9");
+        assert!(!annotated[0].is_source_annotation);
+        assert_eq!(map[0], Some(3));
+    }
+
+    #[test]
+    fn annotate_ir_lines_unknown_dbg_id_strips_metadata() {
+        let ir_lines = vec![IrLine {
+            tag: ChangeTag::Equal,
+            text: String::from("  %x = add i32 1, 2, !dbg !99, !tbaa !50"),
+            is_source_annotation: false,
+        }];
+        // dbg_locations has no entry for !99
+        let (annotated, map) = annotate_ir_lines(ir_lines, &HashMap::new(), &["src line"]);
+        assert_eq!(annotated.len(), 1);
+        assert_eq!(annotated[0].text, "  %x = add i32 1, 2");
+        assert_eq!(map[0], None);
+    }
+
+    #[test]
+    fn annotate_ir_lines_line_number_out_of_range() {
+        let ir_lines = vec![IrLine {
+            tag: ChangeTag::Equal,
+            text: String::from("  ret void, !dbg !10"),
+            is_source_annotation: false,
+        }];
+        let mut dbg_locations = HashMap::new();
+        dbg_locations.insert(10, 999); // Line 999 doesn't exist — no annotation inserted
+        let source_lines = vec!["only one line"];
+        let (annotated, map) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        assert_eq!(annotated.len(), 1);
+        assert_eq!(annotated[0].text, "  ret void");
+        assert_eq!(map[0], Some(999));
+    }
+
+    #[test]
+    fn annotate_ir_lines_handles_function_def_metadata() {
+        // Function definition has !dbg without a preceding comma
+        let ir_lines = vec![IrLine {
+            tag: ChangeTag::Equal,
+            text: String::from("define i32 @s161() #0 !dbg !5 {"),
+            is_source_annotation: false,
+        }];
+        let mut dbg_locations = HashMap::new();
+        dbg_locations.insert(5, 1);
+        let source_lines = vec!["int s161() {"];
+        let (annotated, _) = annotate_ir_lines(ir_lines, &dbg_locations, &source_lines);
+        assert_eq!(annotated.len(), 2);
+        assert!(annotated[0].is_source_annotation);
+        assert_eq!(annotated[0].text, ";; int s161() {");
+        assert_eq!(annotated[1].text, "define i32 @s161() #0 {");
+    }
+
+    #[test]
+    fn annotate_ir_lines_deduplication() {
+        // 3 IR lines mapping to same source → 1 annotation + 3 IR lines
+        let ir_lines = vec![
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %1 = load ptr, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %2 = fcmp olt double %1, 0.0, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  br i1 %2, label %3, label %4, !dbg !10"), is_source_annotation: false },
+        ];
+        let mut dbg = HashMap::new();
+        dbg.insert(10, 2);
+        let src = vec!["line1", "if (b[i] < 0.) {"];
+        let (out, map) = annotate_ir_lines(ir_lines, &dbg, &src);
+        assert_eq!(out.len(), 4); // 1 annotation + 3 IR
+        assert!(out[0].is_source_annotation);
+        assert_eq!(out[0].text, ";; if (b[i] < 0.) {");
+        for item in &out[1..=3] {
+            assert!(!item.is_source_annotation);
+        }
+        assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn annotate_ir_lines_source_transition() {
+        // Lines mapping to L5 then L8 → annotation(5) + IRs + annotation(8) + IRs
+        let ir_lines = vec![
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %a = add i32 1, 2, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %b = add i32 3, 4, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %c = mul i32 5, 6, !dbg !20"), is_source_annotation: false },
+        ];
+        let mut dbg = HashMap::new();
+        dbg.insert(10, 5);
+        dbg.insert(20, 8);
+        let src = vec!["l1", "l2", "l3", "l4", "x = a + b;", "l6", "l7", "y = c * d;"];
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, &src);
+        // annotation(5), IR, IR, annotation(8), IR
+        assert_eq!(out.len(), 5);
+        assert!(out[0].is_source_annotation);
+        assert_eq!(out[0].text, ";; x = a + b;");
+        assert!(!out[1].is_source_annotation);
+        assert!(!out[2].is_source_annotation);
+        assert!(out[3].is_source_annotation);
+        assert_eq!(out[3].text, ";; y = c * d;");
+        assert!(!out[4].is_source_annotation);
+    }
+
+    #[test]
+    fn annotate_ir_lines_no_dbg_gap_no_duplicate() {
+        // L5, no-dbg label, L5 again → no duplicate annotation
+        let ir_lines = vec![
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %a = add i32 1, 2, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("label:"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Equal, text: String::from("  %b = add i32 3, 4, !dbg !10"), is_source_annotation: false },
+        ];
+        let mut dbg = HashMap::new();
+        dbg.insert(10, 5);
+        let src = vec!["l1", "l2", "l3", "l4", "x = a + b;"];
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, &src);
+        // annotation(5), IR, label, IR — no second annotation
+        assert_eq!(out.len(), 4);
+        let annotations: Vec<_> = out.iter().filter(|l| l.is_source_annotation).collect();
+        assert_eq!(annotations.len(), 1);
+    }
+
+    #[test]
+    fn annotate_ir_lines_mixed_tags_annotation_always_equal() {
+        // Insert/Delete lines → annotation is always Equal
+        let ir_lines = vec![
+            IrLine { tag: ChangeTag::Delete, text: String::from("  %old = add i32 1, 2, !dbg !10"), is_source_annotation: false },
+            IrLine { tag: ChangeTag::Insert, text: String::from("  %new = add i32 3, 4, !dbg !10"), is_source_annotation: false },
+        ];
+        let mut dbg = HashMap::new();
+        dbg.insert(10, 1);
+        let src = vec!["x = a + b;"];
+        let (out, _) = annotate_ir_lines(ir_lines, &dbg, &src);
+        assert_eq!(out.len(), 3); // annotation + delete + insert
+        assert!(out[0].is_source_annotation);
+        assert_eq!(out[0].tag, ChangeTag::Equal);
+        assert_eq!(out[1].tag, ChangeTag::Delete);
+        assert_eq!(out[2].tag, ChangeTag::Insert);
     }
 }
