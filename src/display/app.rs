@@ -83,41 +83,68 @@ impl ListFocus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DetailFocus {
-    StageList,
-    PassList,
-    SourceView,
-    IrView,
+    Selector,
+    CodeView,
 }
 
 impl DetailFocus {
-    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
-            Self::StageList => "Stages",
-            Self::PassList => "Passes",
-            Self::SourceView => "C Source",
-            Self::IrView => "IR View",
+            Self::Selector => "Pass Selector",
+            Self::CodeView => "Code View",
         }
     }
+}
 
-    /// Tab: cycle forward through all 4 panes, wrapping around.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeViewMode {
+    IrDiff,
+    IrPostPass,
+    CSource,
+}
+
+impl CodeViewMode {
     pub fn cycle_next(self) -> Self {
         match self {
-            Self::StageList => Self::PassList,
-            Self::PassList => Self::SourceView,
-            Self::SourceView => Self::IrView,
-            Self::IrView => Self::StageList,
+            Self::IrDiff => Self::IrPostPass,
+            Self::IrPostPass => Self::CSource,
+            Self::CSource => Self::IrDiff,
         }
     }
 
-    /// Shift-Tab: cycle backward through all 4 panes, wrapping around.
     pub fn cycle_prev(self) -> Self {
         match self {
-            Self::StageList => Self::IrView,
-            Self::PassList => Self::StageList,
-            Self::SourceView => Self::PassList,
-            Self::IrView => Self::SourceView,
+            Self::IrDiff => Self::CSource,
+            Self::IrPostPass => Self::IrDiff,
+            Self::CSource => Self::IrPostPass,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IrDiff => "IR Diff",
+            Self::IrPostPass => "IR",
+            Self::CSource => "C",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigModalFocus {
+    Rows,
+    Preview,
+}
+
+impl ConfigModalFocus {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Rows => Self::Preview,
+            Self::Preview => Self::Rows,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        self.next()
     }
 }
 
@@ -196,6 +223,8 @@ pub struct AppState {
     pub benchmarks: Vec<BenchmarkItem>,
     pub selected_idx: usize,
     pub config_draft: CompilerConfig,
+    pub config_modal_open: bool,
+    pub config_modal_focus: ConfigModalFocus,
     pub config_selected_row: usize,
     pub config_editing_text: bool,
     pub page: AppPage,
@@ -206,13 +235,13 @@ pub struct AppState {
     pub list_focus: ListFocus,
     pub list_source_scroll: u16,
     pub detail_focus: DetailFocus,
+    pub code_view_mode: CodeViewMode,
     pub ir_scroll: u16,
     pub source_detail_scroll: u16,
     pub function_modal_open: bool,
     pub function_modal_selected_idx: usize,
     pub function_run_mode: FunctionRunMode,
     selected_function_by_benchmark: HashMap<String, BenchmarkFunction>,
-    config_by_benchmark_function: HashMap<String, CompilerConfig>,
     sessions_by_key: HashMap<String, RunSession>,
     running_session_key: Option<String>,
 }
@@ -226,6 +255,8 @@ impl AppState {
             benchmarks,
             selected_idx: 0,
             config_draft: CompilerConfig::default(),
+            config_modal_open: false,
+            config_modal_focus: ConfigModalFocus::Rows,
             config_selected_row: 0,
             config_editing_text: false,
             page: AppPage::BenchmarkList,
@@ -235,14 +266,14 @@ impl AppState {
             status_message: String::from("Ready"),
             list_focus: ListFocus::Benchmarks,
             list_source_scroll: 0,
-            detail_focus: DetailFocus::StageList,
+            detail_focus: DetailFocus::Selector,
+            code_view_mode: CodeViewMode::IrDiff,
             ir_scroll: 0,
             source_detail_scroll: 0,
             function_modal_open: false,
             function_modal_selected_idx: 0,
             function_run_mode,
             selected_function_by_benchmark: HashMap::new(),
-            config_by_benchmark_function: HashMap::new(),
             sessions_by_key: HashMap::new(),
             running_session_key: None,
         }
@@ -275,17 +306,7 @@ impl AppState {
     }
 
     pub fn current_compiler_config(&self) -> CompilerConfig {
-        let Some(benchmark) = self.selected_benchmark() else {
-            return self.config_draft.clone();
-        };
-        let Some(function) = self.selected_function_for_selected_benchmark() else {
-            return self.config_draft.clone();
-        };
-        let key = config_scope_key(&benchmark.name, &function.symbol);
-        self.config_by_benchmark_function
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| self.config_draft.clone())
+        self.config_draft.clone()
     }
 
     pub fn detail_source_text_for_selected_benchmark(&self) -> Option<String> {
@@ -375,19 +396,11 @@ impl AppState {
             .insert(benchmark.name.clone(), function.clone());
 
         self.function_modal_open = false;
-        let scope_key = config_scope_key(&benchmark.name, &function.symbol);
-        self.config_draft = self
-            .config_by_benchmark_function
-            .get(&scope_key)
-            .cloned()
-            .unwrap_or_default();
-        self.config_selected_row = 0;
-        self.config_editing_text = false;
-        self.page = AppPage::CompileConfig;
         self.status_message = format!(
             "Selected function: {} ({})",
             function.loop_id, function.symbol
         );
+        self.open_selected_benchmark_page();
     }
 
     pub fn select_prev(&mut self) {
@@ -427,12 +440,12 @@ impl AppState {
         }
     }
 
-    pub fn focus_prev_list_pane(&mut self) {
+    pub fn list_move_left(&mut self) {
         self.list_focus = self.list_focus.prev();
         self.status_message = format!("Focus: {}", self.list_focus.label());
     }
 
-    pub fn focus_next_list_pane(&mut self) {
+    pub fn list_move_right(&mut self) {
         self.list_focus = self.list_focus.next();
         self.status_message = format!("Focus: {}", self.list_focus.label());
     }
@@ -460,6 +473,51 @@ impl AppState {
         };
         let max = benchmark.source_code.lines().count().saturating_sub(1);
         max.min(u16::MAX as usize) as u16
+    }
+
+    pub fn open_config_modal(&mut self) {
+        if self.page != AppPage::BenchmarkList {
+            return;
+        }
+        self.config_modal_open = true;
+        self.config_modal_focus = ConfigModalFocus::Rows;
+        self.config_editing_text = false;
+        self.status_message = String::from("Configuration modal opened");
+    }
+
+    pub fn close_config_modal(&mut self) {
+        if !self.config_modal_open {
+            return;
+        }
+        self.config_modal_open = false;
+        self.config_editing_text = false;
+        self.status_message = String::from("Configuration modal closed");
+    }
+
+    pub fn is_config_modal_open(&self) -> bool {
+        self.config_modal_open
+    }
+
+    pub fn config_modal_focus_left(&mut self) {
+        if self.config_editing_text {
+            return;
+        }
+        self.config_modal_focus = self.config_modal_focus.prev();
+        self.status_message = match self.config_modal_focus {
+            ConfigModalFocus::Rows => String::from("Config focus: options"),
+            ConfigModalFocus::Preview => String::from("Config focus: preview"),
+        };
+    }
+
+    pub fn config_modal_focus_right(&mut self) {
+        if self.config_editing_text {
+            return;
+        }
+        self.config_modal_focus = self.config_modal_focus.next();
+        self.status_message = match self.config_modal_focus {
+            ConfigModalFocus::Rows => String::from("Config focus: options"),
+            ConfigModalFocus::Preview => String::from("Config focus: preview"),
+        };
     }
 
     pub fn config_rows(&self) -> &'static [ConfigRow] {
@@ -522,35 +580,24 @@ impl AppState {
     }
 
     pub fn config_move_up(&mut self) {
-        if self.config_editing_text {
+        if self.config_editing_text || self.config_modal_focus != ConfigModalFocus::Rows {
             return;
         }
         self.config_selected_row = self.config_selected_row.saturating_sub(1);
     }
 
     pub fn config_move_down(&mut self) {
-        if self.config_editing_text {
+        if self.config_editing_text || self.config_modal_focus != ConfigModalFocus::Rows {
             return;
         }
         let max_idx = ConfigRow::selectable_count() - 1;
         self.config_selected_row = (self.config_selected_row + 1).min(max_idx);
     }
 
-    pub fn config_adjust_left(&mut self) {
-        if self.config_editing_text {
-            return;
-        }
-        self.adjust_config_row(self.config_selected_row_kind(), false);
-    }
-
-    pub fn config_adjust_right(&mut self) {
-        if self.config_editing_text {
-            return;
-        }
-        self.adjust_config_row(self.config_selected_row_kind(), true);
-    }
-
     pub fn config_confirm(&mut self) {
+        if self.config_modal_focus != ConfigModalFocus::Rows && !self.config_editing_text {
+            return;
+        }
         let row = self.config_selected_row_kind();
         if self.config_editing_text {
             self.config_editing_text = false;
@@ -563,23 +610,19 @@ impl AppState {
                 self.config_editing_text = true;
                 self.status_message = String::from("Editing text field (Enter to finish)");
             }
-            _ => self.adjust_config_row(row, true),
+            _ => {
+                self.adjust_config_row(row, true);
+                self.status_message = format!("Config: {}", self.config_draft.label());
+            }
         }
     }
 
-    pub fn config_open_detail_shortcut(&mut self) {
-        self.persist_config_for_selected();
-        self.open_selected_benchmark_page();
-    }
-
-    pub fn config_back_or_cancel(&mut self) {
-        if self.config_editing_text {
-            self.config_editing_text = false;
-            self.status_message = String::from("Canceled text editing");
+    pub fn cancel_config_text_edit(&mut self) {
+        if !self.config_editing_text {
             return;
         }
-        self.page = AppPage::BenchmarkList;
-        self.status_message = String::from("Configuration canceled");
+        self.config_editing_text = false;
+        self.status_message = String::from("Canceled text editing");
     }
 
     pub fn config_push_char(&mut self, ch: char) {
@@ -619,7 +662,8 @@ impl AppState {
         }
 
         self.page = AppPage::BenchmarkDetail;
-        self.detail_focus = DetailFocus::StageList;
+        self.detail_focus = DetailFocus::Selector;
+        self.code_view_mode = CodeViewMode::IrDiff;
         self.ir_scroll = 0;
         self.source_detail_scroll = 0;
     }
@@ -690,18 +734,6 @@ impl AppState {
         self.status_message = format!("Config: {}", self.config_draft.label());
     }
 
-    fn persist_config_for_selected(&mut self) {
-        let Some(benchmark) = self.selected_benchmark() else {
-            return;
-        };
-        let Some(function) = self.selected_function_for_selected_benchmark() else {
-            return;
-        };
-        let key = config_scope_key(&benchmark.name, &function.symbol);
-        self.config_by_benchmark_function
-            .insert(key, self.config_draft.clone());
-    }
-
     pub fn clear_session(&mut self) {
         let Some(benchmark) = self.selected_benchmark() else {
             self.status_message = String::from("No benchmark selected");
@@ -718,7 +750,7 @@ impl AppState {
             self.ir_scroll = 0;
             self.source_detail_scroll = 0;
             self.selected_pass_by_stage.clear();
-            self.detail_focus = DetailFocus::StageList;
+            self.detail_focus = DetailFocus::Selector;
             self.status_message = String::from("Session cleared");
         } else {
             self.status_message = String::from("No session to clear");
@@ -790,118 +822,115 @@ impl AppState {
         passes.into_iter().nth(idx)
     }
 
-    pub fn is_stage_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::StageList
-    }
-
-    pub fn is_pass_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::PassList
-    }
-
-    pub fn is_source_view_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::SourceView
-    }
-
-    pub fn is_ir_view_focused(&self) -> bool {
-        self.detail_focus == DetailFocus::IrView
-    }
-
-    /// Tab: cycle forward through all 4 panes.
-    pub fn focus_cycle_next(&mut self) {
-        self.detail_focus = self.detail_focus.cycle_next();
-    }
-
-    /// Shift-Tab: cycle backward through all 4 panes.
-    pub fn focus_cycle_prev(&mut self) {
-        self.detail_focus = self.detail_focus.cycle_prev();
-    }
-
-    pub fn select_prev_stage(&mut self) {
-        let stages = self
-            .active_session_for_selected_benchmark()
-            .map(Self::ordered_stages_with_counts)
-            .unwrap_or_default();
-        if stages.is_empty() {
-            return;
+    pub fn ordered_pass_positions(session: &RunSession) -> Vec<(AnalysisStage, usize)> {
+        let mut positions = Vec::new();
+        for (stage, _) in Self::ordered_stages_with_counts(session) {
+            let count = Self::passes_for_stage(session, stage).len();
+            for pass_idx in 0..count {
+                positions.push((stage, pass_idx));
+            }
         }
-        let current_pos = stages
+        positions
+    }
+
+    fn selected_global_pass_position(&self, session: &RunSession) -> Option<usize> {
+        let positions = Self::ordered_pass_positions(session);
+        if positions.is_empty() {
+            return None;
+        }
+        let current = (
+            self.selected_stage,
+            self.selected_pass_index_in_stage(session),
+        );
+        positions
             .iter()
-            .position(|(s, _)| *s == self.selected_stage)
-            .unwrap_or(0);
-        if current_pos > 0 {
-            self.selected_stage = stages[current_pos - 1].0;
-        }
+            .position(|entry| *entry == current)
+            .or(Some(0))
     }
 
-    pub fn select_next_stage(&mut self) {
-        let stages = self
-            .active_session_for_selected_benchmark()
-            .map(Self::ordered_stages_with_counts)
-            .unwrap_or_default();
-        if stages.is_empty() {
-            return;
-        }
-        let current_pos = stages
-            .iter()
-            .position(|(s, _)| *s == self.selected_stage)
-            .unwrap_or(0);
-        if current_pos + 1 < stages.len() {
-            self.selected_stage = stages[current_pos + 1].0;
-        }
+    pub fn is_selector_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::Selector
+    }
+
+    pub fn is_code_view_focused(&self) -> bool {
+        self.detail_focus == DetailFocus::CodeView
+    }
+
+    pub fn detail_move_left(&mut self) {
+        self.detail_focus = DetailFocus::Selector;
+    }
+
+    pub fn detail_move_right(&mut self) {
+        self.detail_focus = DetailFocus::CodeView;
+    }
+
+    pub fn rotate_code_view_mode_next(&mut self) {
+        self.code_view_mode = self.code_view_mode.cycle_next();
+        self.ir_scroll = 0;
+        self.source_detail_scroll = 0;
+    }
+
+    pub fn rotate_code_view_mode_prev(&mut self) {
+        self.code_view_mode = self.code_view_mode.cycle_prev();
+        self.ir_scroll = 0;
+        self.source_detail_scroll = 0;
     }
 
     pub fn select_prev_pass(&mut self) {
-        let count = self
-            .active_session_for_selected_benchmark()
-            .map(|s| Self::passes_for_stage(s, self.selected_stage).len())
-            .unwrap_or(0);
-        if count == 0 {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return;
+        };
+        let ordered = Self::ordered_pass_positions(session);
+        if ordered.is_empty() {
             return;
         }
-        let idx = self
-            .selected_pass_by_stage
-            .get(&self.selected_stage)
-            .copied()
-            .unwrap_or(0);
-        self.selected_pass_by_stage
-            .insert(self.selected_stage, idx.saturating_sub(1));
+        let current = self.selected_global_pass_position(session).unwrap_or(0);
+        let target = current.saturating_sub(1);
+        let (stage, pass_idx) = ordered[target];
+        self.selected_stage = stage;
+        self.selected_pass_by_stage.insert(stage, pass_idx);
         self.ir_scroll = 0;
     }
 
     pub fn select_next_pass(&mut self) {
-        let count = self
-            .active_session_for_selected_benchmark()
-            .map(|s| Self::passes_for_stage(s, self.selected_stage).len())
-            .unwrap_or(0);
-        if count == 0 {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return;
+        };
+        let ordered = Self::ordered_pass_positions(session);
+        if ordered.is_empty() {
             return;
         }
-        let idx = self
-            .selected_pass_by_stage
-            .get(&self.selected_stage)
-            .copied()
-            .unwrap_or(0);
-        let new_idx = (idx + 1).min(count - 1);
-        self.selected_pass_by_stage
-            .insert(self.selected_stage, new_idx);
+        let current = self.selected_global_pass_position(session).unwrap_or(0);
+        let target = (current + 1).min(ordered.len() - 1);
+        let (stage, pass_idx) = ordered[target];
+        self.selected_stage = stage;
+        self.selected_pass_by_stage.insert(stage, pass_idx);
         self.ir_scroll = 0;
     }
 
     pub fn detail_move_up(&mut self) {
         match self.detail_focus {
-            DetailFocus::StageList => self.select_prev_stage(),
-            DetailFocus::PassList => self.select_prev_pass(),
-            DetailFocus::SourceView => self.scroll_source_detail_up(),
-            DetailFocus::IrView => self.scroll_ir_up(),
+            DetailFocus::Selector => self.select_prev_pass(),
+            DetailFocus::CodeView => {
+                if self.code_view_mode == CodeViewMode::CSource {
+                    self.scroll_source_detail_up();
+                } else {
+                    self.scroll_ir_up();
+                }
+            }
         }
     }
 
     pub fn detail_move_down(&mut self) {
         match self.detail_focus {
-            DetailFocus::StageList => self.select_next_stage(),
-            DetailFocus::PassList => self.select_next_pass(),
-            DetailFocus::SourceView => self.scroll_source_detail_down(),
-            DetailFocus::IrView => self.scroll_ir_down(),
+            DetailFocus::Selector => self.select_next_pass(),
+            DetailFocus::CodeView => {
+                if self.code_view_mode == CodeViewMode::CSource {
+                    self.scroll_source_detail_down();
+                } else {
+                    self.scroll_ir_down();
+                }
+            }
         }
     }
 
@@ -952,7 +981,15 @@ impl AppState {
         let Some(step) = self.selected_step_in_stage(session) else {
             return 0;
         };
-        let max = step.ir_lines.len().saturating_sub(1);
+        let visible_len = if self.code_view_mode == CodeViewMode::IrPostPass {
+            step.ir_lines
+                .iter()
+                .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
+                .count()
+        } else {
+            step.ir_lines.len()
+        };
+        let max = visible_len.saturating_sub(1);
         max.min(u16::MAX as usize) as u16
     }
 
@@ -1008,10 +1045,10 @@ impl AppState {
         self.source_detail_scroll = (target as u16).min(max);
     }
 
-    /// After analysis completes, auto-navigate to Vectorize stage + PassList focus.
-    /// Skipped if user has already navigated away from StageList.
+    /// After analysis completes, auto-navigate to Vectorize stage.
+    /// Skipped if user has already moved focus to code view.
     pub fn auto_navigate_to_vectorize(&mut self) {
-        if self.detail_focus != DetailFocus::StageList {
+        if self.detail_focus != DetailFocus::Selector {
             return;
         }
         let stages = self
@@ -1028,18 +1065,12 @@ impl AppState {
         };
         self.selected_stage = target_stage;
         self.selected_pass_by_stage.insert(target_stage, 0);
-        self.detail_focus = DetailFocus::PassList;
     }
 
     /// Returns a badge string and color for the benchmark's analysis state in the list page.
     pub fn verdict_badge_for_benchmark(&self, name: &str) -> Option<(String, Color)> {
         let function = self.selected_function_by_benchmark.get(name)?;
-        let config_key = config_scope_key(name, &function.symbol);
-        let config = self
-            .config_by_benchmark_function
-            .get(&config_key)
-            .cloned()
-            .unwrap_or_default();
+        let config = self.current_compiler_config();
         let session =
             self.sessions_by_key
                 .get(&session_key(name, &function.symbol, &config.config_id()))?;
@@ -1082,10 +1113,6 @@ impl AppState {
         self.job_state = JobState::Running(kind);
         self.selected_function_by_benchmark
             .insert(benchmark.clone(), selected_function.clone());
-        self.config_by_benchmark_function.insert(
-            config_scope_key(&benchmark, &selected_function.symbol),
-            compiler_config.clone(),
-        );
 
         let config_id = compiler_config.config_id();
         let key = session_key(&benchmark, &selected_function.symbol, &config_id);
@@ -1224,10 +1251,6 @@ impl AppState {
 
                         self.selected_function_by_benchmark
                             .insert(benchmark.clone(), selected_function.clone());
-                        self.config_by_benchmark_function.insert(
-                            config_scope_key(&benchmark, &selected_function.symbol),
-                            compiler_config.clone(),
-                        );
                         self.sessions_by_key.insert(key, session);
 
                         // Auto-navigate after analysis if this is the currently viewed benchmark
@@ -1264,10 +1287,6 @@ impl AppState {
             }
         }
     }
-}
-
-fn config_scope_key(benchmark: &str, function_symbol: &str) -> String {
-    format!("{benchmark}::{function_symbol}")
 }
 
 fn session_key(benchmark: &str, function_symbol: &str, config_id: &str) -> String {
@@ -1711,8 +1730,6 @@ int s161(void) {
         app.open_function_select_modal();
         assert!(app.is_function_modal_open());
         app.confirm_function_selection();
-        assert_eq!(app.page, AppPage::CompileConfig);
-        app.config_open_detail_shortcut();
         assert_eq!(app.page, AppPage::BenchmarkDetail);
         assert_eq!(app.selected_function_loop_id(), Some("S161"));
     }
@@ -1764,8 +1781,6 @@ int s161(void) {
         );
 
         app.config_draft = config_a.clone();
-        app.config_by_benchmark_function
-            .insert(config_scope_key("A", "s161"), config_a);
         app.clear_session();
         assert_eq!(app.sessions_by_key.len(), 1);
     }
@@ -1826,7 +1841,7 @@ int s161(void) {
         ))));
 
         assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
-        assert_eq!(app.detail_focus, DetailFocus::PassList);
+        assert_eq!(app.detail_focus, DetailFocus::Selector);
     }
 
     #[test]
@@ -1839,8 +1854,8 @@ int s161(void) {
         };
         app.open_function_select_modal();
         app.confirm_function_selection();
-        // User manually moved to PassList before analysis completes
-        app.detail_focus = DetailFocus::PassList;
+        // User manually moved focus to code view before analysis completes
+        app.detail_focus = DetailFocus::CodeView;
 
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::AnalyzeFast,
@@ -1855,8 +1870,8 @@ int s161(void) {
             selected_function,
         ))));
 
-        // Should still be PassList, auto-navigate was skipped
-        assert_eq!(app.detail_focus, DetailFocus::PassList);
+        // Should still be CodeView, auto-navigate was skipped
+        assert_eq!(app.detail_focus, DetailFocus::CodeView);
         // But selected_stage was NOT changed by auto_navigate since it was skipped
         // (remains as default Vectorize which happens to match, but the key thing is no navigation happened)
     }
@@ -1905,12 +1920,11 @@ int s161(void) {
     }
 
     #[test]
-    fn config_page_text_editing_flow() {
+    fn config_modal_text_editing_flow() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
-        app.open_function_select_modal();
-        app.confirm_function_selection();
-        assert_eq!(app.page, AppPage::CompileConfig);
+        app.open_config_modal();
+        assert!(app.is_config_modal_open());
 
         app.config_selected_row = 10; // ExtraCFlags
         app.config_confirm();
@@ -1923,5 +1937,45 @@ int s161(void) {
 
         assert_eq!(app.config_draft.extra_c_flags, "-g");
         assert!(!app.is_config_text_editing());
+    }
+
+    #[test]
+    fn config_modal_opens_without_function_selection() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        assert!(app.selected_function_for_selected_benchmark().is_none());
+        app.open_config_modal();
+        assert!(app.is_config_modal_open());
+    }
+
+    #[test]
+    fn pass_navigation_moves_across_stage_boundaries() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            compiler_config: CompilerConfig::default(),
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(outcome_with_vectorize(
+            "A",
+            CompilerConfig::default(),
+            selected_function,
+        ))));
+
+        assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
+        app.select_prev_pass();
+        assert_eq!(app.selected_stage, AnalysisStage::Loop);
+        app.select_next_pass();
+        assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
     }
 }

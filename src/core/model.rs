@@ -35,7 +35,6 @@ pub struct BenchmarkFunction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppPage {
     BenchmarkList,
-    CompileConfig,
     BenchmarkDetail,
 }
 

@@ -11,7 +11,7 @@ use similar::ChangeTag;
 use crate::core::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession,
 };
-use crate::display::app::{AppState, ConfigRow};
+use crate::display::app::{AppState, CodeViewMode, ConfigModalFocus, ConfigRow};
 use crate::display::syntax::{self, StyledChunk, SyntaxLang};
 use crate::transform::session::has_vectorizer_ir_changes;
 
@@ -25,7 +25,6 @@ const SOURCE_ANNOTATION_FG: Color = Color::Rgb(200, 160, 80);
 pub fn render(frame: &mut Frame, app: &AppState) {
     match app.page {
         AppPage::BenchmarkList => render_benchmark_list_page(frame, app),
-        AppPage::CompileConfig => render_compile_config_page(frame, app),
         AppPage::BenchmarkDetail => render_benchmark_detail_page(frame, app),
     }
 }
@@ -39,46 +38,28 @@ fn render_benchmark_list_page(frame: &mut Frame, app: &AppState) {
     let [header_area, main_area, footer_area] = vertical.areas(frame.area());
     render_list_header(frame, app, header_area);
 
-    let horizontal = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]);
+    let horizontal = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]);
     let [list_area, source_area] = horizontal.areas(main_area);
     render_benchmarks(frame, app, list_area);
     render_benchmark_source_code(frame, app, source_area);
     render_list_footer(frame, app, footer_area);
+    if app.is_config_modal_open() {
+        render_config_modal(frame, app);
+    }
     if app.is_function_modal_open() {
         render_function_select_modal(frame, app);
     }
 }
 
-fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
-    let area = frame.area();
-    let vertical = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(3),
-    ]);
-    let [header_area, main_area, footer_area] = vertical.areas(area);
+fn render_config_modal(frame: &mut Frame, app: &AppState) {
+    let area = centered_rect(frame.area(), 78, 78);
+    frame.render_widget(Clear, area);
 
-    let benchmark_name = app
-        .selected_benchmark()
-        .map(|b| b.name.as_str())
-        .unwrap_or("-");
-    let loop_id = app.selected_function_loop_id().unwrap_or("-");
-    let header = Paragraph::new(Line::from(vec![
-        Span::raw("TSVC TUI  "),
-        Span::styled("Page: ", Style::default().fg(Color::Gray)),
-        Span::styled("Compile Config", Style::default().fg(Color::Yellow)),
-        Span::raw("  "),
-        Span::styled(
-            format!("{benchmark_name} · {loop_id}"),
-            Style::default().fg(Color::Green),
-        ),
-    ]))
-    .block(Block::bordered().title("Session"));
-    frame.render_widget(header, header_area);
+    let vertical = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]);
+    let [main_area, footer_area] = vertical.areas(area);
 
-    let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]);
+    let cols = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]);
     let [left, right] = cols.areas(main_area);
-
     let rows = app.config_rows();
     let mut items: Vec<ListItem> = Vec::new();
     let mut display_to_data: Vec<Option<usize>> = Vec::new();
@@ -118,8 +99,13 @@ fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
         .position(|entry| *entry == Some(app.config_selected_row))
         .unwrap_or(0);
 
+    let left_title = if app.config_modal_focus == ConfigModalFocus::Rows {
+        "Configuration [Focus]"
+    } else {
+        "Configuration"
+    };
     let list = List::new(items)
-        .block(Block::bordered().title("Configuration"))
+        .block(Block::bordered().title(left_title))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -134,8 +120,13 @@ fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
     let [guide_area, preview_area] = right_rows.areas(right);
 
     let selected_row = app.config_selected_row_kind();
+    let guide_title = if app.config_modal_focus == ConfigModalFocus::Preview {
+        "Option Guide [Focus]"
+    } else {
+        "Option Guide"
+    };
     let guide = Paragraph::new(Text::from(config_help_lines(app, selected_row)))
-        .block(Block::bordered().title("Option Guide"))
+        .block(Block::bordered().title(guide_title))
         .wrap(Wrap { trim: false });
     frame.render_widget(guide, guide_area);
 
@@ -154,13 +145,14 @@ fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
     let hints = if app.is_config_text_editing() {
         "type text · backspace delete · enter finish · esc cancel edit"
     } else {
-        "↑↓ row · ←→ change · enter toggle/edit · d open detail · esc back"
+        "←→ section · ↑↓ row · enter toggle/edit · esc close"
     };
     let footer = Paragraph::new(Text::from(vec![
+        Line::from("Config Modal"),
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
     ]))
-    .block(Block::bordered().title("Keys"));
+    .block(Block::bordered().title("Modal"));
     frame.render_widget(footer, footer_area);
 }
 
@@ -240,7 +232,7 @@ fn config_help_lines(app: &AppState, row: ConfigRow) -> Vec<Line<'static>> {
     let workflow_hint = if app.is_config_text_editing() {
         "Workflow: You are editing text; Enter commits this field."
     } else {
-        "Workflow: For pass tracking, try -O1 with vectorizers off, then re-enable selectively. Press 'd' to enter detail."
+        "Workflow: For pass tracking, try -O1 with vectorizers off, then re-enable selectively."
     };
     lines.push(Line::from(workflow_hint.to_string()));
     lines
@@ -267,22 +259,11 @@ fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
     let [header_area, main_area, footer_area] = vertical.areas(area);
     render_detail_header(frame, app, header_area);
 
-    // 2x2 grid: top row (30%) and bottom row (70%)
-    let rows = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]);
-    let [top_row, bottom_row] = rows.areas(main_area);
+    let cols = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]);
+    let [selector_area, code_area] = cols.areas(main_area);
 
-    // Top row: stage list (25%) | pass list (75%)
-    let top_cols = Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)]);
-    let [stage_area, pass_area] = top_cols.areas(top_row);
-
-    // Bottom row: C source (35%) | IR view (65%)
-    let bottom_cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]);
-    let [source_area, ir_area] = bottom_cols.areas(bottom_row);
-
-    render_stage_list(frame, app, stage_area);
-    render_pass_list_panel(frame, app, pass_area);
-    render_detail_source_panel(frame, app, source_area);
-    render_ir_view_panel(frame, app, ir_area);
+    render_pass_selector_panel(frame, app, selector_area);
+    render_code_view_panel(frame, app, code_area);
     render_detail_footer(frame, app, footer_area);
 }
 
@@ -333,11 +314,11 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
     frame.render_widget(header, area);
 }
 
-fn render_stage_list(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let title = if app.is_stage_focused() {
-        "Stages [Focus]"
+fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let title = if app.is_selector_focused() {
+        "Pass Selector [Focus]"
     } else {
-        "Stages"
+        "Pass Selector"
     };
 
     let Some(session) = app.active_session_for_selected_benchmark() else {
@@ -365,89 +346,45 @@ fn render_stage_list(frame: &mut Frame, app: &AppState, area: ratatui::layout::R
         return;
     }
 
-    let selected_pos = stages.iter().position(|(s, _)| *s == app.selected_stage);
+    let selected_stage = app.selected_stage;
+    let selected_pass = app.selected_pass_index_in_stage(session);
+    let mut selected_display_idx = None;
 
-    let items: Vec<ListItem> = stages
-        .iter()
-        .map(|(stage, count)| {
-            let marker = if *stage == AnalysisStage::Vectorize {
-                "\u{2605}"
-            } else {
-                " "
-            };
-            let text = format!("{marker} {}  ({})", stage.ui_label(), count);
-            ListItem::new(text)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::bordered().title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    let mut state = ListState::default();
-    state.select(selected_pos);
-    frame.render_stateful_widget(list, area, &mut state);
-}
-
-fn render_pass_list_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let stage_label = app.selected_stage.ui_label();
-    let is_vectorize = app.selected_stage == AnalysisStage::Vectorize;
-    let star = if is_vectorize { " \u{2605}" } else { "" };
-    let title_base = format!("Passes in {stage_label}{star}");
-    let title = if app.is_pass_focused() {
-        format!("{title_base} [Focus]")
-    } else {
-        title_base
-    };
-
-    let Some(session) = app.active_session_for_selected_benchmark() else {
-        frame.render_widget(
-            Paragraph::new("No analysis").block(Block::bordered().title(title)),
-            area,
+    let mut items = Vec::new();
+    for (stage, count) in stages {
+        let stage_marker = if stage == AnalysisStage::Vectorize {
+            "\u{2605}"
+        } else {
+            " "
+        };
+        items.push(
+            ListItem::new(format!("{stage_marker} {}  ({count})", stage.ui_label())).style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
         );
-        return;
-    };
 
-    let passes = AppState::passes_for_stage(session, app.selected_stage);
-    if passes.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No passes in this stage").block(Block::bordered().title(title)),
-            area,
-        );
-        return;
-    }
-
-    let selected_idx = app.selected_pass_index_in_stage(session);
-
-    let items: Vec<ListItem> = passes
-        .iter()
-        .enumerate()
-        .map(|(i, step)| {
+        let passes = AppState::passes_for_stage(session, stage);
+        for (pass_idx, step) in passes.iter().enumerate() {
             let (icon, _msg) = pass_remark_summary(step, &session.remarks);
             let marker = if step.stage == AnalysisStage::Vectorize {
                 "\u{2605}"
             } else {
                 " "
             };
-            let cursor = if i == selected_idx && app.is_ir_view_focused() {
-                "\u{25c0}"
-            } else {
-                " "
-            };
             let text = format!(
-                "{marker} {}  {} [\u{0394}{}] {cursor}",
+                "  {marker} {}  {} [\u{0394}{}]",
                 pass_display_name(&step.pass_key),
                 icon,
                 step.changed_lines,
             );
-            ListItem::new(text)
-        })
-        .collect();
+            if stage == selected_stage && pass_idx == selected_pass {
+                selected_display_idx = Some(items.len());
+            }
+            items.push(ListItem::new(text));
+        }
+    }
 
     let list = List::new(items)
         .block(Block::bordered().title(title))
@@ -459,17 +396,30 @@ fn render_pass_list_panel(frame: &mut Frame, app: &AppState, area: ratatui::layo
         .highlight_symbol(">> ");
 
     let mut state = ListState::default();
-    state.select(Some(selected_idx));
+    state.select(selected_display_idx);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_detail_source_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let title = if app.is_source_view_focused() {
-        "C Source [Focus]"
+fn render_code_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let title = if app.is_code_view_focused() {
+        format!("Code View: {} [Focus]", app.code_view_mode.label())
     } else {
-        "C Source"
+        format!("Code View: {}", app.code_view_mode.label())
     };
 
+    match app.code_view_mode {
+        CodeViewMode::CSource => render_detail_source_panel(frame, app, area, &title),
+        CodeViewMode::IrPostPass => render_ir_post_panel(frame, app, area, &title),
+        CodeViewMode::IrDiff => render_ir_diff_panel(frame, app, area, &title),
+    }
+}
+
+fn render_detail_source_panel(
+    frame: &mut Frame,
+    app: &AppState,
+    area: ratatui::layout::Rect,
+    title: &str,
+) {
     let Some(source_text) = app.detail_source_text_for_selected_benchmark() else {
         frame.render_widget(
             Paragraph::new("Source not available").block(Block::bordered().title(title)),
@@ -547,13 +497,12 @@ fn collect_highlighted_source_lines(app: &AppState) -> HashSet<u32> {
     result
 }
 
-fn render_ir_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let title = if app.is_ir_view_focused() {
-        "IR View [Focus]"
-    } else {
-        "IR View"
-    };
-
+fn render_ir_diff_panel(
+    frame: &mut Frame,
+    app: &AppState,
+    area: ratatui::layout::Rect,
+    title: &str,
+) {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
             Paragraph::new("No analysis").block(Block::bordered().title(title)),
@@ -622,6 +571,86 @@ fn render_ir_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout
             let highlighted = highlighted_ir.get(idx).map(Vec::as_slice);
             prefixed_highlighted_line(
                 prefix,
+                base_style,
+                highlighted,
+                &ir_line.text,
+                Some(base_style),
+            )
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title(title))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
+        .scroll((app.ir_scroll, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_ir_post_panel(
+    frame: &mut Frame,
+    app: &AppState,
+    area: ratatui::layout::Rect,
+    title: &str,
+) {
+    let Some(session) = app.active_session_for_selected_benchmark() else {
+        frame.render_widget(
+            Paragraph::new("No analysis").block(Block::bordered().title(title)),
+            area,
+        );
+        return;
+    };
+
+    let Some(step) = app.selected_step_in_stage(session) else {
+        let hint = match session.analysis_state {
+            AnalysisState::None => "Press 'a' to analyze",
+            AnalysisState::Running => "\u{27f3} Analyzing...",
+            AnalysisState::Ready => "Select a pass",
+            AnalysisState::Failed => "Analysis failed",
+        };
+        frame.render_widget(
+            Paragraph::new(hint).block(Block::bordered().title(title)),
+            area,
+        );
+        return;
+    };
+
+    let filtered_lines: Vec<_> = step
+        .ir_lines
+        .iter()
+        .filter(|ir_line| !matches!(ir_line.tag, ChangeTag::Delete))
+        .collect();
+
+    if filtered_lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No IR lines for this pass").block(Block::bordered().title(title)),
+            area,
+        );
+        return;
+    }
+
+    let ir_text = filtered_lines
+        .iter()
+        .map(|ir_line| ir_line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let highlighted_ir = syntax::highlight(SyntaxLang::LlvmIr, &ir_text);
+
+    let lines: Vec<Line> = filtered_lines
+        .iter()
+        .enumerate()
+        .map(|(idx, ir_line)| {
+            if ir_line.is_source_annotation {
+                let style = Style::default()
+                    .fg(SOURCE_ANNOTATION_FG)
+                    .bg(CODE_BG)
+                    .add_modifier(Modifier::ITALIC);
+                return Line::from(Span::styled(format!("  {}", ir_line.text), style));
+            }
+
+            let base_style = Style::default().fg(CODE_TEXT_FG).bg(CODE_BG);
+            let highlighted = highlighted_ir.get(idx).map(Vec::as_slice);
+            prefixed_highlighted_line(
+                "  ",
                 base_style,
                 highlighted,
                 &ir_line.text,
@@ -711,8 +740,7 @@ fn render_benchmark_source_code(frame: &mut Frame, app: &AppState, area: ratatui
 }
 
 fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints =
-        "q quit | tab/s-tab focus pane | \u{2191}\u{2193} select-or-scroll | enter select function";
+    let hints = "q quit | \u{2190}\u{2192} section | \u{2191}\u{2193} select/scroll | enter select function | c config";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -723,7 +751,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "Tab/S-Tab cycle pane \u{00b7} \u{2191}\u{2193} navigate \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} c clear";
+    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} navigate \u{00b7} tab/s-tab mode (code view) \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} c clear";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -766,7 +794,7 @@ fn render_function_select_modal(frame: &mut Frame, app: &AppState) {
     }
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    let hint = Paragraph::new("\u{2191}\u{2193} move | enter configure | esc cancel")
+    let hint = Paragraph::new("\u{2191}\u{2193} move | enter open detail | esc cancel")
         .block(Block::bordered().title("Modal"));
     frame.render_widget(hint, hint_area);
 }

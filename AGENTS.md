@@ -63,38 +63,45 @@ If logic is about:
 ## TUI Behavior Contract
 
 ### Pages and Flow
-- Pages: `Benchmark List` -> `Compile Config` -> `Benchmark Detail`
-- `Enter` on list opens `Select Function` modal first
+- Pages: `Benchmark List` -> `Benchmark Detail`
+- `Enter` on list opens `Select Function` modal first, and function confirm opens detail directly
+- `c` on list opens optional global `Configuration` modal (live-apply)
 - Session scope: `benchmark + selected function + config_id`
 
 ### List Page
 - Two panes: `Benchmarks`, `C Source (kernel-focused)`
-- `Tab` / `Shift-Tab`: switch focus pane
+- `Left`/`Right`: switch focus pane
 - `Up`/`Down`:
   - Benchmarks focus -> move selection
   - Source focus -> scroll source
+- `Enter`: open function select modal
+- `c`: open configuration modal
 
-### Compile Config Page
+### Configuration Modal (from List)
 - Rows grouped into 5 sections:
   - Optimization
   - Vectorization
   - Loop Transforms
   - Target
   - Advanced
-- `Up`/`Down`: move row
-- `Left`/`Right`: adjust/toggle value
-- `Enter`: toggle or enter text-edit mode
-- `d`: persist config + open detail page
-- `Esc`: cancel text edit or go back to list
+- `Left`/`Right`: switch modal section focus (`Configuration` / `Option Guide+Flag Preview`)
+- `Up`/`Down`: move row (when config rows are focused)
+- `Enter`: cycle/toggle value or enter text-edit mode
+- `Esc`: cancel text edit or close modal
+- Config is global and applies immediately (no explicit save key)
 
-### Detail Page (2x2)
-- Top: Stage list (25%) | Pass list (75%)
-- Bottom: C source (35%) | IR view (65%)
-- Focus panes: `StageList`, `PassList`, `SourceView`, `IrView`
-- `Tab` / `Shift-Tab`: cycle all 4 panes
-- `Up`/`Down`: move in focused pane
-- `Enter`: Stage -> Pass, Pass -> IR
-- `Esc`: IR -> Pass -> Stage -> list
+### Detail Page (2 columns)
+- Left: integrated stage/pass selector
+  - stage is shown as non-selectable header
+  - only passes are selectable
+- Right: code view (mode rotator)
+  - modes: `IR diff`, `IR`, `C`
+  - `Tab` / `Shift-Tab`: rotate mode (when code view is focused)
+- `Left`/`Right`: switch section focus (`Selector` / `Code View`)
+- `Up`/`Down`:
+  - Selector focus -> move selected pass (across grouped stages)
+  - Code view focus -> scroll current mode
+- `Esc`: return to list
 - Actions:
   - `a`: run analysis
   - `r`: run build+run
@@ -106,10 +113,11 @@ Minimum terminal size: `100x30`.
 ## Analysis and IR Notes
 
 - Analysis path is fast trace based (`-mllvm -print-changed`) and function-scoped.
-- IR view uses interleaved diff lines:
+- `IR diff` mode uses interleaved diff lines:
   - `+ ` inserted
   - `- ` deleted
   - `  ` unchanged
+- `IR` mode shows post-pass IR by omitting deleted diff lines.
 - Source annotations (`;; ...`) are injected with diff-tag-consistent backgrounds.
 - `#dbg_*` intrinsics are removed from displayed IR.
 - Trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) is stripped in transformed IR output.

@@ -8,17 +8,16 @@ pub enum UserAction {
     MoveDown,
     MoveLeft,
     MoveRight,
-    Confirm,               // Enter
-    BackToBenchmarkList,   // Esc
-    FocusNextPaneCycle,    // Tab
-    FocusPrevPaneCycle,    // Shift-Tab
-    Run,                   // 'r' → BuildAndRun
-    Analyze,               // 'a' → AnalyzeFast
-    OpenDetailPage,        // 'd' → Enter BenchmarkDetail from CompileConfig
-    ClearSession,          // 'c'
-    CopyDetailToClipboard, // 'y'
-    Backspace,             // Backspace
-    TextChar(char),        // Generic text input for config page
+    Confirm,                // Enter
+    BackToBenchmarkList,    // Esc
+    RotateCodeViewMode,     // Tab
+    RotateCodeViewModePrev, // Shift-Tab
+    Run,                    // 'r' → BuildAndRun
+    Analyze,                // 'a' → AnalyzeFast
+    ClearSession,           // 'c'
+    CopyDetailToClipboard,  // 'y'
+    Backspace,              // Backspace
+    TextChar(char),         // Generic text input for config modal
 }
 
 pub fn map_key_event(key: KeyEvent) -> UserAction {
@@ -26,7 +25,6 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Char('q') => UserAction::Quit,
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::Analyze,
-        KeyCode::Char('d') => UserAction::OpenDetailPage,
         KeyCode::Char('c') => UserAction::ClearSession,
         KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
         KeyCode::Char(ch) => UserAction::TextChar(ch),
@@ -37,8 +35,8 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Enter => UserAction::Confirm,
         KeyCode::Esc => UserAction::BackToBenchmarkList,
         KeyCode::Backspace => UserAction::Backspace,
-        KeyCode::Tab => UserAction::FocusNextPaneCycle,
-        KeyCode::BackTab => UserAction::FocusPrevPaneCycle,
+        KeyCode::Tab => UserAction::RotateCodeViewMode,
+        KeyCode::BackTab => UserAction::RotateCodeViewModePrev,
         _ => UserAction::None,
     }
 }
@@ -68,19 +66,15 @@ mod tests {
         assert_eq!(map_key_event(key(KeyCode::Right)), UserAction::MoveRight);
         assert_eq!(
             map_key_event(key(KeyCode::Tab)),
-            UserAction::FocusNextPaneCycle
+            UserAction::RotateCodeViewMode
         );
         assert_eq!(
             map_key_event(key(KeyCode::BackTab)),
-            UserAction::FocusPrevPaneCycle
+            UserAction::RotateCodeViewModePrev
         );
 
         assert_eq!(map_key_event(key(KeyCode::Char('a'))), UserAction::Analyze);
         assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
-        assert_eq!(
-            map_key_event(key(KeyCode::Char('d'))),
-            UserAction::OpenDetailPage
-        );
         assert_eq!(
             map_key_event(key(KeyCode::Char('y'))),
             UserAction::CopyDetailToClipboard

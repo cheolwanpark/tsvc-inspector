@@ -88,9 +88,12 @@ fn run_app(
                 continue;
             }
 
-            if app.page == AppPage::CompileConfig && app.is_config_text_editing() {
+            if app.page == AppPage::BenchmarkList
+                && app.is_config_modal_open()
+                && app.is_config_text_editing()
+            {
                 match key.code {
-                    crossterm::event::KeyCode::Esc => app.config_back_or_cancel(),
+                    crossterm::event::KeyCode::Esc => app.cancel_config_text_edit(),
                     crossterm::event::KeyCode::Enter => app.config_confirm(),
                     crossterm::event::KeyCode::Backspace => app.config_backspace(),
                     crossterm::event::KeyCode::Char(ch) => app.config_push_char(ch),
@@ -109,13 +112,27 @@ fn run_app(
                     UserAction::BackToBenchmarkList => app.close_function_select_modal(),
                     _ => {}
                 },
+                action if app.page == AppPage::BenchmarkList && app.is_config_modal_open() => {
+                    match action {
+                        UserAction::MoveUp => app.config_move_up(),
+                        UserAction::MoveDown => app.config_move_down(),
+                        UserAction::MoveLeft => app.config_modal_focus_left(),
+                        UserAction::MoveRight => app.config_modal_focus_right(),
+                        UserAction::Confirm => app.config_confirm(),
+                        UserAction::BackToBenchmarkList => app.close_config_modal(),
+                        UserAction::Backspace => app.config_backspace(),
+                        UserAction::TextChar(ch) => app.config_push_char(ch),
+                        _ => {}
+                    }
+                }
                 action => match app.page {
                     AppPage::BenchmarkList => match action {
                         UserAction::MoveUp => app.list_move_up(),
                         UserAction::MoveDown => app.list_move_down(),
-                        UserAction::FocusNextPaneCycle => app.focus_next_list_pane(),
-                        UserAction::FocusPrevPaneCycle => app.focus_prev_list_pane(),
+                        UserAction::MoveLeft => app.list_move_left(),
+                        UserAction::MoveRight => app.list_move_right(),
                         UserAction::Confirm => app.open_function_select_modal(),
+                        UserAction::ClearSession => app.open_config_modal(),
                         UserAction::Run | UserAction::Analyze => {
                             app.set_status_message(
                                 "Select function and open detail page to run or analyze",
@@ -123,37 +140,20 @@ fn run_app(
                         }
                         _ => {}
                     },
-                    AppPage::CompileConfig => match action {
-                        UserAction::MoveUp => app.config_move_up(),
-                        UserAction::MoveDown => app.config_move_down(),
-                        UserAction::MoveLeft => app.config_adjust_left(),
-                        UserAction::MoveRight => app.config_adjust_right(),
-                        UserAction::Confirm => app.config_confirm(),
-                        UserAction::OpenDetailPage => app.config_open_detail_shortcut(),
-                        UserAction::BackToBenchmarkList => app.config_back_or_cancel(),
-                        UserAction::Backspace => app.config_backspace(),
-                        UserAction::TextChar(ch) => app.config_push_char(ch),
-                        _ => {}
-                    },
                     AppPage::BenchmarkDetail => match action {
                         UserAction::MoveUp => app.detail_move_up(),
                         UserAction::MoveDown => app.detail_move_down(),
-                        UserAction::BackToBenchmarkList => {
-                            if app.is_ir_view_focused() {
-                                app.detail_focus = crate::display::app::DetailFocus::PassList;
-                            } else if app.is_pass_focused() || app.is_source_view_focused() {
-                                app.detail_focus = crate::display::app::DetailFocus::StageList;
-                            } else {
-                                app.back_to_benchmark_list();
+                        UserAction::MoveLeft => app.detail_move_left(),
+                        UserAction::MoveRight => app.detail_move_right(),
+                        UserAction::BackToBenchmarkList => app.back_to_benchmark_list(),
+                        UserAction::RotateCodeViewMode => {
+                            if app.is_code_view_focused() {
+                                app.rotate_code_view_mode_next();
                             }
                         }
-                        UserAction::FocusNextPaneCycle => app.focus_cycle_next(),
-                        UserAction::FocusPrevPaneCycle => app.focus_cycle_prev(),
-                        UserAction::Confirm => {
-                            if app.is_stage_focused() {
-                                app.detail_focus = crate::display::app::DetailFocus::PassList;
-                            } else if app.is_pass_focused() {
-                                app.detail_focus = crate::display::app::DetailFocus::IrView;
+                        UserAction::RotateCodeViewModePrev => {
+                            if app.is_code_view_focused() {
+                                app.rotate_code_view_mode_prev();
                             }
                         }
                         UserAction::ClearSession => app.clear_session(),
