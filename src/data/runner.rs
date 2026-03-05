@@ -6,8 +6,8 @@ use std::process::Command;
 use anyhow::{Context, anyhow};
 use regex::Regex;
 
-use crate::error::AppResult;
-use crate::model::{BenchmarkItem, BuildPurpose, CompilerConfig, FunctionRunMode};
+use crate::core::error::AppResult;
+use crate::core::model::{BenchmarkItem, BuildPurpose, CompilerConfig, FunctionRunMode};
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
@@ -478,21 +478,14 @@ fn find_function_source_file(build_trace: &str, function_name: &str) -> Option<P
         regex::escape(function_name)
     );
     let subprogram_re = Regex::new(&subprogram_pattern).ok()?;
-    let file_id = subprogram_re
-        .captures(build_trace)?
-        .get(1)?
-        .as_str();
+    let file_id = subprogram_re.captures(build_trace)?.get(1)?.as_str();
 
     let difile_pattern = format!(r#"!{file_id} = !DIFile\(filename: "([^"]+)""#);
     let difile_re = Regex::new(&difile_pattern).ok()?;
     let filename = difile_re.captures(build_trace)?.get(1)?.as_str();
 
     let path = PathBuf::from(filename);
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 #[cfg(test)]

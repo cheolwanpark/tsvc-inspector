@@ -1,14 +1,16 @@
 use std::collections::HashMap;
-use std::fmt::Write;
 
 use ratatui::style::Color;
-use similar::ChangeTag;
 
-use crate::model::{
+use crate::core::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
     CompilerConfig, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary, RunSession,
     SessionStatus,
 };
+use crate::transform::session::{
+    DetailSnapshotInput, build_detail_snapshot, extract_vf_from_remarks, has_vectorizer_ir_changes,
+};
+use crate::transform::source::extract_c_function_source;
 
 #[derive(Debug)]
 pub enum JobEvent {
@@ -171,7 +173,10 @@ impl ConfigRow {
     pub fn group(self) -> &'static str {
         match self {
             Self::OptLevel | Self::FastMath => "Optimization",
-            Self::LoopVectorize | Self::SlpVectorize | Self::ForceVecWidth | Self::ForceInterleave => "Vectorization",
+            Self::LoopVectorize
+            | Self::SlpVectorize
+            | Self::ForceVecWidth
+            | Self::ForceInterleave => "Vectorization",
             Self::UnrollLoops | Self::LoopInterchange | Self::LoopDistribute => "Loop Transforms",
             Self::MarchNative => "Target",
             Self::ExtraCFlags | Self::ExtraLlvmFlags => "Advanced",
@@ -918,55 +923,17 @@ impl AppState {
         let source_text = self
             .detail_source_text_for_selected_benchmark()
             .unwrap_or_else(|| String::from("(source not available)"));
-        let full_pass_diff = build_full_pass_diff(step);
-        let pass_name = if step.pass.is_empty() {
-            step.pass_key.as_str()
-        } else {
-            step.pass.as_str()
-        };
-        let remarks_text = format_step_remarks(step, &session.remarks);
-
-        let mut out = String::new();
-        let _ = writeln!(out, "TSVC Detail Snapshot");
-        let _ = writeln!(out);
-
-        let _ = writeln!(out, "Context");
-        let _ = writeln!(out, "- benchmark: {}", benchmark.name);
-        let _ = writeln!(
-            out,
-            "- function: {} ({})",
-            selected_function.loop_id, selected_function.symbol
-        );
-        let _ = writeln!(out, "- config: {}", session.compiler_config);
-        let _ = writeln!(out, "- config_id: {}", session.config_id);
-        let _ = writeln!(out, "- focus: {}", self.detail_focus.label());
-        let _ = writeln!(out, "- analysis_state: {}", session.analysis_state);
-        let _ = writeln!(out);
-
-        let _ = writeln!(out, "Stage/Pass");
-        let _ = writeln!(out, "- stage: {}", self.selected_stage.ui_label());
-        let _ = writeln!(out, "- pass_key: {}", step.pass_key);
-        let _ = writeln!(out, "- pass_raw: {}", step.pass);
-        let _ = writeln!(out, "- pass_index: {selected_pass_index}/{}", passes.len());
-        let _ = writeln!(out, "- changed_lines: {}", step.changed_lines);
-        let _ = writeln!(out);
-
-        let _ = writeln!(out, "Remarks");
-        let _ = writeln!(out, "{remarks_text}");
-        let _ = writeln!(out);
-
-        let _ = writeln!(out, "C Source");
-        let _ = writeln!(out, "```c");
-        let _ = writeln!(out, "{source_text}");
-        let _ = writeln!(out, "```");
-        let _ = writeln!(out);
-
-        let _ = writeln!(out, "IR Diff ({pass_name})");
-        let _ = writeln!(out, "```diff");
-        let _ = writeln!(out, "{full_pass_diff}");
-        let _ = writeln!(out, "```");
-
-        Ok(out)
+        Ok(build_detail_snapshot(DetailSnapshotInput {
+            benchmark,
+            selected_function,
+            session,
+            selected_stage: self.selected_stage,
+            detail_focus_label: self.detail_focus.label(),
+            step,
+            selected_pass_index,
+            passes_len: passes.len(),
+            source_text: &source_text,
+        }))
     }
 
     fn scroll_ir_up(&mut self) {
@@ -1299,135 +1266,6 @@ impl AppState {
     }
 }
 
-fn format_step_remarks(step: &AnalysisStep, remarks: &[RemarkEntry]) -> String {
-    let mut lines = Vec::new();
-    for idx in &step.remark_indices {
-        let Some(remark) = remarks.get(*idx) else {
-            continue;
-        };
-        let message = remark.message.as_deref().unwrap_or(remark.name.as_str());
-        let line = format!(
-            "- [{}] {}::{} {}",
-            remark.kind, remark.pass, remark.name, message
-        );
-        lines.push(line);
-    }
-    if lines.is_empty() {
-        return String::from("- (none)");
-    }
-    lines.join("\n")
-}
-
-fn build_full_pass_diff(step: &AnalysisStep) -> String {
-    if step.ir_lines.is_empty() {
-        return step.diff_text.clone();
-    }
-    step.ir_lines
-        .iter()
-        .map(|line| {
-            if line.is_source_annotation {
-                return line.text.clone();
-            }
-            let prefix = match line.tag {
-                ChangeTag::Insert => "+ ",
-                ChangeTag::Delete => "- ",
-                ChangeTag::Equal => "  ",
-            };
-            format!("{prefix}{}", line.text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn extract_c_function_source(source: &str, symbol: &str) -> Option<String> {
-    if symbol.is_empty() {
-        return None;
-    }
-    let lines: Vec<&str> = source.lines().collect();
-    if lines.is_empty() {
-        return None;
-    }
-
-    for start in 0..lines.len() {
-        if !line_contains_symbol_with_call_paren(lines[start], symbol) {
-            continue;
-        }
-
-        let mut found_open_brace = false;
-        let mut brace_depth = 0u32;
-        let mut end = start;
-
-        while end < lines.len() {
-            let line = lines[end];
-            for ch in line.chars() {
-                if found_open_brace {
-                    match ch {
-                        '{' => brace_depth = brace_depth.saturating_add(1),
-                        '}' => {
-                            brace_depth = brace_depth.saturating_sub(1);
-                            if brace_depth == 0 {
-                                return Some(lines[start..=end].join("\n"));
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match ch {
-                        ';' => break,
-                        '{' => {
-                            found_open_brace = true;
-                            brace_depth = 1;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if !found_open_brace && line.contains(';') {
-                break;
-            }
-            end += 1;
-        }
-    }
-
-    None
-}
-
-fn line_contains_symbol_with_call_paren(line: &str, symbol: &str) -> bool {
-    let bytes = line.as_bytes();
-    let symbol_len = symbol.len();
-    if symbol_len == 0 || bytes.len() < symbol_len {
-        return false;
-    }
-
-    let mut offset = 0usize;
-    while offset + symbol_len <= bytes.len() {
-        let Some(found) = line[offset..].find(symbol) else {
-            break;
-        };
-        let start = offset + found;
-        let end = start + symbol_len;
-
-        let left_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
-        let right_ok = end >= bytes.len() || !is_identifier_byte(bytes[end]);
-        if left_ok && right_ok {
-            let mut idx = end;
-            while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
-                idx += 1;
-            }
-            if idx < bytes.len() && bytes[idx] == b'(' {
-                return true;
-            }
-        }
-        offset = end;
-    }
-    false
-}
-
-fn is_identifier_byte(ch: u8) -> bool {
-    ch.is_ascii_alphanumeric() || ch == b'_'
-}
-
 fn config_scope_key(benchmark: &str, function_symbol: &str) -> String {
     format!("{benchmark}::{function_symbol}")
 }
@@ -1444,39 +1282,10 @@ fn bool_text(v: bool) -> String {
     }
 }
 
-/// Checks if vectorizer passes (loopvectorize/slpvectorizer) made IR changes.
-pub fn has_vectorizer_ir_changes(session: &RunSession) -> bool {
-    session.analysis_steps.iter().any(|step| {
-        step.stage == AnalysisStage::Vectorize
-            && step.changed_lines > 0
-            && matches!(step.pass_key.as_str(), "loopvectorize" | "slpvectorizer")
-    })
-}
-
-/// Extracts the vectorization factor from a session's remarks.
-fn extract_vf_from_remarks(remarks: &[RemarkEntry]) -> Option<u32> {
-    for r in remarks {
-        if r.pass == "loop-vectorize"
-            && let Some(msg) = &r.message
-        {
-            for pattern in &["VF = ", "VF="] {
-                if let Some(pos) = msg.find(pattern) {
-                    let rest = msg[pos + pattern.len()..].trim_start_matches(' ');
-                    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    if let Ok(n) = num.parse::<u32>() {
-                        return Some(n);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
+    use crate::core::model::{
         AnalysisSource, AnalysisStage, AnalysisState, AnalysisStep, IrLine, RemarkKind,
     };
     use similar::ChangeTag;

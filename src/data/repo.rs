@@ -4,7 +4,10 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow};
 
-use crate::error::AppResult;
+use crate::core::error::AppResult;
+use crate::core::model::FunctionRunMode;
+use crate::data::runner::RunnerConfig;
+use crate::data::tsvc_patch::{self, TsvcPatchOutcome};
 
 const LLVM_TEST_SUITE_REPO: &str = "https://github.com/llvm/llvm-test-suite.git";
 
@@ -46,6 +49,46 @@ pub fn resolve_tsvc_root(preferred_root: &Path) -> AppResult<PathBuf> {
     }
 
     Ok(fallback)
+}
+
+pub fn configure_function_run_mode(
+    config: &RunnerConfig,
+) -> AppResult<(FunctionRunMode, Option<String>)> {
+    if !is_app_managed_fallback_root(&config.tsvc_root) {
+        return Ok((
+            FunctionRunMode::OutputFilter,
+            Some(String::from(
+                "External TSVC root detected: function mode = output-filter",
+            )),
+        ));
+    }
+
+    match tsvc_patch::ensure_function_filter_patch(&config.tsvc_root) {
+        Ok(TsvcPatchOutcome::AlreadyPatched) => Ok((
+            FunctionRunMode::RealSelective,
+            Some(String::from("Function mode: real-selective")),
+        )),
+        Ok(TsvcPatchOutcome::Patched) => {
+            if let Err(err) = reset_native_build_dirs(config) {
+                eprintln!("warning: patched TSVC source but failed to reset build dirs: {err:#}");
+            }
+            Ok((
+                FunctionRunMode::RealSelective,
+                Some(String::from(
+                    "Patched fallback TSVC for function-selective run mode",
+                )),
+            ))
+        }
+        Err(err) => {
+            eprintln!("warning: failed to patch TSVC for real-selective mode: {err:#}");
+            Ok((
+                FunctionRunMode::OutputFilter,
+                Some(String::from(
+                    "Function patch failed: falling back to output-filter mode",
+                )),
+            ))
+        }
+    }
 }
 
 pub fn app_managed_fallback_root() -> PathBuf {
@@ -111,4 +154,27 @@ fn run_checked(command: &mut Command, label: &str) -> AppResult<()> {
         stdout,
         stderr
     ))
+}
+
+fn reset_native_build_dirs(config: &RunnerConfig) -> AppResult<()> {
+    let native_root = config.build_root.join("build-tsvc-native");
+    if native_root.exists() {
+        fs::remove_dir_all(&native_root)
+            .with_context(|| format!("remove {}", native_root.display()))?;
+    }
+
+    for name in [
+        "build-tsvc-o3-remarks-run",
+        "build-tsvc-o3-novec-run",
+        "build-tsvc-o3-default-run",
+        "build-tsvc-o3-remarks-analysis",
+        "build-tsvc-o3-novec-analysis",
+        "build-tsvc-o3-default-analysis",
+    ] {
+        let dir = config.build_root.join(name);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+        }
+    }
+    Ok(())
 }

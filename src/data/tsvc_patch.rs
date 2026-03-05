@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use regex::Regex;
 
-use crate::error::AppResult;
+use crate::core::error::AppResult;
 
 const PATCH_MARKER: &str = "/* TSVC_TUI_FUNCTION_FILTER_PATCH */";
 const HELPER_SNIPPET: &str = r#"/* TSVC_TUI_FUNCTION_FILTER_PATCH */

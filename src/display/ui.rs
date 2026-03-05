@@ -8,11 +8,12 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 
 use similar::ChangeTag;
 
-use crate::app::{AppState, ConfigRow, has_vectorizer_ir_changes};
-use crate::model::{
+use crate::core::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession,
 };
-use crate::syntax::{self, StyledChunk, SyntaxLang};
+use crate::display::app::{AppState, ConfigRow};
+use crate::display::syntax::{self, StyledChunk, SyntaxLang};
+use crate::transform::session::has_vectorizer_ir_changes;
 
 const CODE_BG: Color = Color::Rgb(14, 20, 28);
 const CODE_TEXT_FG: Color = Color::Gray;
@@ -88,20 +89,27 @@ fn render_compile_config_page(frame: &mut Frame, app: &AppState) {
         if prev_group != Some(group) {
             let header_text = format!("  --- {} ---", group);
             items.push(
-                ListItem::new(header_text)
-                    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                ListItem::new(header_text).style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ),
             );
             display_to_data.push(None);
             prev_group = Some(group);
         }
         let value = app.config_row_value_text(*row);
-        let row_suffix =
-            if *row == app.config_selected_row_kind() && app.is_config_text_editing() {
-                " [editing]"
-            } else {
-                ""
-            };
-        items.push(ListItem::new(format!("  {:<18} : {}{}", row.title(), value, row_suffix)));
+        let row_suffix = if *row == app.config_selected_row_kind() && app.is_config_text_editing() {
+            " [editing]"
+        } else {
+            ""
+        };
+        items.push(ListItem::new(format!(
+            "  {:<18} : {}{}",
+            row.title(),
+            value,
+            row_suffix
+        )));
         display_to_data.push(Some(i));
     }
 
