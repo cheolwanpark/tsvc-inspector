@@ -408,7 +408,7 @@ pub fn build_source_line_map(
 /// For each IrLine:
 /// - `#dbg_value`/`#dbg_declare`/`#dbg_label` lines are removed entirely
 /// - Trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) is stripped
-/// - When the source line number changes, a separate annotation `IrLine` is inserted
+/// - When the source line/origin or diff tag changes, a separate annotation `IrLine` is inserted
 ///   above the group with `is_source_annotation: true` and text `;; <source>`
 ///
 /// Returns the filtered/annotated IR lines and the corresponding source_line_map.
@@ -426,8 +426,8 @@ pub fn annotate_ir_lines(
 
     let mut out_lines = Vec::with_capacity(ir_lines.len());
     let mut out_map = Vec::with_capacity(ir_lines.len());
-    // Track (line_number, inlined_from) to dedup — same line from different functions stays separate
-    let mut prev_src_key: Option<(u32, Option<String>)> = None;
+    // Track (line_number, inlined_from, diff_tag) to dedup adjacent same-origin lines.
+    let mut prev_src_key: Option<(u32, Option<String>, ChangeTag)> = None;
 
     for ir_line in ir_lines {
         // Strip #dbg_* intrinsic lines entirely
@@ -449,9 +449,9 @@ pub fn annotate_ir_lines(
         });
         let src_line_no = dbg_loc.map(|loc| loc.line);
 
-        // Insert source annotation header when source line or origin changes
+        // Insert source annotation header when source line, origin, or diff tag changes
         if let Some(loc) = dbg_loc {
-            let current_key = (loc.line, loc.inlined_from.clone());
+            let current_key = (loc.line, loc.inlined_from.clone(), ir_line.tag);
             let changed = prev_src_key.as_ref() != Some(&current_key);
             if changed {
                 // Try to resolve the source text for the annotation
@@ -465,7 +465,7 @@ pub fn annotate_ir_lines(
                         None => format!(";; {src}"),
                     };
                     out_lines.push(IrLine {
-                        tag: ChangeTag::Equal,
+                        tag: ir_line.tag,
                         text: annotation,
                         is_source_annotation: true,
                     });
@@ -1429,7 +1429,7 @@ define void @foo() !dbg !5 {
         assert_eq!(annotated.len(), 2);
         assert!(annotated[0].is_source_annotation);
         assert_eq!(annotated[0].text, ";; a[i] = c[i] + d[i] * e[i];");
-        assert_eq!(annotated[0].tag, ChangeTag::Equal);
+        assert_eq!(annotated[0].tag, ChangeTag::Insert);
         assert_eq!(
             annotated[1].text,
             "  store double %40, ptr %43, align 8"
@@ -1566,8 +1566,8 @@ define void @foo() !dbg !5 {
     }
 
     #[test]
-    fn annotate_ir_lines_mixed_tags_annotation_always_equal() {
-        // Insert/Delete lines → annotation is always Equal
+    fn annotate_ir_lines_mixed_tags_annotation_follows_ir_tags() {
+        // Insert/Delete lines on same source create per-tag annotation headers
         let ir_lines = vec![
             IrLine { tag: ChangeTag::Delete, text: String::from("  %old = add i32 1, 2, !dbg !10"), is_source_annotation: false },
             IrLine { tag: ChangeTag::Insert, text: String::from("  %new = add i32 3, 4, !dbg !10"), is_source_annotation: false },
@@ -1576,11 +1576,13 @@ define void @foo() !dbg !5 {
         dbg.insert(10, DbgLocation { line: 1, inlined_from: None });
         let src = vec!["x = a + b;"];
         let (out, _) = annotate_ir_lines(ir_lines, &dbg, None, &src);
-        assert_eq!(out.len(), 3); // annotation + delete + insert
+        assert_eq!(out.len(), 4); // ann(delete) + delete + ann(insert) + insert
         assert!(out[0].is_source_annotation);
-        assert_eq!(out[0].tag, ChangeTag::Equal);
+        assert_eq!(out[0].tag, ChangeTag::Delete);
         assert_eq!(out[1].tag, ChangeTag::Delete);
+        assert!(out[2].is_source_annotation);
         assert_eq!(out[2].tag, ChangeTag::Insert);
+        assert_eq!(out[3].tag, ChangeTag::Insert);
     }
 
     #[test]

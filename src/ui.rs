@@ -593,9 +593,14 @@ fn render_ir_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout
         .enumerate()
         .map(|(idx, ir_line)| {
             if ir_line.is_source_annotation {
+                let annotation_bg = match ir_line.tag {
+                    ChangeTag::Insert => IR_INSERT_BG,
+                    ChangeTag::Delete => IR_DELETE_BG,
+                    ChangeTag::Equal => CODE_BG,
+                };
                 let style = Style::default()
                     .fg(SOURCE_ANNOTATION_FG)
-                    .bg(CODE_BG)
+                    .bg(annotation_bg)
                     .add_modifier(Modifier::ITALIC);
                 return Line::from(Span::styled(format!("  {}", ir_line.text), style));
             }

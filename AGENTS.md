@@ -54,12 +54,13 @@
   - Inserted lines: `+ ` prefix with syntax-highlighted text over a dark green background (`IR_INSERT_BG`).
   - Deleted lines: `- ` prefix with syntax-highlighted text over a dark red background (`IR_DELETE_BG`).
   - Unchanged lines: `  ` prefix with syntax-highlighted text over a dark code background (`CODE_BG`).
-  - Source annotations: `;; <source line>` (or `;; [fn_name] <source line>` for inlined code) in italic amber (`SOURCE_ANNOTATION_FG`), no diff prefix.
+  - Source annotations: `;; <source line>` (or `;; [fn_name] <source line>` for inlined code) in italic amber (`SOURCE_ANNOTATION_FG`), no diff prefix, with background following the annotation line's diff tag (`IR_INSERT_BG`/`IR_DELETE_BG`/`CODE_BG`).
 - IR data is stored as `Vec<IrLine>` (with `similar::ChangeTag` and `is_source_annotation` flag) per `AnalysisStep`.
 - Source annotation interleaving (`annotate_ir_lines` in `parser.rs`):
   - Strips `#dbg_declare`/`#dbg_value`/`#dbg_label` intrinsic lines entirely.
   - Strips trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) from all IR lines.
-  - Inserts `;; <source text>` annotation headers when the source line or inlined-from origin changes, using the actual source file content; inlined code is prefixed with the callee function name (`[fn_name]`).
+  - Inserts `;; <source text>` annotation headers when the source line, inlined-from origin, or diff tag changes, using the actual source file content; inlined code is prefixed with the callee function name (`[fn_name]`).
+  - Annotation headers keep the originating IR line's `ChangeTag` (`Equal`/`Insert`/`Delete`) so visual diff categorization stays consistent.
   - Deleted diff lines resolve `!dbg` references against the previous snapshot's debug metadata to ensure correct source annotations across IR changes.
   - Source file is resolved from `!DISubprogram`/`!DIFile` debug metadata in the build trace (`find_function_source_file` in `runner.rs`).
 - LLVM IR syntax highlighting is provided by `tree-sitter-highlight` + `tree-sitter-llvm`, and diff backgrounds remain visible via style patching.
