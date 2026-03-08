@@ -8,6 +8,50 @@ pub struct IrLine {
     pub tag: ChangeTag,
     pub text: String,
     pub is_source_annotation: bool,
+    pub details: IrLineDetails,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IrAttributeScope {
+    Function,
+    Return,
+    Parameter,
+    Call,
+    CallReturn,
+    CallArgument,
+    Unknown,
+}
+
+impl IrAttributeScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Function => "Function",
+            Self::Return => "Return",
+            Self::Parameter => "Parameter",
+            Self::Call => "Call",
+            Self::CallReturn => "Call Return",
+            Self::CallArgument => "Call Arg",
+            Self::Unknown => "Other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IrAttributeOrigin {
+    Inline,
+    GroupRef(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IrAttribute {
+    pub scope: IrAttributeScope,
+    pub text: String,
+    pub origin: IrAttributeOrigin,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IrLineDetails {
+    pub attributes: Vec<IrAttribute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

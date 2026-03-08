@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use similar::ChangeTag;
 
 use crate::core::model::{
-    AnalysisStage, AnalysisState, AnalysisStep, AppPage, RemarkEntry, RemarkKind, RunSession,
+    AnalysisStage, AnalysisState, AnalysisStep, AppPage, IrAttribute, IrAttributeOrigin,
+    RemarkEntry, RemarkKind, RunSession,
 };
 use crate::display::app::{AppState, CodeViewMode, ConfigModalFocus, ConfigRow};
 use crate::display::syntax::{self, StyledChunk, SyntaxLang};
@@ -20,9 +21,13 @@ const CODE_TEXT_FG: Color = Color::Gray;
 const SOURCE_LINE_HIGHLIGHT_BG: Color = Color::Rgb(44, 52, 64);
 const IR_INSERT_BG: Color = Color::Rgb(19, 70, 35);
 const IR_DELETE_BG: Color = Color::Rgb(90, 28, 28);
+const IR_SELECTED_BG: Color = Color::Rgb(44, 58, 82);
+const IR_INSERT_SELECTED_BG: Color = Color::Rgb(28, 92, 48);
+const IR_DELETE_SELECTED_BG: Color = Color::Rgb(118, 42, 42);
 const SOURCE_ANNOTATION_FG: Color = Color::Rgb(200, 160, 80);
+const DETAIL_ATTR_BAR_HEIGHT: u16 = 7;
 
-pub fn render(frame: &mut Frame, app: &AppState) {
+pub fn render(frame: &mut Frame, app: &mut AppState) {
     match app.page {
         AppPage::BenchmarkList => render_benchmark_list_page(frame, app),
         AppPage::BenchmarkDetail => render_benchmark_detail_page(frame, app),
@@ -238,7 +243,7 @@ fn config_help_lines(app: &AppState, row: ConfigRow) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
+fn render_benchmark_detail_page(frame: &mut Frame, app: &mut AppState) {
     let area = frame.area();
     if area.width < 100 || area.height < 30 {
         frame.render_widget(
@@ -259,11 +264,18 @@ fn render_benchmark_detail_page(frame: &mut Frame, app: &AppState) {
     let [header_area, main_area, footer_area] = vertical.areas(area);
     render_detail_header(frame, app, header_area);
 
-    let cols = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]);
-    let [selector_area, code_area] = cols.areas(main_area);
+    let cols = Layout::horizontal([Constraint::Percentage(23), Constraint::Percentage(77)]);
+    let [selector_area, right_area] = cols.areas(main_area);
+    let right_rows = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(DETAIL_ATTR_BAR_HEIGHT),
+    ]);
+    let [code_area, attr_area] = right_rows.areas(right_area);
+    app.set_detail_code_viewport_lines(code_area.height.saturating_sub(2));
 
     render_pass_selector_panel(frame, app, selector_area);
     render_code_view_panel(frame, app, code_area);
+    render_line_attributes_bar(frame, app, attr_area);
     render_detail_footer(frame, app, footer_area);
 }
 
@@ -414,6 +426,144 @@ fn render_code_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layo
     }
 }
 
+fn render_line_attributes_bar(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+    let text = Text::from(line_attribute_lines(app));
+    let widget = Paragraph::new(text)
+        .block(Block::bordered().title("Line Attributes"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(widget, area);
+}
+
+fn line_attribute_lines(app: &AppState) -> Vec<Line<'static>> {
+    if app.code_view_mode == CodeViewMode::CSource {
+        return vec![
+            Line::from("IR line inspector is available in IR Diff and IR modes."),
+            Line::from("Switch code view mode to inspect LLVM attributes per line."),
+        ];
+    }
+
+    let Some(session) = app.active_session_for_selected_benchmark() else {
+        return vec![Line::from("Run analysis to inspect LLVM attributes.")];
+    };
+    let Some(step) = app.selected_step_in_stage(session) else {
+        return vec![Line::from("Select a pass to inspect LLVM attributes.")];
+    };
+    let Some(selected_line) = app.selected_ir_line_for_selected_step() else {
+        return vec![Line::from("No IR line selected.")];
+    };
+
+    let diff_label = match selected_line.tag {
+        ChangeTag::Insert => "inserted",
+        ChangeTag::Delete => "deleted",
+        ChangeTag::Equal => "unchanged",
+    };
+    let mut lines = vec![Line::from(format!(
+        "Line {} · {} · {} · {} attr(s)",
+        app.selected_ir_visible_index() + 1,
+        app.code_view_mode.label(),
+        diff_label,
+        selected_line.details.attributes.len(),
+    ))];
+
+    if selected_line.is_source_annotation {
+        lines.push(Line::from(
+            "This is a source annotation line, not an LLVM IR instruction.",
+        ));
+        lines.push(Line::from(
+            "Move to a nearby IR line to inspect inline or group attributes.",
+        ));
+        return lines;
+    }
+
+    if selected_line.details.attributes.is_empty() {
+        lines.push(Line::from(
+            "No LLVM attributes were detected on the selected line.",
+        ));
+        lines.push(Line::from(format!(
+            "Pass: {}",
+            pass_display_name(&step.pass_key)
+        )));
+        return lines;
+    }
+
+    let ordered_scopes = [
+        crate::core::model::IrAttributeScope::Function,
+        crate::core::model::IrAttributeScope::Return,
+        crate::core::model::IrAttributeScope::Parameter,
+        crate::core::model::IrAttributeScope::Call,
+        crate::core::model::IrAttributeScope::CallReturn,
+        crate::core::model::IrAttributeScope::CallArgument,
+        crate::core::model::IrAttributeScope::Unknown,
+    ];
+
+    for scope in ordered_scopes {
+        let scoped = selected_line
+            .details
+            .attributes
+            .iter()
+            .filter(|attr| attr.scope == scope)
+            .collect::<Vec<_>>();
+        if scoped.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(format!(
+            "{}: {}",
+            scope.label(),
+            format_attribute_scope_items(&scoped)
+        )));
+    }
+
+    lines
+}
+
+fn format_attribute_scope_items(attrs: &[&IrAttribute]) -> String {
+    let mut inline = Vec::new();
+    let mut groups = BTreeMap::<u32, Vec<&str>>::new();
+
+    for attr in attrs {
+        match attr.origin {
+            IrAttributeOrigin::Inline => inline.push(attr.text.as_str()),
+            IrAttributeOrigin::GroupRef(group_id) => {
+                groups.entry(group_id).or_default().push(attr.text.as_str())
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !inline.is_empty() {
+        parts.push(inline.join(", "));
+    }
+    for (group_id, group_attrs) in groups {
+        parts.push(format!("from #{group_id}: {}", group_attrs.join(", ")));
+    }
+    parts.join("; ")
+}
+
+fn selected_ir_style(tag: ChangeTag, selected: bool) -> Style {
+    if !selected {
+        return match tag {
+            ChangeTag::Insert => Style::default().fg(Color::White).bg(IR_INSERT_BG),
+            ChangeTag::Delete => Style::default().fg(Color::White).bg(IR_DELETE_BG),
+            ChangeTag::Equal => Style::default().fg(CODE_TEXT_FG).bg(CODE_BG),
+        };
+    }
+
+    match tag {
+        ChangeTag::Insert => Style::default()
+            .fg(Color::White)
+            .bg(IR_INSERT_SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+        ChangeTag::Delete => Style::default()
+            .fg(Color::White)
+            .bg(IR_DELETE_SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+        ChangeTag::Equal => Style::default()
+            .fg(Color::White)
+            .bg(IR_SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
 fn render_detail_source_panel(
     frame: &mut Frame,
     app: &AppState,
@@ -536,6 +686,7 @@ fn render_ir_diff_panel(
         return;
     }
 
+    let selected_idx = app.selected_ir_visible_index();
     let ir_text = step
         .ir_lines
         .iter()
@@ -549,8 +700,12 @@ fn render_ir_diff_panel(
         .iter()
         .enumerate()
         .map(|(idx, ir_line)| {
+            let selected = idx == selected_idx;
             if ir_line.is_source_annotation {
                 let annotation_bg = match ir_line.tag {
+                    ChangeTag::Insert if selected => IR_INSERT_SELECTED_BG,
+                    ChangeTag::Delete if selected => IR_DELETE_SELECTED_BG,
+                    ChangeTag::Equal if selected => IR_SELECTED_BG,
                     ChangeTag::Insert => IR_INSERT_BG,
                     ChangeTag::Delete => IR_DELETE_BG,
                     ChangeTag::Equal => CODE_BG,
@@ -558,23 +713,34 @@ fn render_ir_diff_panel(
                 let style = Style::default()
                     .fg(SOURCE_ANNOTATION_FG)
                     .bg(annotation_bg)
-                    .add_modifier(Modifier::ITALIC);
-                return Line::from(Span::styled(format!("  {}", ir_line.text), style));
+                    .add_modifier(if selected {
+                        Modifier::ITALIC | Modifier::BOLD
+                    } else {
+                        Modifier::ITALIC
+                    });
+                let marker = if selected { ">" } else { " " };
+                return Line::from(Span::styled(
+                    format!("{marker}  {:>4} | {}", idx + 1, ir_line.text),
+                    style,
+                ));
             }
 
-            let (prefix, base_style) = match ir_line.tag {
-                ChangeTag::Insert => ("+ ", Style::default().fg(Color::White).bg(IR_INSERT_BG)),
-                ChangeTag::Delete => ("- ", Style::default().fg(Color::White).bg(IR_DELETE_BG)),
-                ChangeTag::Equal => ("  ", Style::default().fg(CODE_TEXT_FG).bg(CODE_BG)),
+            let prefix = match ir_line.tag {
+                ChangeTag::Insert => "+ ",
+                ChangeTag::Delete => "- ",
+                ChangeTag::Equal => "  ",
             };
+            let marker = if selected { ">" } else { " " };
+            let line_style = selected_ir_style(ir_line.tag, selected);
+            let gutter = format!("{marker}{prefix}{:>4} | ", idx + 1);
 
             let highlighted = highlighted_ir.get(idx).map(Vec::as_slice);
             prefixed_highlighted_line(
-                prefix,
-                base_style,
+                &gutter,
+                line_style,
                 highlighted,
                 &ir_line.text,
-                Some(base_style),
+                Some(line_style),
             )
         })
         .collect();
@@ -628,6 +794,7 @@ fn render_ir_post_panel(
         return;
     }
 
+    let selected_idx = app.selected_ir_visible_index();
     let ir_text = filtered_lines
         .iter()
         .map(|ir_line| ir_line.text.as_str())
@@ -639,18 +806,29 @@ fn render_ir_post_panel(
         .iter()
         .enumerate()
         .map(|(idx, ir_line)| {
+            let selected = idx == selected_idx;
             if ir_line.is_source_annotation {
                 let style = Style::default()
                     .fg(SOURCE_ANNOTATION_FG)
-                    .bg(CODE_BG)
-                    .add_modifier(Modifier::ITALIC);
-                return Line::from(Span::styled(format!("  {}", ir_line.text), style));
+                    .bg(if selected { IR_SELECTED_BG } else { CODE_BG })
+                    .add_modifier(if selected {
+                        Modifier::ITALIC | Modifier::BOLD
+                    } else {
+                        Modifier::ITALIC
+                    });
+                let marker = if selected { ">" } else { " " };
+                return Line::from(Span::styled(
+                    format!("{marker}  {:>4} | {}", idx + 1, ir_line.text),
+                    style,
+                ));
             }
 
-            let base_style = Style::default().fg(CODE_TEXT_FG).bg(CODE_BG);
+            let base_style = selected_ir_style(ChangeTag::Equal, selected);
+            let marker = if selected { ">" } else { " " };
+            let gutter = format!("{marker}  {:>4} | ", idx + 1);
             let highlighted = highlighted_ir.get(idx).map(Vec::as_slice);
             prefixed_highlighted_line(
-                "  ",
+                &gutter,
                 base_style,
                 highlighted,
                 &ir_line.text,
@@ -751,7 +929,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} navigate \u{00b7} tab/s-tab mode (code view) \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} c clear";
+    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab mode (code view) \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} c clear";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),

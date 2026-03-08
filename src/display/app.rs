@@ -4,8 +4,8 @@ use ratatui::style::Color;
 
 use crate::core::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
-    CompilerConfig, FunctionRunMode, JobKind, LoopResult, RemarkEntry, RemarksSummary, RunSession,
-    SessionStatus,
+    CompilerConfig, FunctionRunMode, IrLine, JobKind, LoopResult, RemarkEntry, RemarksSummary,
+    RunSession, SessionStatus,
 };
 use crate::transform::session::{
     DetailSnapshotInput, build_detail_snapshot, extract_vf_from_remarks, has_vectorizer_ir_changes,
@@ -237,7 +237,10 @@ pub struct AppState {
     pub detail_focus: DetailFocus,
     pub code_view_mode: CodeViewMode,
     pub ir_scroll: u16,
+    pub ir_diff_selected_line: usize,
+    pub ir_post_selected_line: usize,
     pub source_detail_scroll: u16,
+    pub detail_code_viewport_lines: u16,
     pub function_modal_open: bool,
     pub function_modal_selected_idx: usize,
     pub function_run_mode: FunctionRunMode,
@@ -269,7 +272,10 @@ impl AppState {
             detail_focus: DetailFocus::Selector,
             code_view_mode: CodeViewMode::IrDiff,
             ir_scroll: 0,
+            ir_diff_selected_line: 0,
+            ir_post_selected_line: 0,
             source_detail_scroll: 0,
+            detail_code_viewport_lines: 1,
             function_modal_open: false,
             function_modal_selected_idx: 0,
             function_run_mode,
@@ -664,8 +670,7 @@ impl AppState {
         self.page = AppPage::BenchmarkDetail;
         self.detail_focus = DetailFocus::Selector;
         self.code_view_mode = CodeViewMode::IrDiff;
-        self.ir_scroll = 0;
-        self.source_detail_scroll = 0;
+        self.reset_ir_navigation();
     }
 
     pub fn back_to_benchmark_list(&mut self) {
@@ -747,8 +752,7 @@ impl AppState {
         let key = session_key(&benchmark.name, &function.symbol, &config_id);
 
         if self.sessions_by_key.remove(&key).is_some() {
-            self.ir_scroll = 0;
-            self.source_detail_scroll = 0;
+            self.reset_ir_navigation();
             self.selected_pass_by_stage.clear();
             self.detail_focus = DetailFocus::Selector;
             self.status_message = String::from("Session cleared");
@@ -774,6 +778,174 @@ impl AppState {
             &function.symbol,
             &config.config_id(),
         ))
+    }
+
+    pub fn set_detail_code_viewport_lines(&mut self, lines: u16) {
+        self.detail_code_viewport_lines = lines.max(1);
+        self.normalize_ir_cursor();
+    }
+
+    pub fn selected_ir_visible_index(&self) -> usize {
+        match self.code_view_mode {
+            CodeViewMode::IrDiff => self.ir_diff_selected_line,
+            CodeViewMode::IrPostPass => self.ir_post_selected_line,
+            CodeViewMode::CSource => 0,
+        }
+    }
+
+    pub fn visible_ir_line_count(&self) -> usize {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return 0;
+        };
+        let Some(step) = self.selected_step_in_stage(session) else {
+            return 0;
+        };
+        Self::visible_ir_line_count_for_mode(step, self.code_view_mode)
+    }
+
+    pub fn visible_ir_line_for_selected_step(&self, idx: usize) -> Option<&IrLine> {
+        let session = self.active_session_for_selected_benchmark()?;
+        let step = self.selected_step_in_stage(session)?;
+        Self::visible_ir_line_for_mode(step, self.code_view_mode, idx)
+    }
+
+    pub fn selected_ir_line_for_selected_step(&self) -> Option<&IrLine> {
+        self.visible_ir_line_for_selected_step(self.selected_ir_visible_index())
+    }
+
+    fn visible_ir_line_count_for_mode(step: &AnalysisStep, mode: CodeViewMode) -> usize {
+        match mode {
+            CodeViewMode::IrDiff => step.ir_lines.len(),
+            CodeViewMode::IrPostPass => step
+                .ir_lines
+                .iter()
+                .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
+                .count(),
+            CodeViewMode::CSource => 0,
+        }
+    }
+
+    fn visible_ir_line_for_mode(
+        step: &AnalysisStep,
+        mode: CodeViewMode,
+        idx: usize,
+    ) -> Option<&IrLine> {
+        match mode {
+            CodeViewMode::IrDiff => step.ir_lines.get(idx),
+            CodeViewMode::IrPostPass => step
+                .ir_lines
+                .iter()
+                .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
+                .nth(idx),
+            CodeViewMode::CSource => None,
+        }
+    }
+
+    fn first_selectable_ir_index_for_mode(&self, mode: CodeViewMode) -> usize {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return 0;
+        };
+        let Some(step) = self.selected_step_in_stage(session) else {
+            return 0;
+        };
+        match mode {
+            CodeViewMode::IrDiff => step
+                .ir_lines
+                .iter()
+                .position(|line| !line.is_source_annotation)
+                .unwrap_or(0),
+            CodeViewMode::IrPostPass => step
+                .ir_lines
+                .iter()
+                .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
+                .position(|line| !line.is_source_annotation)
+                .unwrap_or(0),
+            CodeViewMode::CSource => 0,
+        }
+    }
+
+    fn reset_ir_navigation(&mut self) {
+        self.ir_scroll = 0;
+        self.source_detail_scroll = 0;
+        self.ir_diff_selected_line = self.first_selectable_ir_index_for_mode(CodeViewMode::IrDiff);
+        self.ir_post_selected_line =
+            self.first_selectable_ir_index_for_mode(CodeViewMode::IrPostPass);
+        self.normalize_ir_cursor();
+    }
+
+    fn normalize_ir_cursor(&mut self) {
+        if self.code_view_mode == CodeViewMode::CSource {
+            return;
+        }
+
+        let line_count = self.visible_ir_line_count();
+        if line_count == 0 {
+            self.ir_scroll = 0;
+            match self.code_view_mode {
+                CodeViewMode::IrDiff => self.ir_diff_selected_line = 0,
+                CodeViewMode::IrPostPass => self.ir_post_selected_line = 0,
+                CodeViewMode::CSource => {}
+            }
+            return;
+        }
+
+        let max_idx = line_count - 1;
+        match self.code_view_mode {
+            CodeViewMode::IrDiff => {
+                self.ir_diff_selected_line = self.ir_diff_selected_line.min(max_idx)
+            }
+            CodeViewMode::IrPostPass => {
+                self.ir_post_selected_line = self.ir_post_selected_line.min(max_idx)
+            }
+            CodeViewMode::CSource => {}
+        }
+        self.ir_scroll = self.ir_scroll.min(max_idx.min(u16::MAX as usize) as u16);
+        self.ensure_selected_ir_line_visible();
+    }
+
+    fn ensure_selected_ir_line_visible(&mut self) {
+        if self.code_view_mode == CodeViewMode::CSource {
+            return;
+        }
+
+        let selected = self.selected_ir_visible_index();
+        let viewport = self.detail_code_viewport_lines.max(1) as usize;
+        let scroll = self.ir_scroll as usize;
+        if selected < scroll {
+            self.ir_scroll = selected.min(u16::MAX as usize) as u16;
+            return;
+        }
+        if selected >= scroll.saturating_add(viewport) {
+            let target = selected + 1 - viewport;
+            self.ir_scroll = target.min(u16::MAX as usize) as u16;
+        }
+    }
+
+    fn move_ir_cursor_up(&mut self) {
+        match self.code_view_mode {
+            CodeViewMode::IrDiff => {
+                self.ir_diff_selected_line = self.ir_diff_selected_line.saturating_sub(1)
+            }
+            CodeViewMode::IrPostPass => {
+                self.ir_post_selected_line = self.ir_post_selected_line.saturating_sub(1)
+            }
+            CodeViewMode::CSource => return,
+        }
+        self.ensure_selected_ir_line_visible();
+    }
+
+    fn move_ir_cursor_down(&mut self) {
+        let max_idx = self.visible_ir_line_count().saturating_sub(1);
+        match self.code_view_mode {
+            CodeViewMode::IrDiff => {
+                self.ir_diff_selected_line = (self.ir_diff_selected_line + 1).min(max_idx)
+            }
+            CodeViewMode::IrPostPass => {
+                self.ir_post_selected_line = (self.ir_post_selected_line + 1).min(max_idx)
+            }
+            CodeViewMode::CSource => return,
+        }
+        self.ensure_selected_ir_line_visible();
     }
 
     // --- Stage/Pass navigation ---
@@ -866,14 +1038,12 @@ impl AppState {
 
     pub fn rotate_code_view_mode_next(&mut self) {
         self.code_view_mode = self.code_view_mode.cycle_next();
-        self.ir_scroll = 0;
-        self.source_detail_scroll = 0;
+        self.reset_ir_navigation();
     }
 
     pub fn rotate_code_view_mode_prev(&mut self) {
         self.code_view_mode = self.code_view_mode.cycle_prev();
-        self.ir_scroll = 0;
-        self.source_detail_scroll = 0;
+        self.reset_ir_navigation();
     }
 
     pub fn select_prev_pass(&mut self) {
@@ -889,7 +1059,7 @@ impl AppState {
         let (stage, pass_idx) = ordered[target];
         self.selected_stage = stage;
         self.selected_pass_by_stage.insert(stage, pass_idx);
-        self.ir_scroll = 0;
+        self.reset_ir_navigation();
     }
 
     pub fn select_next_pass(&mut self) {
@@ -905,7 +1075,7 @@ impl AppState {
         let (stage, pass_idx) = ordered[target];
         self.selected_stage = stage;
         self.selected_pass_by_stage.insert(stage, pass_idx);
-        self.ir_scroll = 0;
+        self.reset_ir_navigation();
     }
 
     pub fn detail_move_up(&mut self) {
@@ -915,7 +1085,7 @@ impl AppState {
                 if self.code_view_mode == CodeViewMode::CSource {
                     self.scroll_source_detail_up();
                 } else {
-                    self.scroll_ir_up();
+                    self.move_ir_cursor_up();
                 }
             }
         }
@@ -928,7 +1098,7 @@ impl AppState {
                 if self.code_view_mode == CodeViewMode::CSource {
                     self.scroll_source_detail_down();
                 } else {
-                    self.scroll_ir_down();
+                    self.move_ir_cursor_down();
                 }
             }
         }
@@ -963,34 +1133,6 @@ impl AppState {
             passes_len: passes.len(),
             source_text: &source_text,
         }))
-    }
-
-    fn scroll_ir_up(&mut self) {
-        self.ir_scroll = self.ir_scroll.saturating_sub(1);
-    }
-
-    fn scroll_ir_down(&mut self) {
-        let max_scroll = self.max_ir_scroll();
-        self.ir_scroll = self.ir_scroll.saturating_add(1).min(max_scroll);
-    }
-
-    fn max_ir_scroll(&self) -> u16 {
-        let Some(session) = self.active_session_for_selected_benchmark() else {
-            return 0;
-        };
-        let Some(step) = self.selected_step_in_stage(session) else {
-            return 0;
-        };
-        let visible_len = if self.code_view_mode == CodeViewMode::IrPostPass {
-            step.ir_lines
-                .iter()
-                .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
-                .count()
-        } else {
-            step.ir_lines.len()
-        };
-        let max = visible_len.saturating_sub(1);
-        max.min(u16::MAX as usize) as u16
     }
 
     fn scroll_source_detail_up(&mut self) {
@@ -1145,7 +1287,7 @@ impl AppState {
         };
         self.sessions_by_key.insert(key, session);
 
-        self.ir_scroll = 0;
+        self.reset_ir_navigation();
         self.status_message = format!(
             "{kind} started for {benchmark} [{}] ({})",
             selected_function.loop_id, compiler_config
@@ -1241,6 +1383,7 @@ impl AppState {
                                 session.remarks = remarks;
                                 session.remarks_summary = remarks_summary;
                                 session.analysis_state = AnalysisState::Ready;
+                                self.reset_ir_navigation();
                                 self.status_message = format!(
                                     "Analysis ready: {} [{}]",
                                     benchmark, selected_function.loop_id
@@ -1551,21 +1694,25 @@ int s161(void) {
                 tag: ChangeTag::Equal,
                 text: String::from("x"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("old"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("new"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("y"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
         ];
         step.source_line_map = vec![None; step.ir_lines.len()];
@@ -1616,36 +1763,43 @@ int s161(void) {
                 tag: ChangeTag::Equal,
                 text: String::from("l1"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("old1"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("new1"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("l2"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Delete,
                 text: String::from("old2"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Insert,
                 text: String::from("new2"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
             IrLine {
                 tag: ChangeTag::Equal,
                 text: String::from("l3"),
                 is_source_annotation: false,
+                details: Default::default(),
             },
         ];
         step.source_line_map = vec![None; step.ir_lines.len()];
@@ -1977,5 +2131,68 @@ int s161(void) {
         assert_eq!(app.selected_stage, AnalysisStage::Loop);
         app.select_next_pass();
         assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
+    }
+
+    #[test]
+    fn code_view_moves_ir_cursor_and_scrolls_with_viewport() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
+        step.ir_lines = (0..5)
+            .map(|idx| IrLine {
+                tag: ChangeTag::Equal,
+                text: format!("line {idx}"),
+                is_source_annotation: false,
+                details: Default::default(),
+            })
+            .collect();
+        step.source_line_map = vec![None; step.ir_lines.len()];
+        attach_ready_session(&mut app, step, vec![]);
+
+        app.detail_focus = DetailFocus::CodeView;
+        app.code_view_mode = CodeViewMode::IrDiff;
+        app.set_detail_code_viewport_lines(2);
+
+        app.detail_move_down();
+        assert_eq!(app.selected_ir_visible_index(), 1);
+        assert_eq!(app.ir_scroll, 0);
+
+        app.detail_move_down();
+        assert_eq!(app.selected_ir_visible_index(), 2);
+        assert_eq!(app.ir_scroll, 1);
+
+        app.detail_move_down();
+        assert_eq!(app.selected_ir_visible_index(), 3);
+        assert_eq!(app.ir_scroll, 2);
+    }
+
+    #[test]
+    fn c_source_mode_keeps_existing_scroll_behavior() {
+        let source = r#"
+int s161(void) {
+    int a = 0;
+    a += 1;
+    a += 2;
+    return a;
+}
+"#;
+        let mut app = AppState::new_with_run_mode(
+            vec![benchmark_with_source("A", source)],
+            FunctionRunMode::OutputFilter,
+        );
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+        app.detail_focus = DetailFocus::CodeView;
+        app.code_view_mode = CodeViewMode::CSource;
+
+        app.detail_move_down();
+        app.detail_move_down();
+
+        assert_eq!(app.source_detail_scroll, 2);
+        assert_eq!(app.ir_diff_selected_line, 0);
+        assert_eq!(app.ir_post_selected_line, 0);
     }
 }

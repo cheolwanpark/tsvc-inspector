@@ -5,11 +5,13 @@ use regex::Regex;
 use similar::{ChangeTag, TextDiff};
 
 use crate::core::model::{
-    AnalysisSource, AnalysisStage, AnalysisStep, DbgLocation, IrLine, RemarkEntry,
+    AnalysisSource, AnalysisStage, AnalysisStep, DbgLocation, IrAttribute, IrAttributeOrigin,
+    IrAttributeScope, IrLine, IrLineDetails, RemarkEntry,
 };
 use crate::data::parser::{normalize_pass_key, parse_dbg_locations, parse_ir_snapshots_from_trace};
 
 const MAX_DIFF_LINES: usize = 8000;
+type AttributeGroupMap = HashMap<u32, Vec<String>>;
 
 pub fn build_fast_analysis_steps(
     build_trace: &str,
@@ -77,6 +79,7 @@ pub fn annotate_ir_lines(
                         tag: ir_line.tag,
                         text: annotation,
                         is_source_annotation: true,
+                        details: IrLineDetails::default(),
                     });
                     out_map.push(Some(loc.line));
                 }
@@ -92,10 +95,456 @@ pub fn annotate_ir_lines(
             tag: ir_line.tag,
             text: stripped.to_string(),
             is_source_annotation: false,
+            details: IrLineDetails::default(),
         });
     }
 
     (out_lines, out_map)
+}
+
+fn attach_line_attributes(
+    ir_lines: &mut [IrLine],
+    current_groups: &AttributeGroupMap,
+    previous_groups: Option<&AttributeGroupMap>,
+) {
+    for ir_line in ir_lines {
+        if ir_line.is_source_annotation {
+            continue;
+        }
+        let groups = if ir_line.tag == ChangeTag::Delete {
+            previous_groups.unwrap_or(current_groups)
+        } else {
+            current_groups
+        };
+        ir_line.details.attributes = parse_line_attributes(&ir_line.text, groups);
+    }
+}
+
+fn parse_attribute_groups(snapshot: &str) -> AttributeGroupMap {
+    static ATTR_GROUP_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"^\s*attributes #(\d+)\s*=\s*\{(.*)\}\s*$"#)
+            .expect("valid attribute group regex")
+    });
+
+    let mut groups = HashMap::new();
+    for line in snapshot.lines() {
+        let Some(caps) = ATTR_GROUP_RE.captures(line) else {
+            continue;
+        };
+        let Some(id) = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) else {
+            continue;
+        };
+        let body = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        groups.insert(id, split_attribute_tokens(body));
+    }
+    groups
+}
+
+fn parse_line_attributes(line: &str, groups: &AttributeGroupMap) -> Vec<IrAttribute> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed == "{" || trimmed == "}" || trimmed.ends_with(':') {
+        return Vec::new();
+    }
+
+    if trimmed.starts_with("define ") || trimmed.starts_with("declare ") {
+        return parse_function_line_attributes(trimmed, groups);
+    }
+    if find_call_keyword(trimmed).is_some() {
+        return parse_call_line_attributes(trimmed, groups);
+    }
+
+    Vec::new()
+}
+
+fn parse_function_line_attributes(line: &str, groups: &AttributeGroupMap) -> Vec<IrAttribute> {
+    let mut attrs = Vec::new();
+    let Some(at_idx) = line.find('@') else {
+        return attrs;
+    };
+    let Some(param_start_rel) = line[at_idx..].find('(') else {
+        return attrs;
+    };
+    let param_start = at_idx + param_start_rel;
+    let Some(param_end) = find_matching_delimiter(line, param_start, '(', ')') else {
+        return attrs;
+    };
+
+    parse_zone_attributes(
+        &line[..at_idx],
+        IrAttributeScope::Return,
+        groups,
+        &mut attrs,
+    );
+
+    let params = &line[(param_start + 1)..param_end];
+    for segment in split_top_level_commas(params) {
+        parse_zone_attributes(segment, IrAttributeScope::Parameter, groups, &mut attrs);
+    }
+
+    let tail = truncate_attribute_tail(&line[(param_end + 1)..]);
+    parse_zone_attributes(tail, IrAttributeScope::Function, groups, &mut attrs);
+    attrs
+}
+
+fn parse_call_line_attributes(line: &str, groups: &AttributeGroupMap) -> Vec<IrAttribute> {
+    let mut attrs = Vec::new();
+    let Some((call_idx, keyword_len)) = find_call_keyword(line) else {
+        return attrs;
+    };
+    let after_call = &line[(call_idx + keyword_len)..];
+    let Some(args_start_rel) = after_call.find('(') else {
+        return attrs;
+    };
+    let args_start = call_idx + keyword_len + args_start_rel;
+    let Some(args_end) = find_matching_delimiter(line, args_start, '(', ')') else {
+        return attrs;
+    };
+
+    parse_zone_attributes(
+        &line[(call_idx + keyword_len)..args_start],
+        IrAttributeScope::CallReturn,
+        groups,
+        &mut attrs,
+    );
+
+    let args = &line[(args_start + 1)..args_end];
+    for segment in split_top_level_commas(args) {
+        parse_zone_attributes(segment, IrAttributeScope::CallArgument, groups, &mut attrs);
+    }
+
+    let tail = truncate_attribute_tail(&line[(args_end + 1)..]);
+    parse_zone_attributes(tail, IrAttributeScope::Call, groups, &mut attrs);
+    attrs
+}
+
+fn parse_zone_attributes(
+    text: &str,
+    scope: IrAttributeScope,
+    groups: &AttributeGroupMap,
+    attrs: &mut Vec<IrAttribute>,
+) {
+    for token in split_attribute_tokens(text) {
+        let token = trim_attribute_token(&token);
+        if token.is_empty() || !looks_like_attribute_token(&token) {
+            continue;
+        }
+
+        if let Some(group_id) = parse_group_ref(&token) {
+            if let Some(group_attrs) = groups.get(&group_id) {
+                for group_attr in group_attrs {
+                    let group_attr = trim_attribute_token(group_attr);
+                    if !group_attr.is_empty() && looks_like_attribute_token(&group_attr) {
+                        push_attribute(
+                            attrs,
+                            scope,
+                            group_attr,
+                            IrAttributeOrigin::GroupRef(group_id),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        push_attribute(attrs, scope, token, IrAttributeOrigin::Inline);
+    }
+}
+
+fn push_attribute(
+    attrs: &mut Vec<IrAttribute>,
+    scope: IrAttributeScope,
+    text: String,
+    origin: IrAttributeOrigin,
+) {
+    let candidate = IrAttribute {
+        scope,
+        text,
+        origin,
+    };
+    if !attrs.iter().any(|existing| existing == &candidate) {
+        attrs.push(candidate);
+    }
+}
+
+fn find_call_keyword(line: &str) -> Option<(usize, usize)> {
+    static CALL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(call|invoke)\b").expect("valid call regex"));
+    let caps = CALL_RE.captures(line)?;
+    let m = caps.get(1)?;
+    Some((m.start(), m.as_str().len()))
+}
+
+fn parse_group_ref(token: &str) -> Option<u32> {
+    token
+        .strip_prefix('#')
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
+        .and_then(|rest| rest.parse::<u32>().ok())
+}
+
+fn trim_attribute_token(token: &str) -> String {
+    token
+        .trim()
+        .trim_matches(|ch: char| ch == ',')
+        .trim_matches(|ch: char| ch == ';')
+        .to_string()
+}
+
+fn truncate_attribute_tail(text: &str) -> &str {
+    let mut in_string = false;
+    let mut paren_depth = 0i32;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '"' => in_string = !in_string,
+            '(' if !in_string => paren_depth += 1,
+            ')' if !in_string => paren_depth -= 1,
+            '{' | ';' | '[' if !in_string && paren_depth == 0 => return &text[..idx],
+            _ => {}
+        }
+    }
+    text
+}
+
+fn split_attribute_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut paren_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut angle_depth = 0i32;
+
+    for ch in text.chars() {
+        match ch {
+            '"' => {
+                in_string = !in_string;
+                current.push(ch);
+            }
+            '(' if !in_string => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_string => {
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            '{' if !in_string => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' if !in_string => {
+                brace_depth -= 1;
+                current.push(ch);
+            }
+            '[' if !in_string => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' if !in_string => {
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            '<' if !in_string => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' if !in_string && angle_depth > 0 => {
+                angle_depth -= 1;
+                current.push(ch);
+            }
+            ch if ch.is_whitespace()
+                && !in_string
+                && paren_depth == 0
+                && brace_depth == 0
+                && bracket_depth == 0
+                && angle_depth == 0 =>
+            {
+                if !current.trim().is_empty() {
+                    tokens.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.trim().is_empty() {
+        tokens.push(current.trim().to_string());
+    }
+    tokens
+}
+
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut paren_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut angle_depth = 0i32;
+
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '"' => in_string = !in_string,
+            '(' if !in_string => paren_depth += 1,
+            ')' if !in_string => paren_depth -= 1,
+            '{' if !in_string => brace_depth += 1,
+            '}' if !in_string => brace_depth -= 1,
+            '[' if !in_string => bracket_depth += 1,
+            ']' if !in_string => bracket_depth -= 1,
+            '<' if !in_string => angle_depth += 1,
+            '>' if !in_string && angle_depth > 0 => angle_depth -= 1,
+            ',' if !in_string
+                && paren_depth == 0
+                && brace_depth == 0
+                && bracket_depth == 0
+                && angle_depth == 0 =>
+            {
+                segments.push(text[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start <= text.len() {
+        segments.push(text[start..].trim());
+    }
+    segments
+}
+
+fn find_matching_delimiter(text: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+
+    for (idx, ch) in text.char_indices().skip_while(|(idx, _)| *idx < start) {
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_attribute_token(token: &str) -> bool {
+    if token.is_empty()
+        || token == "..."
+        || token.starts_with('@')
+        || token.starts_with('%')
+        || token.starts_with('!')
+        || token == "="
+        || token.ends_with(':')
+        || is_non_attribute_keyword(token)
+        || is_type_token(token)
+    {
+        return false;
+    }
+
+    if token.starts_with('"') {
+        return true;
+    }
+    if token.starts_with('#') {
+        return parse_group_ref(token).is_some();
+    }
+    if token.contains('=') || token.contains('(') {
+        return true;
+    }
+
+    token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic())
+}
+
+fn is_non_attribute_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "define"
+            | "declare"
+            | "call"
+            | "invoke"
+            | "tail"
+            | "musttail"
+            | "notail"
+            | "fastcc"
+            | "coldcc"
+            | "ccc"
+            | "swiftcc"
+            | "preserve_mostcc"
+            | "preserve_allcc"
+            | "x86_stdcallcc"
+            | "x86_fastcallcc"
+            | "x86_thiscallcc"
+            | "spir_func"
+            | "spir_kernel"
+            | "dso_local"
+            | "dso_preemptable"
+            | "private"
+            | "internal"
+            | "available_externally"
+            | "linkonce"
+            | "weak"
+            | "common"
+            | "appending"
+            | "extern_weak"
+            | "linkonce_odr"
+            | "weak_odr"
+            | "external"
+            | "unnamed_addr"
+            | "local_unnamed_addr"
+            | "addrspace"
+            | "constant"
+            | "global"
+            | "alias"
+            | "ifunc"
+            | "to"
+            | "within"
+            | "blockaddress"
+            | "asm"
+            | "entry"
+    )
+}
+
+fn is_type_token(token: &str) -> bool {
+    if token.ends_with('*')
+        || token.starts_with("ptr")
+        || token
+            .strip_prefix('i')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
+        || matches!(
+            token,
+            "void"
+                | "half"
+                | "bfloat"
+                | "float"
+                | "double"
+                | "fp128"
+                | "x86_fp80"
+                | "ppc_fp128"
+                | "label"
+                | "token"
+                | "metadata"
+                | "x86_amx"
+        )
+        || token.starts_with('{')
+        || token.starts_with('[')
+        || token.starts_with('<')
+    {
+        return true;
+    }
+
+    false
 }
 
 fn build_analysis_steps_from_snapshots(
@@ -112,6 +561,7 @@ fn build_analysis_steps_from_snapshots(
     let mut out = Vec::new();
     let mut prev_ir: Option<String> = None;
     let mut prev_dbg_locations: Option<HashMap<u32, DbgLocation>> = None;
+    let mut prev_attribute_groups: Option<AttributeGroupMap> = None;
     let mut prev_raw_index = 0usize;
 
     for snapshot in snapshots {
@@ -126,6 +576,7 @@ fn build_analysis_steps_from_snapshots(
             collect_analysis_remark_indices(&snapshot.pass, target_function.as_deref(), remarks);
 
         let dbg_locations = parse_dbg_locations(&snapshot.snapshot);
+        let attribute_groups = parse_attribute_groups(&snapshot.snapshot);
 
         if prev_ir.is_none() {
             let ir_lines: Vec<IrLine> = function_ir
@@ -134,10 +585,12 @@ fn build_analysis_steps_from_snapshots(
                     tag: ChangeTag::Equal,
                     text: l.to_string(),
                     is_source_annotation: false,
+                    details: IrLineDetails::default(),
                 })
                 .collect();
-            let (ir_lines, source_line_map) =
+            let (mut ir_lines, source_line_map) =
                 annotate_ir_lines(ir_lines, &dbg_locations, None, &src_lines);
+            attach_line_attributes(&mut ir_lines, &attribute_groups, None);
             out.push(AnalysisStep {
                 visible_index: out.len(),
                 raw_index: snapshot.raw_index,
@@ -156,6 +609,7 @@ fn build_analysis_steps_from_snapshots(
             });
             prev_raw_index = snapshot.raw_index;
             prev_dbg_locations = Some(dbg_locations);
+            prev_attribute_groups = Some(attribute_groups);
             prev_ir = Some(function_ir);
             continue;
         }
@@ -179,13 +633,19 @@ fn build_analysis_steps_from_snapshots(
                 tag: change.tag(),
                 text: change.value().trim_end_matches('\n').to_string(),
                 is_source_annotation: false,
+                details: IrLineDetails::default(),
             })
             .collect();
-        let (ir_lines, source_line_map) = annotate_ir_lines(
+        let (mut ir_lines, source_line_map) = annotate_ir_lines(
             ir_lines,
             &dbg_locations,
             prev_dbg_locations.as_ref(),
             &src_lines,
+        );
+        attach_line_attributes(
+            &mut ir_lines,
+            &attribute_groups,
+            prev_attribute_groups.as_ref(),
         );
 
         let mut diff_text = diff
@@ -221,6 +681,7 @@ fn build_analysis_steps_from_snapshots(
 
         prev_raw_index = snapshot.raw_index;
         prev_dbg_locations = Some(dbg_locations);
+        prev_attribute_groups = Some(attribute_groups);
         prev_ir = Some(function_ir);
     }
 
@@ -497,5 +958,106 @@ entry:
         assert_eq!(steps[0].stage, AnalysisStage::Initial);
         assert_eq!(steps[1].stage, AnalysisStage::Vectorize);
         assert!(steps[1].changed_lines > 0);
+    }
+
+    #[test]
+    fn initial_ir_lines_capture_inline_and_group_attributes() {
+        let trace = r#"
+*** IR Dump At Start ***
+define noundef i32 @s161(ptr noalias noundef %p) #0 !dbg !14 {
+entry:
+  %0 = call noundef i32 @foo(ptr nonnull %p) nounwind
+  ret i32 %0, !dbg !10
+}
+attributes #0 = { alwaysinline "no-sse" }
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "s161", scope: !1, file: !1, line: 1)
+"#;
+
+        let steps = build_fast_analysis_steps(trace, "s161", &[], Some("line10\nline11\n"));
+        let define_line = steps[0]
+            .ir_lines
+            .iter()
+            .find(|line| line.text.starts_with("define "))
+            .expect("define line should exist");
+        let call_line = steps[0]
+            .ir_lines
+            .iter()
+            .find(|line| line.text.contains("call"))
+            .expect("call line should exist");
+
+        let define_attrs = define_line
+            .details
+            .attributes
+            .iter()
+            .map(|attr| attr.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(define_attrs.contains(&"noundef"));
+        assert!(define_attrs.contains(&"noalias"));
+        assert!(define_attrs.contains(&"alwaysinline"));
+        assert!(define_attrs.contains(&"\"no-sse\""));
+        assert!(define_line.details.attributes.iter().any(|attr| {
+            attr.text == "alwaysinline" && matches!(attr.origin, IrAttributeOrigin::GroupRef(0))
+        }));
+
+        let call_attrs = call_line
+            .details
+            .attributes
+            .iter()
+            .map(|attr| attr.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(call_attrs.contains(&"noundef"));
+        assert!(call_attrs.contains(&"nonnull"));
+        assert!(call_attrs.contains(&"nounwind"));
+    }
+
+    #[test]
+    fn diff_lines_use_correct_group_table_for_deleted_and_inserted_lines() {
+        let trace = r#"
+*** IR Dump At Start ***
+define i32 @s161() #0 !dbg !14 {
+entry:
+  ret i32 0, !dbg !10
+}
+attributes #0 = { nounwind }
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "s161", scope: !1, file: !1, line: 1)
+*** IR Dump After ForceFunctionAttrsPass on s161 ***
+define i32 @s161() #1 !dbg !14 {
+entry:
+  ret i32 0, !dbg !10
+}
+attributes #1 = { readonly }
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "s161", scope: !1, file: !1, line: 1)
+"#;
+
+        let steps = build_fast_analysis_steps(trace, "s161", &[], Some("line10\nline11\n"));
+        let diff_step = &steps[1];
+        let deleted_define = diff_step
+            .ir_lines
+            .iter()
+            .find(|line| line.tag == ChangeTag::Delete && line.text.starts_with("define "))
+            .expect("deleted define line should exist");
+        let inserted_define = diff_step
+            .ir_lines
+            .iter()
+            .find(|line| line.tag == ChangeTag::Insert && line.text.starts_with("define "))
+            .expect("inserted define line should exist");
+
+        assert!(
+            deleted_define
+                .details
+                .attributes
+                .iter()
+                .any(|attr| attr.text == "nounwind")
+        );
+        assert!(
+            inserted_define
+                .details
+                .attributes
+                .iter()
+                .any(|attr| attr.text == "readonly")
+        );
     }
 }

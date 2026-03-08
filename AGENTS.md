@@ -94,13 +94,15 @@ If logic is about:
 - Left: integrated stage/pass selector
   - stage is shown as non-selectable header
   - only passes are selectable
-- Right: code view (mode rotator)
+- Right: code view + line attribute inspector
   - modes: `IR diff`, `IR`, `C`
   - `Tab` / `Shift-Tab`: rotate mode (when code view is focused)
+  - fixed bottom panel: `Line Attributes`
 - `Left`/`Right`: switch section focus (`Selector` / `Code View`)
 - `Up`/`Down`:
   - Selector focus -> move selected pass (across grouped stages)
-  - Code view focus -> scroll current mode
+  - Code view focus + `IR diff`/`IR` -> move selected IR line cursor and auto-scroll viewport
+  - Code view focus + `C` -> scroll source view
 - `Esc`: return to list
 - Actions:
   - `a`: run analysis
@@ -121,6 +123,9 @@ Minimum terminal size: `100x30`.
 - Source annotations (`;; ...`) are injected with diff-tag-consistent backgrounds.
 - `#dbg_*` intrinsics are removed from displayed IR.
 - Trailing metadata (`!dbg`, `!tbaa`, `!llvm.loop`, etc.) is stripped in transformed IR output.
+- The line inspector is `IR`-only in v1:
+  - it parses inline attributes and resolves `attributes #N = { ... }` group references
+  - it does not attempt `C` line attribute mapping
 
 ## Function-Selective Run Modes
 
