@@ -9,8 +9,8 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use similar::ChangeTag;
 
 use crate::core::model::{
-    AnalysisStage, AnalysisState, AnalysisStep, AppPage, IrAttribute, IrAttributeOrigin,
-    RemarkEntry, RemarkKind, RunSession,
+    AnalysisState, AnalysisStep, AppPage, IrAttribute, IrAttributeOrigin, RemarkEntry, RemarkKind,
+    RunSession,
 };
 use crate::display::app::{AppState, CodeViewMode, ConfigModalFocus, ConfigRow};
 use crate::display::syntax::{self, StyledChunk, SyntaxLang};
@@ -364,13 +364,8 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
 
     let mut items = Vec::new();
     for (stage, count) in stages {
-        let stage_marker = if stage == AnalysisStage::Vectorize {
-            "\u{2605}"
-        } else {
-            " "
-        };
         items.push(
-            ListItem::new(format!("{stage_marker} {}  ({count})", stage.ui_label())).style(
+            ListItem::new(format!("{}  ({count})", stage.ui_label())).style(
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
@@ -380,16 +375,11 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
         let passes = AppState::passes_for_stage(session, stage);
         for (pass_idx, step) in passes.iter().enumerate() {
             let (icon, _msg) = pass_remark_summary(step, &session.remarks);
-            let marker = if step.stage == AnalysisStage::Vectorize {
-                "\u{2605}"
-            } else {
-                " "
-            };
             let text = format!(
-                "  {marker} {}  {} [\u{0394}{}]",
+                "  {}  {} [\u{0394}{}]",
                 pass_display_name(&step.pass_key),
                 icon,
-                step.changed_lines,
+                step.changed_lines
             );
             if stage == selected_stage && pass_idx == selected_pass {
                 selected_display_idx = Some(items.len());

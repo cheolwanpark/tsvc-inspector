@@ -263,7 +263,7 @@ impl AppState {
             config_selected_row: 0,
             config_editing_text: false,
             page: AppPage::BenchmarkList,
-            selected_stage: AnalysisStage::Vectorize,
+            selected_stage: AnalysisStage::Initial,
             selected_pass_by_stage: HashMap::new(),
             job_state: JobState::Idle,
             status_message: String::from("Ready"),
@@ -670,6 +670,7 @@ impl AppState {
         self.page = AppPage::BenchmarkDetail;
         self.detail_focus = DetailFocus::Selector;
         self.code_view_mode = CodeViewMode::IrDiff;
+        self.ensure_valid_pass_selection_for_active_session();
         self.reset_ir_navigation();
     }
 
@@ -1005,6 +1006,33 @@ impl AppState {
         positions
     }
 
+    fn ensure_valid_pass_selection_for_active_session(&mut self) {
+        let Some(positions) = self
+            .active_session_for_selected_benchmark()
+            .map(Self::ordered_pass_positions)
+        else {
+            return;
+        };
+        let Some((first_stage, first_pass_idx)) = positions.first().copied() else {
+            return;
+        };
+
+        let current = (
+            self.selected_stage,
+            self.selected_pass_by_stage
+                .get(&self.selected_stage)
+                .copied()
+                .unwrap_or(0),
+        );
+        if positions.contains(&current) {
+            return;
+        }
+
+        self.selected_stage = first_stage;
+        self.selected_pass_by_stage
+            .insert(first_stage, first_pass_idx);
+    }
+
     fn selected_global_pass_position(&self, session: &RunSession) -> Option<usize> {
         let positions = Self::ordered_pass_positions(session);
         if positions.is_empty() {
@@ -1185,28 +1213,6 @@ impl AppState {
         let max = self.max_source_detail_scroll();
         let target = mid.saturating_sub(5);
         self.source_detail_scroll = (target as u16).min(max);
-    }
-
-    /// After analysis completes, auto-navigate to Vectorize stage.
-    /// Skipped if user has already moved focus to code view.
-    pub fn auto_navigate_to_vectorize(&mut self) {
-        if self.detail_focus != DetailFocus::Selector {
-            return;
-        }
-        let stages = self
-            .active_session_for_selected_benchmark()
-            .map(Self::ordered_stages_with_counts)
-            .unwrap_or_default();
-        if stages.is_empty() {
-            return;
-        }
-        let target_stage = if stages.iter().any(|(s, _)| *s == AnalysisStage::Vectorize) {
-            AnalysisStage::Vectorize
-        } else {
-            stages[0].0
-        };
-        self.selected_stage = target_stage;
-        self.selected_pass_by_stage.insert(target_stage, 0);
     }
 
     /// Returns a badge string and color for the benchmark's analysis state in the list page.
@@ -1396,7 +1402,7 @@ impl AppState {
                             .insert(benchmark.clone(), selected_function.clone());
                         self.sessions_by_key.insert(key, session);
 
-                        // Auto-navigate after analysis if this is the currently viewed benchmark
+                        // Keep the detail selector on a valid pass for the currently viewed session.
                         if matches!(kind, JobKind::AnalyzeFast)
                             && self
                                 .selected_benchmark()
@@ -1405,7 +1411,7 @@ impl AppState {
                                 .selected_function_for_selected_benchmark()
                                 .is_some_and(|f| f.symbol == selected_function.symbol)
                         {
-                            self.auto_navigate_to_vectorize();
+                            self.ensure_valid_pass_selection_for_active_session();
                         }
 
                         if !matches!(kind, JobKind::AnalyzeFast) {
@@ -1525,6 +1531,7 @@ mod tests {
 
         let key = session_key(&benchmark, &selected_function.symbol, &config.config_id());
         app.sessions_by_key.insert(key, session);
+        app.ensure_valid_pass_selection_for_active_session();
     }
 
     #[test]
@@ -1971,7 +1978,7 @@ int s161(void) {
     }
 
     #[test]
-    fn auto_navigates_to_vectorize_after_analysis() {
+    fn analysis_selects_first_available_stage_without_changing_focus() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         let selected_function = BenchmarkFunction {
@@ -1994,12 +2001,19 @@ int s161(void) {
             selected_function,
         ))));
 
-        assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
+        assert_eq!(app.selected_stage, AnalysisStage::Loop);
+        assert_eq!(
+            app.selected_pass_index_in_stage(
+                app.active_session_for_selected_benchmark()
+                    .expect("session should exist")
+            ),
+            0
+        );
         assert_eq!(app.detail_focus, DetailFocus::Selector);
     }
 
     #[test]
-    fn auto_navigate_skips_if_user_navigated() {
+    fn analysis_preserves_code_view_focus_while_normalizing_selection() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         let selected_function = BenchmarkFunction {
@@ -2024,10 +2038,39 @@ int s161(void) {
             selected_function,
         ))));
 
-        // Should still be CodeView, auto-navigate was skipped
         assert_eq!(app.detail_focus, DetailFocus::CodeView);
-        // But selected_stage was NOT changed by auto_navigate since it was skipped
-        // (remains as default Vectorize which happens to match, but the key thing is no navigation happened)
+        assert_eq!(app.selected_stage, AnalysisStage::Loop);
+    }
+
+    #[test]
+    fn analysis_without_vectorize_stage_still_selects_available_pass() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        let selected_function = BenchmarkFunction {
+            loop_id: String::from("S161"),
+            symbol: String::from("s161"),
+        };
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        app.handle_job_event(JobEvent::Started {
+            kind: JobKind::AnalyzeFast,
+            benchmark: String::from("A"),
+            compiler_config: CompilerConfig::default(),
+            selected_function: selected_function.clone(),
+            run_mode: FunctionRunMode::OutputFilter,
+        });
+        app.handle_job_event(JobEvent::Finished(Ok(outcome_for(
+            "A",
+            CompilerConfig::default(),
+            selected_function,
+        ))));
+
+        let session = app
+            .active_session_for_selected_benchmark()
+            .expect("session should exist");
+        assert_eq!(app.selected_stage, AnalysisStage::Loop);
+        assert!(app.selected_step_in_stage(session).is_some());
     }
 
     #[test]
@@ -2126,11 +2169,33 @@ int s161(void) {
             selected_function,
         ))));
 
+        app.select_next_pass();
         assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
         app.select_prev_pass();
         assert_eq!(app.selected_stage, AnalysisStage::Loop);
-        app.select_next_pass();
-        assert_eq!(app.selected_stage, AnalysisStage::Vectorize);
+    }
+
+    #[test]
+    fn opening_detail_with_existing_session_selects_first_available_pass() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.selected_function_by_benchmark.insert(
+            String::from("A"),
+            BenchmarkFunction {
+                loop_id: String::from("S161"),
+                symbol: String::from("s161"),
+            },
+        );
+        let step = make_step(AnalysisStage::Cleanup, "instcombine", 0);
+        attach_ready_session(&mut app, step, vec![]);
+
+        app.open_selected_benchmark_page();
+
+        let session = app
+            .active_session_for_selected_benchmark()
+            .expect("session should exist");
+        assert_eq!(app.selected_stage, AnalysisStage::Cleanup);
+        assert!(app.selected_step_in_stage(session).is_some());
     }
 
     #[test]
