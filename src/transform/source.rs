@@ -183,7 +183,7 @@ fn extract_available_functions(
     let call_re =
         Regex::new(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\);\s*$").context("build call regex")?;
     let wrapped_call_re = Regex::new(
-        r#"^if\s*\(\s*tsvc_tui_should_run\("([A-Za-z_][A-Za-z0-9_]*)"\)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(.*\);\s*$"#,
+        r#"^if\s*\(\s*tsvc_inspector_should_run\("([A-Za-z_][A-Za-z0-9_]*)"\)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(.*\);\s*$"#,
     )
     .context("build wrapped call regex")?;
 

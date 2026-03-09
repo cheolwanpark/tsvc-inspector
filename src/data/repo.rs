@@ -92,7 +92,7 @@ pub fn configure_function_run_mode(
 }
 
 pub fn app_managed_fallback_root() -> PathBuf {
-    std::env::temp_dir().join("tsvc-tui-llvm-test-suite")
+    std::env::temp_dir().join("tsvc-inspector-llvm-test-suite")
 }
 
 pub fn is_app_managed_fallback_root(root: &Path) -> bool {

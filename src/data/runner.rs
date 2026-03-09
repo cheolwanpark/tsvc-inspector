@@ -435,7 +435,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time should move forward")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("tsvc-tui-prepare-rebuild-test-{unique}"));
+        let root =
+            std::env::temp_dir().join(format!("tsvc-inspector-prepare-rebuild-test-{unique}"));
         let target_dir = root.join("Foo");
         fs::create_dir_all(&target_dir).expect("create target dir");
         fs::write(target_dir.join("build.make"), "keep").expect("write build.make");

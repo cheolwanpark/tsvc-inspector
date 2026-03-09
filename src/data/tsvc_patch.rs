@@ -6,10 +6,10 @@ use regex::Regex;
 
 use crate::core::error::AppResult;
 
-const PATCH_MARKER: &str = "/* TSVC_TUI_FUNCTION_FILTER_PATCH */";
-const HELPER_SNIPPET: &str = r#"/* TSVC_TUI_FUNCTION_FILTER_PATCH */
-static int tsvc_tui_should_run(const char *loop_symbol) {
-    const char *filter = getenv("TSVC_TUI_FUNCTION_FILTER");
+const PATCH_MARKER: &str = "/* TSVC_INSPECTOR_FUNCTION_FILTER_PATCH */";
+const HELPER_SNIPPET: &str = r#"/* TSVC_INSPECTOR_FUNCTION_FILTER_PATCH */
+static int tsvc_inspector_should_run(const char *loop_symbol) {
+    const char *filter = getenv("TSVC_INSPECTOR_FUNCTION_FILTER");
     if (filter == NULL || filter[0] == '\0') {
         return 1;
     }
@@ -36,7 +36,7 @@ pub fn ensure_function_filter_patch(tsvc_root: &Path) -> AppResult<TsvcPatchOutc
         return Ok(TsvcPatchOutcome::AlreadyPatched);
     };
 
-    let backup_path = tsc_inc_path.with_extension("inc.tsvc_tui_orig");
+    let backup_path = tsc_inc_path.with_extension("inc.tsvc_inspector_orig");
     if !backup_path.exists() {
         fs::write(&backup_path, &original)
             .with_context(|| format!("write {}", backup_path.display()))?;
@@ -106,7 +106,7 @@ fn wrap_main_loop_calls(content: &str) -> AppResult<String> {
             let name = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
             let args = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
             let wrapped_line =
-                format!("{indent}if (tsvc_tui_should_run(\"{name}\")) {name}({args});");
+                format!("{indent}if (tsvc_inspector_should_run(\"{name}\")) {name}({args});");
             transformed.push(wrapped_line);
             continue;
         }
@@ -145,9 +145,9 @@ int main(int argc, char **argv) {
             .expect("patch should succeed")
             .expect("content should be patched");
         assert!(patched.contains(PATCH_MARKER));
-        assert!(patched.contains("if (tsvc_tui_should_run(\"s161\")) s161();"));
-        assert!(patched.contains("if (tsvc_tui_should_run(\"s162\")) s162(n1);"));
-        assert!(patched.contains("if (tsvc_tui_should_run(\"va\")) va();"));
+        assert!(patched.contains("if (tsvc_inspector_should_run(\"s161\")) s161();"));
+        assert!(patched.contains("if (tsvc_inspector_should_run(\"s162\")) s162(n1);"));
+        assert!(patched.contains("if (tsvc_inspector_should_run(\"va\")) va();"));
     }
 
     #[test]

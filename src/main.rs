@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use tsvc_tui::AppResult;
-use tsvc_tui::display::runtime::{self, RuntimeOptions};
+use tsvc_inspector::AppResult;
+use tsvc_inspector::display::runtime::{self, RuntimeOptions};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "tsvc-tui",
+    name = "tsvc-inspector",
     version,
-    about = "TSVC study assistant with Ratatui"
+    about = "TSVC inspector with Ratatui"
 )]
 struct Cli {
     #[arg(long, default_value = "llvm-test-suite")]
