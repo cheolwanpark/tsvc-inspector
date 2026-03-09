@@ -919,7 +919,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab mode (code view) \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy \u{00b7} c clear";
+    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} c C view \u{00b7} C clear \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),

@@ -107,16 +107,16 @@ impl CodeViewMode {
     pub fn cycle_next(self) -> Self {
         match self {
             Self::IrDiff => Self::IrPostPass,
-            Self::IrPostPass => Self::CSource,
-            Self::CSource => Self::IrDiff,
+            Self::IrPostPass => Self::IrDiff,
+            Self::CSource => Self::IrPostPass,
         }
     }
 
     pub fn cycle_prev(self) -> Self {
         match self {
-            Self::IrDiff => Self::CSource,
+            Self::IrDiff => Self::IrPostPass,
             Self::IrPostPass => Self::IrDiff,
-            Self::CSource => Self::IrPostPass,
+            Self::CSource => Self::IrDiff,
         }
     }
 
@@ -236,6 +236,7 @@ pub struct AppState {
     pub list_source_scroll: u16,
     pub detail_focus: DetailFocus,
     pub code_view_mode: CodeViewMode,
+    last_ir_code_view_mode: CodeViewMode,
     pub ir_scroll: u16,
     pub ir_diff_selected_line: usize,
     pub ir_post_selected_line: usize,
@@ -271,6 +272,7 @@ impl AppState {
             list_source_scroll: 0,
             detail_focus: DetailFocus::Selector,
             code_view_mode: CodeViewMode::IrDiff,
+            last_ir_code_view_mode: CodeViewMode::IrDiff,
             ir_scroll: 0,
             ir_diff_selected_line: 0,
             ir_post_selected_line: 0,
@@ -670,6 +672,7 @@ impl AppState {
         self.page = AppPage::BenchmarkDetail;
         self.detail_focus = DetailFocus::Selector;
         self.code_view_mode = CodeViewMode::IrDiff;
+        self.last_ir_code_view_mode = CodeViewMode::IrDiff;
         self.ensure_valid_pass_selection_for_active_session();
         self.reset_ir_navigation();
     }
@@ -1065,12 +1068,30 @@ impl AppState {
     }
 
     pub fn rotate_code_view_mode_next(&mut self) {
-        self.code_view_mode = self.code_view_mode.cycle_next();
+        self.code_view_mode = if self.code_view_mode == CodeViewMode::CSource {
+            self.last_ir_code_view_mode
+        } else {
+            self.code_view_mode.cycle_next()
+        };
+        self.last_ir_code_view_mode = self.code_view_mode;
         self.reset_ir_navigation();
     }
 
     pub fn rotate_code_view_mode_prev(&mut self) {
-        self.code_view_mode = self.code_view_mode.cycle_prev();
+        self.code_view_mode = if self.code_view_mode == CodeViewMode::CSource {
+            self.last_ir_code_view_mode
+        } else {
+            self.code_view_mode.cycle_prev()
+        };
+        self.last_ir_code_view_mode = self.code_view_mode;
+        self.reset_ir_navigation();
+    }
+
+    pub fn show_c_source_mode(&mut self) {
+        if self.code_view_mode != CodeViewMode::CSource {
+            self.last_ir_code_view_mode = self.code_view_mode;
+        }
+        self.code_view_mode = CodeViewMode::CSource;
         self.reset_ir_navigation();
     }
 
@@ -2259,5 +2280,57 @@ int s161(void) {
         assert_eq!(app.source_detail_scroll, 2);
         assert_eq!(app.ir_diff_selected_line, 0);
         assert_eq!(app.ir_post_selected_line, 0);
+    }
+
+    #[test]
+    fn tab_only_toggles_between_ir_diff_and_ir_modes() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
+
+        app.rotate_code_view_mode_next();
+        assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
+
+        app.rotate_code_view_mode_next();
+        assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
+
+        app.rotate_code_view_mode_prev();
+        assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
+    }
+
+    #[test]
+    fn c_source_mode_returns_to_last_ir_mode_on_tab() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        app.rotate_code_view_mode_next();
+        assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
+
+        app.show_c_source_mode();
+        assert_eq!(app.code_view_mode, CodeViewMode::CSource);
+
+        app.rotate_code_view_mode_next();
+        assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
+    }
+
+    #[test]
+    fn c_source_mode_returns_to_ir_diff_on_tab_when_it_was_last_seen() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
+
+        app.show_c_source_mode();
+        assert_eq!(app.code_view_mode, CodeViewMode::CSource);
+
+        app.rotate_code_view_mode_next();
+        assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
     }
 }

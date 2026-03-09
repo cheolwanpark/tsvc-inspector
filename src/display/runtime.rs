@@ -132,7 +132,7 @@ fn run_app(
                         UserAction::MoveLeft => app.list_move_left(),
                         UserAction::MoveRight => app.list_move_right(),
                         UserAction::Confirm => app.open_function_select_modal(),
-                        UserAction::ClearSession => app.open_config_modal(),
+                        UserAction::ShowCSource => app.open_config_modal(),
                         UserAction::Run | UserAction::Analyze => {
                             app.set_status_message(
                                 "Select function and open detail page to run or analyze",
@@ -154,6 +154,11 @@ fn run_app(
                         UserAction::RotateCodeViewModePrev => {
                             if app.is_code_view_focused() {
                                 app.rotate_code_view_mode_prev();
+                            }
+                        }
+                        UserAction::ShowCSource => {
+                            if app.is_code_view_focused() {
+                                app.show_c_source_mode();
                             }
                         }
                         UserAction::ClearSession => app.clear_session(),

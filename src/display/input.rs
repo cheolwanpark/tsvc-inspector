@@ -12,9 +12,10 @@ pub enum UserAction {
     BackToBenchmarkList,    // Esc
     RotateCodeViewMode,     // Tab
     RotateCodeViewModePrev, // Shift-Tab
+    ShowCSource,            // 'c'
     Run,                    // 'r' → BuildAndRun
     Analyze,                // 'a' → AnalyzeFast
-    ClearSession,           // 'c'
+    ClearSession,           // 'C'
     CopyDetailToClipboard,  // 'y'
     Backspace,              // Backspace
     TextChar(char),         // Generic text input for config modal
@@ -25,7 +26,8 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Char('q') => UserAction::Quit,
         KeyCode::Char('r') => UserAction::Run,
         KeyCode::Char('a') => UserAction::Analyze,
-        KeyCode::Char('c') => UserAction::ClearSession,
+        KeyCode::Char('c') => UserAction::ShowCSource,
+        KeyCode::Char('C') => UserAction::ClearSession,
         KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
         KeyCode::Char(ch) => UserAction::TextChar(ch),
         KeyCode::Up => UserAction::MoveUp,
@@ -75,6 +77,14 @@ mod tests {
 
         assert_eq!(map_key_event(key(KeyCode::Char('a'))), UserAction::Analyze);
         assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('c'))),
+            UserAction::ShowCSource
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('C'))),
+            UserAction::ClearSession
+        );
         assert_eq!(
             map_key_event(key(KeyCode::Char('y'))),
             UserAction::CopyDetailToClipboard
