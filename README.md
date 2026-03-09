@@ -1,3 +1,5 @@
+<img width="1905" height="1046" alt="image" src="https://github.com/user-attachments/assets/56233b1a-773a-41f9-b3ec-60e790f62a41" />
+
 # tsvc-inspector
 
 `tsvc-inspector` is a terminal UI for exploring TSVC benchmark kernels with a clang-driven analysis loop. It lets you browse benchmarks, select a function, inspect the pass timeline, review changed IR, and retry the same kernel under different compiler settings without leaving the TUI.
