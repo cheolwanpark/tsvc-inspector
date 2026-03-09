@@ -3,7 +3,8 @@ use std::fmt::Write;
 use similar::ChangeTag;
 
 use crate::core::model::{
-    AnalysisStage, AnalysisStep, BenchmarkFunction, BenchmarkItem, RemarkEntry, RunSession,
+    AnalysisStage, AnalysisStep, BenchmarkFunction, BenchmarkItem, PassTraceEntry, RemarkEntry,
+    RunSession,
 };
 
 pub struct DetailSnapshotInput<'a> {
@@ -12,20 +13,21 @@ pub struct DetailSnapshotInput<'a> {
     pub session: &'a RunSession,
     pub selected_stage: AnalysisStage,
     pub detail_focus_label: &'a str,
-    pub step: &'a AnalysisStep,
+    pub trace_entry: &'a PassTraceEntry,
+    pub step: Option<&'a AnalysisStep>,
     pub selected_pass_index: usize,
     pub passes_len: usize,
     pub source_text: &'a str,
 }
 
 pub fn build_detail_snapshot(input: DetailSnapshotInput<'_>) -> String {
-    let full_pass_diff = build_full_pass_diff(input.step);
-    let pass_name = if input.step.pass.is_empty() {
-        input.step.pass_key.as_str()
+    let full_pass_diff = input.step.map(build_full_pass_diff);
+    let pass_name = if input.trace_entry.pass.is_empty() {
+        input.trace_entry.pass_key.as_str()
     } else {
-        input.step.pass.as_str()
+        input.trace_entry.pass.as_str()
     };
-    let remarks_text = format_step_remarks(input.step, &input.session.remarks);
+    let remarks_text = format_pass_remarks(input.trace_entry, &input.session.remarks);
 
     let mut out = String::new();
     let _ = writeln!(out, "TSVC Detail Snapshot");
@@ -46,18 +48,36 @@ pub fn build_detail_snapshot(input: DetailSnapshotInput<'_>) -> String {
 
     let _ = writeln!(out, "Stage/Pass");
     let _ = writeln!(out, "- stage: {}", input.selected_stage.ui_label());
-    let _ = writeln!(out, "- pass_key: {}", input.step.pass_key);
-    let _ = writeln!(out, "- pass_raw: {}", input.step.pass);
+    let _ = writeln!(out, "- pass_key: {}", input.trace_entry.pass_key);
+    let _ = writeln!(out, "- pass_raw: {}", input.trace_entry.pass);
     let _ = writeln!(
         out,
         "- pass_index: {}/{}",
         input.selected_pass_index, input.passes_len
     );
-    let _ = writeln!(out, "- changed_lines: {}", input.step.changed_lines);
+    let _ = writeln!(
+        out,
+        "- pass_status: {}",
+        input.trace_entry.status.ui_label()
+    );
+    let _ = writeln!(out, "- target: {}", input.trace_entry.target_raw);
+    if let Some(step) = input.step {
+        let _ = writeln!(out, "- changed_lines: {}", step.changed_lines);
+    }
     let _ = writeln!(out);
 
     let _ = writeln!(out, "Remarks");
     let _ = writeln!(out, "{remarks_text}");
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "Raw Logs");
+    if input.trace_entry.log_lines.is_empty() {
+        let _ = writeln!(out, "- (none)");
+    } else {
+        for line in &input.trace_entry.log_lines {
+            let _ = writeln!(out, "- {line}");
+        }
+    }
     let _ = writeln!(out);
 
     let _ = writeln!(out, "C Source");
@@ -67,9 +87,13 @@ pub fn build_detail_snapshot(input: DetailSnapshotInput<'_>) -> String {
     let _ = writeln!(out);
 
     let _ = writeln!(out, "IR Diff ({pass_name})");
-    let _ = writeln!(out, "```diff");
-    let _ = writeln!(out, "{full_pass_diff}");
-    let _ = writeln!(out, "```");
+    if let Some(diff) = full_pass_diff {
+        let _ = writeln!(out, "```diff");
+        let _ = writeln!(out, "{diff}");
+        let _ = writeln!(out, "```");
+    } else {
+        let _ = writeln!(out, "(no IR diff for this pass)");
+    }
 
     out
 }
@@ -101,9 +125,9 @@ pub fn extract_vf_from_remarks(remarks: &[RemarkEntry]) -> Option<u32> {
     None
 }
 
-fn format_step_remarks(step: &AnalysisStep, remarks: &[RemarkEntry]) -> String {
+fn format_pass_remarks(trace_entry: &PassTraceEntry, remarks: &[RemarkEntry]) -> String {
     let mut lines = Vec::new();
-    for idx in &step.remark_indices {
+    for idx in &trace_entry.remark_indices {
         let Some(remark) = remarks.get(*idx) else {
             continue;
         };

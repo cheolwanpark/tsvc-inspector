@@ -8,21 +8,23 @@ pub enum UserAction {
     MoveDown,
     MoveLeft,
     MoveRight,
-    Confirm,                // Enter
-    BackToBenchmarkList,    // Esc
-    RotateCodeViewMode,     // Tab
-    RotateCodeViewModePrev, // Shift-Tab
-    ShowCSource,            // 'c'
-    CopyDetailToClipboard,  // 'y'
-    ToggleSideBySideDiff,   // 'd'
-    Backspace,              // Backspace
-    TextChar(char),         // Generic text input for config modal
+    Confirm,                 // Enter
+    BackToBenchmarkList,     // Esc
+    RotateCodeViewMode,      // Tab
+    RotateCodeViewModePrev,  // Shift-Tab
+    CyclePassTimelineFilter, // 'r'
+    ShowCSource,             // 'c'
+    CopyDetailToClipboard,   // 'y'
+    ToggleSideBySideDiff,    // 'd'
+    Backspace,               // Backspace
+    TextChar(char),          // Generic text input for config modal
 }
 
 pub fn map_key_event(key: KeyEvent) -> UserAction {
     match key.code {
         KeyCode::Char('q') => UserAction::Quit,
         KeyCode::Char('c') => UserAction::ShowCSource,
+        KeyCode::Char('r') => UserAction::CyclePassTimelineFilter,
         KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
         KeyCode::Char('d') => UserAction::ToggleSideBySideDiff,
         KeyCode::Char(ch) => UserAction::TextChar(ch),
@@ -74,6 +76,10 @@ mod tests {
         assert_eq!(
             map_key_event(key(KeyCode::Char('c'))),
             UserAction::ShowCSource
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('r'))),
+            UserAction::CyclePassTimelineFilter
         );
         assert_eq!(
             map_key_event(key(KeyCode::Char('y'))),

@@ -294,6 +294,8 @@ impl CompilerConfig {
         flags.push(String::from("-print-changed"));
         flags.push(String::from("-mllvm"));
         flags.push(String::from("-print-module-scope"));
+        flags.push(String::from("-mllvm"));
+        flags.push(String::from("-opt-bisect-limit=-1"));
 
         for token in split_flags(&self.extra_llvm_flags) {
             flags.push(String::from("-mllvm"));
@@ -522,6 +524,41 @@ pub struct AnalysisStep {
     pub source: AnalysisSource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassTraceStatus {
+    Changed,
+    RanNoChange,
+}
+
+impl PassTraceStatus {
+    pub fn changed(self) -> bool {
+        matches!(self, Self::Changed)
+    }
+
+    pub fn ui_label(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::RanNoChange => "ran-no-change",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PassTraceEntry {
+    pub order_index: usize,
+    #[allow(dead_code)]
+    pub pass: String,
+    pub pass_key: String,
+    pub pass_occurrence: usize,
+    pub stage: AnalysisStage,
+    pub target_raw: String,
+    pub target_function: Option<String>,
+    pub status: PassTraceStatus,
+    pub analysis_step_index: Option<usize>,
+    pub remark_indices: Vec<usize>,
+    pub log_lines: Vec<String>,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct RemarksSummary {
     pub total_loop_vectorize: usize,
@@ -592,6 +629,7 @@ pub struct RunSession {
     pub run_mode: FunctionRunMode,
     pub remarks: Vec<RemarkEntry>,
     pub analysis_steps: Vec<AnalysisStep>,
+    pub pass_trace: Vec<PassTraceEntry>,
     pub analysis_state: AnalysisState,
     pub remarks_summary: RemarksSummary,
     pub logs: Vec<String>,
@@ -616,6 +654,7 @@ impl RunSession {
             run_mode,
             remarks: Vec::new(),
             analysis_steps: Vec::new(),
+            pass_trace: Vec::new(),
             analysis_state: AnalysisState::None,
             remarks_summary: RemarksSummary::default(),
             logs: Vec::new(),
@@ -636,6 +675,7 @@ mod tests {
         assert!(flags.iter().any(|f| f == "-fsave-optimization-record"));
         assert!(flags.iter().any(|f| f == "-print-changed"));
         assert!(flags.iter().any(|f| f == "-print-module-scope"));
+        assert!(flags.iter().any(|f| f == "-opt-bisect-limit=-1"));
         assert!(flags.iter().any(|f| f == "-Rpass=loop-vectorize"));
         assert!(flags.iter().any(|f| f == "-Rpass-missed=loop-vectorize"));
         assert!(flags.iter().any(|f| f == "-Rpass-analysis=loop-vectorize"));

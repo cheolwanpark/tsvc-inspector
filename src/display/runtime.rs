@@ -117,6 +117,26 @@ fn run_app(
                     UserAction::BackToBenchmarkList => app.close_function_select_modal(),
                     _ => {}
                 },
+                action if app.page == AppPage::BenchmarkDetail && app.is_pass_info_modal_open() => {
+                    match action {
+                        UserAction::MoveUp => app.detail_move_up(),
+                        UserAction::MoveDown => app.detail_move_down(),
+                        UserAction::BackToBenchmarkList => {
+                            app.close_pass_info_modal();
+                        }
+                        _ => {}
+                    }
+                }
+                action if app.page == AppPage::BenchmarkDetail && app.is_c_source_popup_open() => {
+                    match action {
+                        UserAction::MoveUp => app.detail_move_up(),
+                        UserAction::MoveDown => app.detail_move_down(),
+                        UserAction::BackToBenchmarkList | UserAction::ShowCSource => {
+                            app.close_c_source_popup();
+                        }
+                        _ => {}
+                    }
+                }
                 action
                     if app.page == AppPage::BenchmarkDetail && app.is_side_by_side_diff_open() =>
                 {
@@ -157,6 +177,11 @@ fn run_app(
                         UserAction::MoveLeft => app.detail_move_left(),
                         UserAction::MoveRight => app.detail_move_right(),
                         UserAction::BackToBenchmarkList => app.back_to_benchmark_list(),
+                        UserAction::Confirm => {
+                            if app.is_selector_focused() {
+                                app.open_pass_info_modal();
+                            }
+                        }
                         UserAction::RotateCodeViewMode => {
                             if app.is_code_view_focused() {
                                 app.rotate_code_view_mode_next();
@@ -167,11 +192,8 @@ fn run_app(
                                 app.rotate_code_view_mode_prev();
                             }
                         }
-                        UserAction::ShowCSource => {
-                            if app.is_code_view_focused() {
-                                app.show_c_source_mode();
-                            }
-                        }
+                        UserAction::CyclePassTimelineFilter => app.cycle_pass_timeline_filter(),
+                        UserAction::ShowCSource => app.open_c_source_popup(),
                         UserAction::CopyDetailToClipboard => copy_detail_snapshot(app),
                         UserAction::ToggleSideBySideDiff => app.toggle_side_by_side_diff(),
                         _ => {}
@@ -252,9 +274,15 @@ fn maybe_spawn_analysis(
                     &remarks,
                     raw.source_file_content.as_deref(),
                 );
-                if analysis_steps.is_empty() {
+                let pass_trace = analysis::build_pass_trace(
+                    &raw.build_trace,
+                    &selected_function.symbol,
+                    &analysis_steps,
+                    &remarks,
+                );
+                if pass_trace.is_empty() {
                     let _ = tx.send(JobEvent::Finished(Err(format!(
-                        "no function-level IR steps found for '{}'",
+                        "no function-level pass trace found for '{}'",
                         selected_function.symbol
                     ))));
                     return;
@@ -269,6 +297,7 @@ fn maybe_spawn_analysis(
                     run_mode,
                     data: JobOutcomeData::Analysis {
                         analysis_steps,
+                        pass_trace,
                         remarks,
                         remarks_summary: summary,
                     },

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use similar::ChangeTag;
 
 use crate::core::model::{
-    AnalysisState, AnalysisStep, AppPage, IrAttribute, IrAttributeOrigin, RemarkEntry, RemarkKind,
+    AnalysisState, AnalysisStep, AppPage, PassTraceEntry, PassTraceStatus, RemarkEntry, RemarkKind,
     RunSession,
 };
 use crate::display::app::{AppState, CodeViewMode, ConfigRow};
@@ -274,8 +274,14 @@ fn render_benchmark_detail_page(frame: &mut Frame, app: &mut AppState) {
     render_code_view_panel(frame, app, code_area);
     render_line_attributes_bar(frame, app, attr_area);
     render_detail_footer(frame, app, footer_area);
+    if app.is_pass_info_modal_open() {
+        render_pass_info_modal(frame, app);
+    }
     if app.is_side_by_side_diff_open() {
         render_side_by_side_diff_modal(frame, app);
+    }
+    if app.is_c_source_popup_open() {
+        render_c_source_modal(frame, app);
     }
 }
 
@@ -328,15 +334,18 @@ fn render_detail_header(frame: &mut Frame, app: &AppState, area: ratatui::layout
 
 fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let title = if app.is_selector_focused() {
-        "Pass Selector [Focus]"
+        format!(
+            "Pass Timeline: {} [Focus]",
+            app.pass_timeline_filter.label()
+        )
     } else {
-        "Pass Selector"
+        format!("Pass Timeline: {}", app.pass_timeline_filter.label())
     };
 
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
             Paragraph::new("Analysis will start when you enter detail.")
-                .block(Block::bordered().title(title)),
+                .block(Block::bordered().title(title.as_str())),
             area,
         );
         return;
@@ -344,16 +353,17 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
 
     if session.analysis_state == AnalysisState::Running {
         frame.render_widget(
-            Paragraph::new("\u{27f3} Analyzing...").block(Block::bordered().title(title)),
+            Paragraph::new("\u{27f3} Analyzing...").block(Block::bordered().title(title.as_str())),
             area,
         );
         return;
     }
 
-    let stages = AppState::ordered_stages_with_counts(session);
+    let stages = AppState::ordered_stages_with_counts(session, app.pass_timeline_filter);
     if stages.is_empty() {
         frame.render_widget(
-            Paragraph::new("Waiting for analysis passes...").block(Block::bordered().title(title)),
+            Paragraph::new("Waiting for pass timeline...")
+                .block(Block::bordered().title(title.as_str())),
             area,
         );
         return;
@@ -373,14 +383,13 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
             ),
         );
 
-        let passes = AppState::passes_for_stage(session, stage);
-        for (pass_idx, step) in passes.iter().enumerate() {
-            let (icon, _msg) = pass_remark_summary(step, &session.remarks);
+        let passes = AppState::pass_trace_for_stage(session, stage, app.pass_timeline_filter);
+        for (pass_idx, entry) in passes.iter().enumerate() {
             let text = format!(
-                "  {}  {} [\u{0394}{}]",
-                pass_display_name(&step.pass_key),
-                icon,
-                step.changed_lines
+                "  {}  [{}]{}",
+                pass_display_name(&entry.pass_key),
+                timeline_status_label(entry),
+                timeline_remark_suffix(entry, &session.remarks)
             );
             if stage == selected_stage && pass_idx == selected_pass {
                 selected_display_idx = Some(items.len());
@@ -390,7 +399,7 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
     }
 
     let list = List::new(items)
-        .block(Block::bordered().title(title))
+        .block(Block::bordered().title(title.as_str()))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -405,131 +414,59 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
 
 fn render_code_view_panel(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     let title = if app.is_code_view_focused() {
-        format!("Code View: {} [Focus]", app.code_view_mode.label())
+        format!("Inspector: {} [Focus]", app.code_view_mode.label())
     } else {
-        format!("Code View: {}", app.code_view_mode.label())
+        format!("Inspector: {}", app.code_view_mode.label())
     };
 
     match app.code_view_mode {
-        CodeViewMode::CSource => render_detail_source_panel(frame, app, area, &title),
         CodeViewMode::IrPostPass => render_ir_post_panel(frame, app, area, &title),
         CodeViewMode::IrDiff => render_ir_diff_panel(frame, app, area, &title),
     }
 }
 
 fn render_line_attributes_bar(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let text = Text::from(line_attribute_lines(app));
+    let text = Text::from(pass_summary_lines(app));
     let widget = Paragraph::new(text)
-        .block(Block::bordered().title("Line Attributes"))
+        .block(Block::bordered().title("Pass Summary"))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
 }
 
-fn line_attribute_lines(app: &AppState) -> Vec<Line<'static>> {
-    if app.code_view_mode == CodeViewMode::CSource {
-        return vec![
-            Line::from("IR line inspector is available in IR Diff and IR modes."),
-            Line::from("Switch code view mode to inspect LLVM attributes per line."),
-        ];
-    }
-
+fn pass_summary_lines(app: &AppState) -> Vec<Line<'static>> {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         return vec![Line::from(
-            "Analysis results are required to inspect LLVM attributes.",
+            "Analysis results are required to inspect the selected pass.",
         )];
     };
-    let Some(step) = app.selected_step_in_stage(session) else {
-        return vec![Line::from("Select a pass to inspect LLVM attributes.")];
-    };
-    let Some(selected_line) = app.selected_ir_line_for_selected_step() else {
-        return vec![Line::from("No IR line selected.")];
+    let Some(entry) = app.selected_trace_entry_in_stage(session) else {
+        return vec![Line::from("Select a pass to inspect.")];
     };
 
-    let diff_label = match selected_line.tag {
-        ChangeTag::Insert => "inserted",
-        ChangeTag::Delete => "deleted",
-        ChangeTag::Equal => "unchanged",
-    };
-    let mut lines = vec![Line::from(format!(
-        "Line {} · {} · {} · {} attr(s)",
-        app.selected_ir_visible_index() + 1,
-        app.code_view_mode.label(),
-        diff_label,
-        selected_line.details.attributes.len(),
-    ))];
-
-    if selected_line.is_source_annotation {
-        lines.push(Line::from(
-            "This is a source annotation line, not an LLVM IR instruction.",
-        ));
-        lines.push(Line::from(
-            "Move to a nearby IR line to inspect inline or group attributes.",
-        ));
-        return lines;
-    }
-
-    if selected_line.details.attributes.is_empty() {
-        lines.push(Line::from(
-            "No LLVM attributes were detected on the selected line.",
-        ));
-        lines.push(Line::from(format!(
-            "Pass: {}",
-            pass_display_name(&step.pass_key)
-        )));
-        return lines;
-    }
-
-    let ordered_scopes = [
-        crate::core::model::IrAttributeScope::Function,
-        crate::core::model::IrAttributeScope::Return,
-        crate::core::model::IrAttributeScope::Parameter,
-        crate::core::model::IrAttributeScope::Call,
-        crate::core::model::IrAttributeScope::CallReturn,
-        crate::core::model::IrAttributeScope::CallArgument,
-        crate::core::model::IrAttributeScope::Unknown,
+    let mut lines = vec![
+        Line::from(format!("Status: {}", entry.status.ui_label())),
+        Line::from(format!(
+            "Target: {}",
+            if entry.target_raw.is_empty() {
+                "(unknown-target)"
+            } else {
+                entry.target_raw.as_str()
+            }
+        )),
     ];
 
-    for scope in ordered_scopes {
-        let scoped = selected_line
-            .details
-            .attributes
-            .iter()
-            .filter(|attr| attr.scope == scope)
-            .collect::<Vec<_>>();
-        if scoped.is_empty() {
-            continue;
-        }
-        lines.push(Line::from(format!(
-            "{}: {}",
-            scope.label(),
-            format_attribute_scope_items(&scoped)
-        )));
+    if let Some(remark) = entry
+        .remark_indices
+        .iter()
+        .find_map(|idx| session.remarks.get(*idx))
+    {
+        let message = remark.message.as_deref().unwrap_or(remark.name.as_str());
+        lines.push(Line::from(format!("Reason: [{}] {}", remark.kind, message)));
+    } else {
+        lines.push(Line::from("Reason: No explicit reason emitted"));
     }
 
     lines
-}
-
-fn format_attribute_scope_items(attrs: &[&IrAttribute]) -> String {
-    let mut inline = Vec::new();
-    let mut groups = BTreeMap::<u32, Vec<&str>>::new();
-
-    for attr in attrs {
-        match attr.origin {
-            IrAttributeOrigin::Inline => inline.push(attr.text.as_str()),
-            IrAttributeOrigin::GroupRef(group_id) => {
-                groups.entry(group_id).or_default().push(attr.text.as_str())
-            }
-        }
-    }
-
-    let mut parts = Vec::new();
-    if !inline.is_empty() {
-        parts.push(inline.join(", "));
-    }
-    for (group_id, group_attrs) in groups {
-        parts.push(format!("from #{group_id}: {}", group_attrs.join(", ")));
-    }
-    parts.join("; ")
 }
 
 fn selected_ir_style(tag: ChangeTag, selected: bool) -> Style {
@@ -617,6 +554,22 @@ fn render_detail_source_panel(
     frame.render_widget(paragraph, area);
 }
 
+fn render_c_source_modal(frame: &mut Frame, app: &AppState) {
+    let area = centered_rect(frame.area(), 88, 82);
+    frame.render_widget(Clear, area);
+
+    let vertical = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]);
+    let [content_area, footer_area] = vertical.areas(area);
+    render_detail_source_panel(frame, app, content_area, "C Source");
+
+    let hint = Paragraph::new(Text::from(vec![
+        Line::from("C Source Popup"),
+        Line::from("\u{2191}\u{2193} scroll · c close · esc close"),
+    ]))
+    .block(Block::bordered().title("Modal"));
+    frame.render_widget(hint, footer_area);
+}
+
 /// Collect source line numbers that correspond to currently visible IR lines.
 fn collect_highlighted_source_lines(app: &AppState) -> HashSet<u32> {
     let mut result = HashSet::new();
@@ -655,12 +608,7 @@ fn render_ir_diff_panel(
     };
 
     let Some(step) = app.selected_step_in_stage(session) else {
-        let hint = match session.analysis_state {
-            AnalysisState::None => "Waiting for analysis...",
-            AnalysisState::Running => "\u{27f3} Analyzing...",
-            AnalysisState::Ready => "Select a pass",
-            AnalysisState::Failed => "Analysis failed",
-        };
+        let hint = ir_unavailable_hint(app, session);
         frame.render_widget(
             Paragraph::new(hint).block(Block::bordered().title(title)),
             area,
@@ -760,12 +708,7 @@ fn render_ir_post_panel(
     };
 
     let Some(step) = app.selected_step_in_stage(session) else {
-        let hint = match session.analysis_state {
-            AnalysisState::None => "Waiting for analysis...",
-            AnalysisState::Running => "\u{27f3} Analyzing...",
-            AnalysisState::Ready => "Select a pass",
-            AnalysisState::Failed => "Analysis failed",
-        };
+        let hint = ir_unavailable_hint(app, session);
         frame.render_widget(
             Paragraph::new(hint).block(Block::bordered().title(title)),
             area,
@@ -835,6 +778,89 @@ fn render_ir_post_panel(
         .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
         .scroll((app.ir_scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn render_pass_info_modal(frame: &mut Frame, app: &AppState) {
+    let area = centered_rect(frame.area(), 82, 78);
+    frame.render_widget(Clear, area);
+    let vertical = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]);
+    let [content_area, footer_area] = vertical.areas(area);
+
+    let Some(session) = app.active_session_for_selected_benchmark() else {
+        frame.render_widget(
+            Paragraph::new("Waiting for analysis...").block(Block::bordered().title("Pass Info")),
+            content_area,
+        );
+        return;
+    };
+    let Some(entry) = app.selected_trace_entry_in_stage(session) else {
+        let hint = match session.analysis_state {
+            AnalysisState::None => "Waiting for analysis...",
+            AnalysisState::Running => "\u{27f3} Analyzing...",
+            AnalysisState::Ready => "Select a pass",
+            AnalysisState::Failed => "Analysis failed",
+        };
+        frame.render_widget(
+            Paragraph::new(hint).block(Block::bordered().title("Pass Info")),
+            content_area,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from("Summary"),
+        Line::from(format!(
+            "Pass: {}",
+            if entry.pass.is_empty() {
+                entry.pass_key.as_str()
+            } else {
+                entry.pass.as_str()
+            }
+        )),
+        Line::from(format!("Status: {}", entry.status.ui_label())),
+        Line::from(format!("Occurrence: #{}", entry.pass_occurrence)),
+        Line::from(format!(
+            "Target: {}",
+            if entry.target_raw.is_empty() {
+                "(unknown-target)"
+            } else {
+                entry.target_raw.as_str()
+            }
+        )),
+        Line::from(""),
+        Line::from("Decision"),
+    ];
+
+    let remark_lines = format_trace_remarks(entry, &session.remarks);
+    if remark_lines.is_empty() {
+        lines.push(Line::from("No explicit reason emitted"));
+    } else {
+        lines.extend(remark_lines);
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Raw Log"));
+    if entry.log_lines.is_empty() {
+        lines.push(Line::from("(none)"));
+    } else {
+        for line in &entry.log_lines {
+            lines.push(Line::from(line.clone()));
+        }
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(Block::bordered().title("Pass Info"))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
+        .scroll((app.pass_info_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, content_area);
+
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from("Pass Info Modal"),
+        Line::from("\u{2191}\u{2193} scroll · esc close"),
+    ]))
+    .block(Block::bordered().title("Modal"));
+    frame.render_widget(footer, footer_area);
 }
 
 fn render_benchmarks(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
@@ -922,7 +948,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} c C view \u{00b7} d side-by-side diff \u{00b7} y copy";
+    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} enter pass info \u{00b7} r timeline filter \u{00b7} c C popup \u{00b7} d side-by-side diff \u{00b7} y copy";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -1171,6 +1197,67 @@ fn render_side_by_side_cell(
 
 // --- Helper functions ---
 
+fn ir_unavailable_hint(app: &AppState, session: &RunSession) -> &'static str {
+    if let Some(entry) = app.selected_trace_entry_in_stage(session)
+        && !entry.status.changed()
+    {
+        return "IR unchanged after this pass";
+    }
+    match session.analysis_state {
+        AnalysisState::None => "Waiting for analysis...",
+        AnalysisState::Running => "\u{27f3} Analyzing...",
+        AnalysisState::Ready => "Select a pass",
+        AnalysisState::Failed => "Analysis failed",
+    }
+}
+
+fn format_trace_remarks(entry: &PassTraceEntry, remarks: &[RemarkEntry]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for idx in &entry.remark_indices {
+        let Some(remark) = remarks.get(*idx) else {
+            continue;
+        };
+        let message = remark.message.as_deref().unwrap_or(remark.name.as_str());
+        lines.push(Line::from(format!(
+            "[{}] {}::{} {}",
+            remark.kind, remark.pass, remark.name, message
+        )));
+    }
+    lines
+}
+
+fn timeline_status_label(entry: &PassTraceEntry) -> &'static str {
+    match entry.status {
+        PassTraceStatus::Changed => "changed",
+        PassTraceStatus::RanNoChange => "ran",
+    }
+}
+
+fn timeline_remark_suffix(entry: &PassTraceEntry, remarks: &[RemarkEntry]) -> String {
+    if entry.remark_indices.is_empty() {
+        return String::new();
+    }
+    let mut badges = Vec::new();
+    for idx in &entry.remark_indices {
+        let Some(remark) = remarks.get(*idx) else {
+            continue;
+        };
+        let badge = match remark.kind {
+            RemarkKind::Passed => "✓",
+            RemarkKind::Missed => "✗",
+            RemarkKind::Analysis | RemarkKind::Other => "·",
+        };
+        if !badges.iter().any(|existing| existing == &badge) {
+            badges.push(badge);
+        }
+    }
+    if badges.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", badges.join(""))
+    }
+}
+
 fn pass_display_name(pass_key: &str) -> &str {
     match pass_key {
         "licm" => "Loop Invariant CM",
@@ -1236,22 +1323,6 @@ fn extract_vf_from_session(session: &RunSession) -> Option<u32> {
         }
     }
     None
-}
-
-fn pass_remark_summary(step: &AnalysisStep, remarks: &[RemarkEntry]) -> (char, String) {
-    for idx in &step.remark_indices {
-        let Some(r) = remarks.get(*idx) else {
-            continue;
-        };
-        let icon = match r.kind {
-            RemarkKind::Passed => '\u{2713}',
-            RemarkKind::Missed => '\u{2717}',
-            _ => '\u{2014}',
-        };
-        let msg = r.message.as_deref().unwrap_or(r.name.as_str()).to_string();
-        return (icon, msg);
-    }
-    ('\u{2014}', String::from("no remarks"))
 }
 
 fn color_diff_line(line: &str) -> Line<'_> {

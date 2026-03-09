@@ -4,8 +4,8 @@ use ratatui::style::Color;
 
 use crate::core::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
-    CompilerConfig, FunctionRunMode, IrLine, JobKind, RemarkEntry, RemarksSummary, RunSession,
-    SessionStatus,
+    CompilerConfig, FunctionRunMode, IrLine, JobKind, PassTraceEntry, RemarkEntry, RemarksSummary,
+    RunSession, SessionStatus,
 };
 use crate::transform::session::{
     DetailSnapshotInput, build_detail_snapshot, extract_vf_from_remarks, has_vectorizer_ir_changes,
@@ -39,6 +39,7 @@ pub struct JobOutcome {
 pub enum JobOutcomeData {
     Analysis {
         analysis_steps: Vec<AnalysisStep>,
+        pass_trace: Vec<PassTraceEntry>,
         remarks: Vec<RemarkEntry>,
         remarks_summary: RemarksSummary,
     },
@@ -85,8 +86,8 @@ pub enum DetailFocus {
 impl DetailFocus {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Selector => "Pass Selector",
-            Self::CodeView => "Code View",
+            Self::Selector => "Pass Timeline",
+            Self::CodeView => "Inspector",
         }
     }
 }
@@ -95,7 +96,6 @@ impl DetailFocus {
 pub enum CodeViewMode {
     IrDiff,
     IrPostPass,
-    CSource,
 }
 
 impl CodeViewMode {
@@ -103,7 +103,6 @@ impl CodeViewMode {
         match self {
             Self::IrDiff => Self::IrPostPass,
             Self::IrPostPass => Self::IrDiff,
-            Self::CSource => Self::IrPostPass,
         }
     }
 
@@ -111,7 +110,6 @@ impl CodeViewMode {
         match self {
             Self::IrDiff => Self::IrPostPass,
             Self::IrPostPass => Self::IrDiff,
-            Self::CSource => Self::IrDiff,
         }
     }
 
@@ -119,7 +117,28 @@ impl CodeViewMode {
         match self {
             Self::IrDiff => "IR Diff",
             Self::IrPostPass => "IR",
-            Self::CSource => "C",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassTimelineFilter {
+    Changed,
+    Ran,
+}
+
+impl PassTimelineFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Changed => Self::Ran,
+            Self::Ran => Self::Changed,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Changed => "Changed",
+            Self::Ran => "Ran",
         }
     }
 }
@@ -208,18 +227,21 @@ pub struct AppState {
     pub page: AppPage,
     pub selected_stage: AnalysisStage,
     pub selected_pass_by_stage: HashMap<AnalysisStage, usize>,
+    pub pass_timeline_filter: PassTimelineFilter,
     pub job_state: JobState,
     pub status_message: String,
     pub list_focus: ListFocus,
     pub list_source_scroll: u16,
     pub detail_focus: DetailFocus,
     pub code_view_mode: CodeViewMode,
-    last_ir_code_view_mode: CodeViewMode,
     pub ir_scroll: u16,
     pub ir_diff_selected_line: usize,
     pub ir_post_selected_line: usize,
+    pub pass_info_scroll: u16,
     pub source_detail_scroll: u16,
     pub detail_code_viewport_lines: u16,
+    pub pass_info_modal_open: bool,
+    pub c_source_popup_open: bool,
     pub side_by_side_diff_open: bool,
     pub side_by_side_diff_scroll: u16,
     pub function_modal_open: bool,
@@ -243,20 +265,23 @@ impl AppState {
             config_selected_row: 0,
             config_editing_text: false,
             page: AppPage::BenchmarkList,
-            selected_stage: AnalysisStage::Initial,
+            selected_stage: AnalysisStage::Loop,
             selected_pass_by_stage: HashMap::new(),
+            pass_timeline_filter: PassTimelineFilter::Changed,
             job_state: JobState::Idle,
             status_message: String::from("Ready"),
             list_focus: ListFocus::Benchmarks,
             list_source_scroll: 0,
             detail_focus: DetailFocus::Selector,
             code_view_mode: CodeViewMode::IrDiff,
-            last_ir_code_view_mode: CodeViewMode::IrDiff,
             ir_scroll: 0,
             ir_diff_selected_line: 0,
             ir_post_selected_line: 0,
+            pass_info_scroll: 0,
             source_detail_scroll: 0,
             detail_code_viewport_lines: 1,
+            pass_info_modal_open: false,
+            c_source_popup_open: false,
             side_by_side_diff_open: false,
             side_by_side_diff_scroll: 0,
             function_modal_open: false,
@@ -620,7 +645,10 @@ impl AppState {
         self.page = AppPage::BenchmarkDetail;
         self.detail_focus = DetailFocus::Selector;
         self.code_view_mode = CodeViewMode::IrDiff;
-        self.last_ir_code_view_mode = CodeViewMode::IrDiff;
+        self.pass_timeline_filter = PassTimelineFilter::Changed;
+        self.pass_info_scroll = 0;
+        self.pass_info_modal_open = false;
+        self.c_source_popup_open = false;
         self.side_by_side_diff_open = false;
         self.side_by_side_diff_scroll = 0;
         self.ensure_valid_pass_selection_for_active_session();
@@ -628,6 +656,8 @@ impl AppState {
     }
 
     pub fn back_to_benchmark_list(&mut self) {
+        self.pass_info_modal_open = false;
+        self.c_source_popup_open = false;
         self.side_by_side_diff_open = false;
         self.side_by_side_diff_scroll = 0;
         self.page = AppPage::BenchmarkList;
@@ -726,7 +756,6 @@ impl AppState {
         match self.code_view_mode {
             CodeViewMode::IrDiff => self.ir_diff_selected_line,
             CodeViewMode::IrPostPass => self.ir_post_selected_line,
-            CodeViewMode::CSource => 0,
         }
     }
 
@@ -758,7 +787,6 @@ impl AppState {
                 .iter()
                 .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
                 .count(),
-            CodeViewMode::CSource => 0,
         }
     }
 
@@ -774,7 +802,6 @@ impl AppState {
                 .iter()
                 .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
                 .nth(idx),
-            CodeViewMode::CSource => None,
         }
     }
 
@@ -797,12 +824,12 @@ impl AppState {
                 .filter(|line| !matches!(line.tag, similar::ChangeTag::Delete))
                 .position(|line| !line.is_source_annotation)
                 .unwrap_or(0),
-            CodeViewMode::CSource => 0,
         }
     }
 
     fn reset_ir_navigation(&mut self) {
         self.ir_scroll = 0;
+        self.pass_info_scroll = 0;
         self.source_detail_scroll = 0;
         self.ir_diff_selected_line = self.first_selectable_ir_index_for_mode(CodeViewMode::IrDiff);
         self.ir_post_selected_line =
@@ -811,17 +838,12 @@ impl AppState {
     }
 
     fn normalize_ir_cursor(&mut self) {
-        if self.code_view_mode == CodeViewMode::CSource {
-            return;
-        }
-
         let line_count = self.visible_ir_line_count();
         if line_count == 0 {
             self.ir_scroll = 0;
             match self.code_view_mode {
                 CodeViewMode::IrDiff => self.ir_diff_selected_line = 0,
                 CodeViewMode::IrPostPass => self.ir_post_selected_line = 0,
-                CodeViewMode::CSource => {}
             }
             return;
         }
@@ -834,17 +856,12 @@ impl AppState {
             CodeViewMode::IrPostPass => {
                 self.ir_post_selected_line = self.ir_post_selected_line.min(max_idx)
             }
-            CodeViewMode::CSource => {}
         }
         self.ir_scroll = self.ir_scroll.min(max_idx.min(u16::MAX as usize) as u16);
         self.ensure_selected_ir_line_visible();
     }
 
     fn ensure_selected_ir_line_visible(&mut self) {
-        if self.code_view_mode == CodeViewMode::CSource {
-            return;
-        }
-
         let selected = self.selected_ir_visible_index();
         let viewport = self.detail_code_viewport_lines.max(1) as usize;
         let scroll = self.ir_scroll as usize;
@@ -866,7 +883,6 @@ impl AppState {
             CodeViewMode::IrPostPass => {
                 self.ir_post_selected_line = self.ir_post_selected_line.saturating_sub(1)
             }
-            CodeViewMode::CSource => return,
         }
         self.ensure_selected_ir_line_visible();
     }
@@ -880,36 +896,44 @@ impl AppState {
             CodeViewMode::IrPostPass => {
                 self.ir_post_selected_line = (self.ir_post_selected_line + 1).min(max_idx)
             }
-            CodeViewMode::CSource => return,
         }
         self.ensure_selected_ir_line_visible();
     }
 
     // --- Stage/Pass navigation ---
 
-    /// Returns stages (sorted by pipeline_order) that have at least one pass, with their counts.
-    pub fn ordered_stages_with_counts(session: &RunSession) -> Vec<(AnalysisStage, usize)> {
+    pub fn ordered_stages_with_counts(
+        session: &RunSession,
+        filter: PassTimelineFilter,
+    ) -> Vec<(AnalysisStage, usize)> {
         let mut counts: HashMap<AnalysisStage, usize> = HashMap::new();
-        for step in &session.analysis_steps {
-            *counts.entry(step.stage).or_insert(0) += 1;
+        for entry in &session.pass_trace {
+            if filter == PassTimelineFilter::Changed && !entry.status.changed() {
+                continue;
+            }
+            *counts.entry(entry.stage).or_insert(0) += 1;
         }
         let mut result: Vec<(AnalysisStage, usize)> = counts.into_iter().collect();
         result.sort_by_key(|(stage, _)| stage.pipeline_order());
         result
     }
 
-    /// Returns passes for the given stage in order.
-    pub fn passes_for_stage(session: &RunSession, stage: AnalysisStage) -> Vec<&AnalysisStep> {
+    pub fn pass_trace_for_stage(
+        session: &RunSession,
+        stage: AnalysisStage,
+        filter: PassTimelineFilter,
+    ) -> Vec<&PassTraceEntry> {
         session
-            .analysis_steps
+            .pass_trace
             .iter()
-            .filter(|s| s.stage == stage)
+            .filter(|entry| entry.stage == stage)
+            .filter(|entry| filter != PassTimelineFilter::Changed || entry.status.changed())
             .collect()
     }
 
-    /// Returns the selected pass index within the current stage, clamped to valid range.
     pub fn selected_pass_index_in_stage(&self, session: &RunSession) -> usize {
-        let passes = Self::passes_for_stage(session, self.selected_stage);
+        let passes =
+            Self::pass_trace_for_stage(session, self.selected_stage, self.pass_timeline_filter);
         if passes.is_empty() {
             return 0;
         }
@@ -921,9 +945,12 @@ impl AppState {
         stored.min(passes.len() - 1)
     }
 
-    /// Returns a reference to the currently selected pass, or None if no passes exist.
-    pub fn selected_step_in_stage<'a>(&self, session: &'a RunSession) -> Option<&'a AnalysisStep> {
-        let passes = Self::passes_for_stage(session, self.selected_stage);
+    pub fn selected_trace_entry_in_stage<'a>(
+        &self,
+        session: &'a RunSession,
+    ) -> Option<&'a PassTraceEntry> {
+        let passes =
+            Self::pass_trace_for_stage(session, self.selected_stage, self.pass_timeline_filter);
         if passes.is_empty() {
             return None;
         }
@@ -931,10 +958,19 @@ impl AppState {
         passes.into_iter().nth(idx)
     }
 
-    pub fn ordered_pass_positions(session: &RunSession) -> Vec<(AnalysisStage, usize)> {
+    pub fn selected_step_in_stage<'a>(&self, session: &'a RunSession) -> Option<&'a AnalysisStep> {
+        let entry = self.selected_trace_entry_in_stage(session)?;
+        let step_idx = entry.analysis_step_index?;
+        session.analysis_steps.get(step_idx)
+    }
+
+    pub fn ordered_pass_positions(
+        session: &RunSession,
+        filter: PassTimelineFilter,
+    ) -> Vec<(AnalysisStage, usize)> {
         let mut positions = Vec::new();
-        for (stage, _) in Self::ordered_stages_with_counts(session) {
-            let count = Self::passes_for_stage(session, stage).len();
+        for (stage, _) in Self::ordered_stages_with_counts(session, filter) {
+            let count = Self::pass_trace_for_stage(session, stage, filter).len();
             for pass_idx in 0..count {
                 positions.push((stage, pass_idx));
             }
@@ -945,7 +981,7 @@ impl AppState {
     fn ensure_valid_pass_selection_for_active_session(&mut self) {
         let Some(positions) = self
             .active_session_for_selected_benchmark()
-            .map(Self::ordered_pass_positions)
+            .map(|session| Self::ordered_pass_positions(session, self.pass_timeline_filter))
         else {
             return;
         };
@@ -970,7 +1006,7 @@ impl AppState {
     }
 
     fn selected_global_pass_position(&self, session: &RunSession) -> Option<usize> {
-        let positions = Self::ordered_pass_positions(session);
+        let positions = Self::ordered_pass_positions(session, self.pass_timeline_filter);
         if positions.is_empty() {
             return None;
         }
@@ -996,6 +1032,14 @@ impl AppState {
         self.side_by_side_diff_open
     }
 
+    pub fn is_pass_info_modal_open(&self) -> bool {
+        self.pass_info_modal_open
+    }
+
+    pub fn is_c_source_popup_open(&self) -> bool {
+        self.c_source_popup_open
+    }
+
     pub fn toggle_side_by_side_diff(&mut self) {
         if self.side_by_side_diff_open {
             self.close_side_by_side_diff();
@@ -1017,6 +1061,8 @@ impl AppState {
             return;
         }
 
+        self.pass_info_modal_open = false;
+        self.c_source_popup_open = false;
         self.side_by_side_diff_open = true;
         self.side_by_side_diff_scroll = 0;
         self.status_message = String::from("Side-by-side diff opened");
@@ -1048,38 +1094,61 @@ impl AppState {
     }
 
     pub fn rotate_code_view_mode_next(&mut self) {
-        self.code_view_mode = if self.code_view_mode == CodeViewMode::CSource {
-            self.last_ir_code_view_mode
-        } else {
-            self.code_view_mode.cycle_next()
-        };
-        self.last_ir_code_view_mode = self.code_view_mode;
+        self.code_view_mode = self.code_view_mode.cycle_next();
         self.reset_ir_navigation();
     }
 
     pub fn rotate_code_view_mode_prev(&mut self) {
-        self.code_view_mode = if self.code_view_mode == CodeViewMode::CSource {
-            self.last_ir_code_view_mode
-        } else {
-            self.code_view_mode.cycle_prev()
-        };
-        self.last_ir_code_view_mode = self.code_view_mode;
+        self.code_view_mode = self.code_view_mode.cycle_prev();
         self.reset_ir_navigation();
     }
 
-    pub fn show_c_source_mode(&mut self) {
-        if self.code_view_mode != CodeViewMode::CSource {
-            self.last_ir_code_view_mode = self.code_view_mode;
+    pub fn open_pass_info_modal(&mut self) {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            self.status_message = String::from("Analysis results are required for pass info");
+            return;
+        };
+        if self.selected_trace_entry_in_stage(session).is_none() {
+            self.status_message = String::from("Select a pass to inspect");
+            return;
         }
-        self.code_view_mode = CodeViewMode::CSource;
+        self.close_side_by_side_diff();
+        self.c_source_popup_open = false;
+        self.pass_info_modal_open = true;
+        self.pass_info_scroll = 0;
+        self.status_message = String::from("Pass info opened");
+    }
+
+    pub fn close_pass_info_modal(&mut self) {
+        self.pass_info_modal_open = false;
+        self.pass_info_scroll = 0;
+        self.status_message = String::from("Pass info closed");
+    }
+
+    pub fn cycle_pass_timeline_filter(&mut self) {
+        self.pass_timeline_filter = self.pass_timeline_filter.next();
+        self.ensure_valid_pass_selection_for_active_session();
         self.reset_ir_navigation();
+        self.status_message = format!("Pass Timeline: {}", self.pass_timeline_filter.label());
+    }
+
+    pub fn open_c_source_popup(&mut self) {
+        self.pass_info_modal_open = false;
+        self.close_side_by_side_diff();
+        self.c_source_popup_open = true;
+        self.status_message = String::from("C source popup opened");
+    }
+
+    pub fn close_c_source_popup(&mut self) {
+        self.c_source_popup_open = false;
+        self.status_message = String::from("C source popup closed");
     }
 
     pub fn select_prev_pass(&mut self) {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return;
         };
-        let ordered = Self::ordered_pass_positions(session);
+        let ordered = Self::ordered_pass_positions(session, self.pass_timeline_filter);
         if ordered.is_empty() {
             return;
         }
@@ -1095,7 +1164,7 @@ impl AppState {
         let Some(session) = self.active_session_for_selected_benchmark() else {
             return;
         };
-        let ordered = Self::ordered_pass_positions(session);
+        let ordered = Self::ordered_pass_positions(session, self.pass_timeline_filter);
         if ordered.is_empty() {
             return;
         }
@@ -1108,36 +1177,43 @@ impl AppState {
     }
 
     pub fn detail_move_up(&mut self) {
+        if self.pass_info_modal_open {
+            self.pass_info_scroll = self.pass_info_scroll.saturating_sub(1);
+            return;
+        }
+        if self.c_source_popup_open {
+            self.scroll_source_detail_up();
+            return;
+        }
         if self.side_by_side_diff_open {
             self.side_by_side_diff_scroll_up();
             return;
         }
         match self.detail_focus {
             DetailFocus::Selector => self.select_prev_pass(),
-            DetailFocus::CodeView => {
-                if self.code_view_mode == CodeViewMode::CSource {
-                    self.scroll_source_detail_up();
-                } else {
-                    self.move_ir_cursor_up();
-                }
-            }
+            DetailFocus::CodeView => self.move_ir_cursor_up(),
         }
     }
 
     pub fn detail_move_down(&mut self) {
+        if self.pass_info_modal_open {
+            self.pass_info_scroll = self
+                .pass_info_scroll
+                .saturating_add(1)
+                .min(self.max_pass_info_scroll());
+            return;
+        }
+        if self.c_source_popup_open {
+            self.scroll_source_detail_down();
+            return;
+        }
         if self.side_by_side_diff_open {
             self.side_by_side_diff_scroll_down();
             return;
         }
         match self.detail_focus {
             DetailFocus::Selector => self.select_next_pass(),
-            DetailFocus::CodeView => {
-                if self.code_view_mode == CodeViewMode::CSource {
-                    self.scroll_source_detail_down();
-                } else {
-                    self.move_ir_cursor_down();
-                }
-            }
+            DetailFocus::CodeView => self.move_ir_cursor_down(),
         }
     }
 
@@ -1151,10 +1227,12 @@ impl AppState {
         let session = self
             .active_session_for_selected_benchmark()
             .ok_or_else(|| String::from("no active session for selected function"))?;
-        let step = self
-            .selected_step_in_stage(session)
-            .ok_or_else(|| String::from("no selected analysis pass"))?;
-        let passes = Self::passes_for_stage(session, self.selected_stage);
+        let trace_entry = self
+            .selected_trace_entry_in_stage(session)
+            .ok_or_else(|| String::from("no selected pass"))?;
+        let step = self.selected_step_in_stage(session);
+        let passes =
+            Self::pass_trace_for_stage(session, self.selected_stage, self.pass_timeline_filter);
         let selected_pass_index = self.selected_pass_index_in_stage(session) + 1;
         let source_text = self
             .detail_source_text_for_selected_benchmark()
@@ -1166,6 +1244,7 @@ impl AppState {
             selected_stage: self.selected_stage,
             detail_focus_label: self.detail_focus.label(),
             step,
+            trace_entry,
             selected_pass_index,
             passes_len: passes.len(),
             source_text: &source_text,
@@ -1187,6 +1266,19 @@ impl AppState {
         };
         let max = source.lines().count().saturating_sub(1);
         max.min(u16::MAX as usize) as u16
+    }
+
+    fn max_pass_info_scroll(&self) -> u16 {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return 0;
+        };
+        let Some(entry) = self.selected_trace_entry_in_stage(session) else {
+            return 0;
+        };
+        let mut line_count = 10usize;
+        line_count += entry.remark_indices.len();
+        line_count += entry.log_lines.len();
+        line_count.saturating_sub(1).min(u16::MAX as usize) as u16
     }
 
     fn max_side_by_side_diff_scroll(&self) -> u16 {
@@ -1305,9 +1397,14 @@ impl AppState {
         session.remarks.clear();
         session.remarks_summary = RemarksSummary::default();
         session.analysis_steps.clear();
+        session.pass_trace.clear();
         session.analysis_state = AnalysisState::Running;
         self.sessions_by_key.insert(key, session);
 
+        self.pass_info_modal_open = false;
+        self.c_source_popup_open = false;
+        self.side_by_side_diff_open = false;
+        self.side_by_side_diff_scroll = 0;
         self.reset_ir_navigation();
         self.status_message = format!(
             "{kind} started for {benchmark} [{}] ({})",
@@ -1382,10 +1479,12 @@ impl AppState {
                         match data {
                             JobOutcomeData::Analysis {
                                 analysis_steps,
+                                pass_trace,
                                 remarks,
                                 remarks_summary,
                             } => {
                                 session.analysis_steps = analysis_steps;
+                                session.pass_trace = pass_trace;
                                 session.remarks = remarks;
                                 session.remarks_summary = remarks_summary;
                                 session.analysis_state = AnalysisState::Ready;
@@ -1446,7 +1545,8 @@ fn bool_text(v: bool) -> String {
 mod tests {
     use super::*;
     use crate::core::model::{
-        AnalysisSource, AnalysisStage, AnalysisState, AnalysisStep, IrLine, RemarkKind,
+        AnalysisSource, AnalysisStage, AnalysisState, AnalysisStep, IrLine, PassTraceEntry,
+        PassTraceStatus, RemarkKind,
     };
     use similar::ChangeTag;
 
@@ -1494,6 +1594,26 @@ mod tests {
         }
     }
 
+    fn make_trace_entry(
+        step: &AnalysisStep,
+        remark_indices: Vec<usize>,
+        status: PassTraceStatus,
+    ) -> PassTraceEntry {
+        PassTraceEntry {
+            order_index: step.raw_index,
+            pass: step.pass.clone(),
+            pass_key: step.pass_key.clone(),
+            pass_occurrence: step.pass_occurrence,
+            stage: step.stage,
+            target_raw: step.target_raw.clone(),
+            target_function: step.target_function.clone(),
+            status,
+            analysis_step_index: status.changed().then_some(0),
+            remark_indices,
+            log_lines: vec![format!("log for {}", step.pass_key)],
+        }
+    }
+
     fn attach_ready_session(app: &mut AppState, step: AnalysisStep, remarks: Vec<RemarkEntry>) {
         let benchmark = app
             .selected_benchmark()
@@ -1514,7 +1634,12 @@ mod tests {
             FunctionRunMode::OutputFilter,
         );
         session.analysis_state = AnalysisState::Ready;
-        session.analysis_steps = vec![step];
+        session.analysis_steps = vec![step.clone()];
+        session.pass_trace = vec![make_trace_entry(
+            &step,
+            step.remark_indices.clone(),
+            PassTraceStatus::Changed,
+        )];
         session.remarks = remarks.clone();
         session.remarks_summary = RemarksSummary::from_entries(&remarks);
         session.status = SessionStatus::Succeeded;
@@ -1830,6 +1955,7 @@ int s161(void) {
             function: Some(function.symbol.clone()),
             message: Some(String::from("ok")),
         }];
+        let step = make_step(AnalysisStage::Loop, "licm", 0);
         JobOutcome {
             kind: JobKind::AnalyzeFast,
             benchmark: benchmark_name.to_string(),
@@ -1837,7 +1963,8 @@ int s161(void) {
             selected_function: function,
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
-                analysis_steps: vec![make_step(AnalysisStage::Loop, "licm", 0)],
+                analysis_steps: vec![step.clone()],
+                pass_trace: vec![make_trace_entry(&step, vec![0], PassTraceStatus::Changed)],
                 remarks_summary: RemarksSummary::from_entries(&remarks),
                 remarks,
             },
@@ -1858,6 +1985,8 @@ int s161(void) {
             function: Some(function.symbol.clone()),
             message: Some(String::from("vectorized loop (VF = 4)")),
         }];
+        let loop_step = make_step(AnalysisStage::Loop, "licm", 0);
+        let vector_step = make_step(AnalysisStage::Vectorize, "loop-vectorize", 1);
         JobOutcome {
             kind: JobKind::AnalyzeFast,
             benchmark: benchmark_name.to_string(),
@@ -1865,9 +1994,13 @@ int s161(void) {
             selected_function: function,
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
-                analysis_steps: vec![
-                    make_step(AnalysisStage::Loop, "licm", 0),
-                    make_step(AnalysisStage::Vectorize, "loop-vectorize", 1),
+                analysis_steps: vec![loop_step.clone(), vector_step.clone()],
+                pass_trace: vec![
+                    make_trace_entry(&loop_step, vec![], PassTraceStatus::Changed),
+                    PassTraceEntry {
+                        analysis_step_index: Some(1),
+                        ..make_trace_entry(&vector_step, vec![0], PassTraceStatus::Changed)
+                    },
                 ],
                 remarks_summary: RemarksSummary::from_entries(&remarks),
                 remarks,
@@ -2037,6 +2170,7 @@ int s161(void) {
         let remarks: Vec<RemarkEntry> = vec![];
         let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
         step.changed_lines = 10;
+        let pass_trace = vec![make_trace_entry(&step, vec![], PassTraceStatus::Changed)];
 
         app.handle_job_event(JobEvent::Started {
             kind: JobKind::AnalyzeFast,
@@ -2053,6 +2187,7 @@ int s161(void) {
             run_mode: FunctionRunMode::OutputFilter,
             data: JobOutcomeData::Analysis {
                 analysis_steps: vec![step],
+                pass_trace,
                 remarks: remarks.clone(),
                 remarks_summary: RemarksSummary::from_entries(&remarks),
             },
@@ -2202,7 +2337,7 @@ int s161(void) {
     }
 
     #[test]
-    fn c_source_mode_keeps_existing_scroll_behavior() {
+    fn c_source_popup_keeps_existing_scroll_behavior() {
         let source = r#"
 int s161(void) {
     int a = 0;
@@ -2217,8 +2352,7 @@ int s161(void) {
         );
         app.open_function_select_modal();
         app.confirm_function_selection();
-        app.detail_focus = DetailFocus::CodeView;
-        app.code_view_mode = CodeViewMode::CSource;
+        app.open_c_source_popup();
 
         app.detail_move_down();
         app.detail_move_down();
@@ -2229,7 +2363,7 @@ int s161(void) {
     }
 
     #[test]
-    fn tab_only_toggles_between_ir_diff_and_ir_modes() {
+    fn tab_cycles_between_ir_diff_and_ir_only() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         app.open_function_select_modal();
@@ -2248,7 +2382,7 @@ int s161(void) {
     }
 
     #[test]
-    fn c_source_mode_returns_to_last_ir_mode_on_tab() {
+    fn c_source_popup_does_not_change_inspector_tab() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         app.open_function_select_modal();
@@ -2257,27 +2391,47 @@ int s161(void) {
         app.rotate_code_view_mode_next();
         assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
 
-        app.show_c_source_mode();
-        assert_eq!(app.code_view_mode, CodeViewMode::CSource);
+        app.open_c_source_popup();
+        assert!(app.is_c_source_popup_open());
+        assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
 
-        app.rotate_code_view_mode_next();
+        app.close_c_source_popup();
+        assert!(!app.is_c_source_popup_open());
         assert_eq!(app.code_view_mode, CodeViewMode::IrPostPass);
     }
 
     #[test]
-    fn c_source_mode_returns_to_ir_diff_on_tab_when_it_was_last_seen() {
+    fn pass_info_modal_opens_from_selected_pass_and_closes_other_popups() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+        let step = make_step(AnalysisStage::Loop, "licm", 0);
+        attach_ready_session(&mut app, step, vec![]);
+
+        app.open_c_source_popup();
+        assert!(app.is_c_source_popup_open());
+
+        app.open_pass_info_modal();
+
+        assert!(app.is_pass_info_modal_open());
+        assert!(!app.is_c_source_popup_open());
+    }
+
+    #[test]
+    fn pass_timeline_filter_cycles_between_changed_and_ran() {
         let mut app =
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         app.open_function_select_modal();
         app.confirm_function_selection();
 
-        assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
+        assert_eq!(app.pass_timeline_filter, PassTimelineFilter::Changed);
 
-        app.show_c_source_mode();
-        assert_eq!(app.code_view_mode, CodeViewMode::CSource);
+        app.cycle_pass_timeline_filter();
+        assert_eq!(app.pass_timeline_filter, PassTimelineFilter::Ran);
 
-        app.rotate_code_view_mode_next();
-        assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
+        app.cycle_pass_timeline_filter();
+        assert_eq!(app.pass_timeline_filter, PassTimelineFilter::Changed);
     }
 
     #[test]

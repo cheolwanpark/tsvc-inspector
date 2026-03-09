@@ -6,9 +6,12 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::core::model::{
     AnalysisSource, AnalysisStage, AnalysisStep, DbgLocation, IrAttribute, IrAttributeOrigin,
-    IrAttributeScope, IrLine, IrLineDetails, RemarkEntry,
+    IrAttributeScope, IrLine, IrLineDetails, PassTraceEntry, PassTraceStatus, RemarkEntry,
 };
-use crate::data::parser::{normalize_pass_key, parse_dbg_locations, parse_ir_snapshots_from_trace};
+use crate::data::parser::{
+    normalize_pass_key, parse_bisect_pass_records, parse_dbg_locations,
+    parse_ir_snapshots_from_trace, parse_trace_pass_records,
+};
 
 const MAX_DIFF_LINES: usize = 8000;
 type AttributeGroupMap = HashMap<u32, Vec<String>>;
@@ -27,6 +30,141 @@ pub fn build_fast_analysis_steps(
         AnalysisSource::TraceFast,
         source_file_content,
     )
+}
+
+pub fn build_pass_trace(
+    build_trace: &str,
+    selected_function_symbol: &str,
+    analysis_steps: &[AnalysisStep],
+    remarks: &[RemarkEntry],
+) -> Vec<PassTraceEntry> {
+    let selected_symbol = selected_function_symbol.trim();
+    let mut out = Vec::<PassTraceEntry>::new();
+    let mut entry_by_key = HashMap::<(String, usize), usize>::new();
+
+    for record in parse_bisect_pass_records(build_trace) {
+        if !should_include_trace_target(&record.target, selected_symbol) {
+            continue;
+        }
+        let pass_key = normalize_pass_key(&record.pass);
+        let key = (pass_key.clone(), record.pass_occurrence);
+        let idx = match entry_by_key.get(&key).copied() {
+            Some(idx) => idx,
+            None => {
+                let idx = out.len();
+                out.push(PassTraceEntry {
+                    order_index: record.order_index,
+                    pass: record.pass.clone(),
+                    pass_key: pass_key.clone(),
+                    pass_occurrence: record.pass_occurrence,
+                    stage: classify_analysis_stage(
+                        record.order_index,
+                        &record.pass,
+                        &record.target,
+                    ),
+                    target_raw: record.target.clone(),
+                    target_function: target_function_from_label(&record.target),
+                    status: PassTraceStatus::RanNoChange,
+                    analysis_step_index: None,
+                    remark_indices: collect_analysis_remark_indices(
+                        &record.pass,
+                        target_function_from_label(&record.target).as_deref(),
+                        remarks,
+                    ),
+                    log_lines: vec![],
+                });
+                entry_by_key.insert(key, idx);
+                idx
+            }
+        };
+        push_unique_line(&mut out[idx].log_lines, record.log_line);
+    }
+
+    for record in parse_trace_pass_records(build_trace) {
+        if !should_include_trace_target(&record.target, selected_symbol) {
+            continue;
+        }
+        let pass_key = normalize_pass_key(&record.pass);
+        let target_function = target_function_from_label(&record.target);
+        let key = (pass_key.clone(), record.pass_occurrence);
+        let idx = match entry_by_key.get(&key).copied() {
+            Some(idx) => idx,
+            None => {
+                let idx = out.len();
+                out.push(PassTraceEntry {
+                    order_index: record.raw_index,
+                    pass: record.pass.clone(),
+                    pass_key: pass_key.clone(),
+                    pass_occurrence: record.pass_occurrence,
+                    stage: classify_analysis_stage(record.raw_index, &record.pass, &record.target),
+                    target_raw: record.target.clone(),
+                    target_function: target_function.clone(),
+                    status: if record.changed {
+                        PassTraceStatus::Changed
+                    } else {
+                        PassTraceStatus::RanNoChange
+                    },
+                    analysis_step_index: None,
+                    remark_indices: collect_analysis_remark_indices(
+                        &record.pass,
+                        target_function.as_deref(),
+                        remarks,
+                    ),
+                    log_lines: vec![],
+                });
+                entry_by_key.insert(key, idx);
+                idx
+            }
+        };
+        let entry = &mut out[idx];
+        entry.order_index = entry.order_index.min(record.raw_index);
+        entry.target_raw = record.target.clone();
+        entry.target_function = target_function;
+        if record.changed {
+            entry.status = PassTraceStatus::Changed;
+        }
+        push_unique_line(&mut entry.log_lines, record.log_line);
+    }
+
+    for (step_idx, step) in analysis_steps.iter().enumerate() {
+        if step.raw_index == 0 {
+            continue;
+        }
+        let key = (step.pass_key.clone(), step.pass_occurrence);
+        let idx = match entry_by_key.get(&key).copied() {
+            Some(idx) => idx,
+            None => {
+                let idx = out.len();
+                out.push(PassTraceEntry {
+                    order_index: step.raw_index,
+                    pass: step.pass.clone(),
+                    pass_key: step.pass_key.clone(),
+                    pass_occurrence: step.pass_occurrence,
+                    stage: step.stage,
+                    target_raw: step.target_raw.clone(),
+                    target_function: step.target_function.clone(),
+                    status: PassTraceStatus::Changed,
+                    analysis_step_index: Some(step_idx),
+                    remark_indices: step.remark_indices.clone(),
+                    log_lines: vec![],
+                });
+                entry_by_key.insert(key, idx);
+                idx
+            }
+        };
+        let entry = &mut out[idx];
+        entry.order_index = entry.order_index.min(step.raw_index);
+        entry.pass = step.pass.clone();
+        entry.stage = step.stage;
+        entry.target_raw = step.target_raw.clone();
+        entry.target_function = step.target_function.clone();
+        entry.status = PassTraceStatus::Changed;
+        entry.analysis_step_index = Some(step_idx);
+        entry.remark_indices = step.remark_indices.clone();
+    }
+
+    out.sort_by_key(|entry| entry.order_index);
+    out
 }
 
 pub fn annotate_ir_lines(
@@ -725,6 +863,32 @@ fn collect_analysis_remark_indices(
     matching.into_iter().map(|(idx, _)| idx).collect()
 }
 
+fn should_include_trace_target(target: &str, selected_function_symbol: &str) -> bool {
+    if selected_function_symbol.is_empty() {
+        return true;
+    }
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.eq_ignore_ascii_case("[module]") {
+        return true;
+    }
+    if trimmed.to_ascii_lowercase().contains("filtered out") {
+        return false;
+    }
+    match target_function_from_label(target) {
+        Some(function) => function.eq_ignore_ascii_case(selected_function_symbol),
+        None => false,
+    }
+}
+
+fn push_unique_line(lines: &mut Vec<String>, line: String) {
+    if !lines.iter().any(|existing| existing == &line) {
+        lines.push(line);
+    }
+}
+
 fn classify_analysis_stage(raw_index: usize, pass: &str, target: &str) -> AnalysisStage {
     if raw_index == 0 {
         return AnalysisStage::Initial;
@@ -958,6 +1122,80 @@ entry:
         assert_eq!(steps[0].stage, AnalysisStage::Initial);
         assert_eq!(steps[1].stage, AnalysisStage::Vectorize);
         assert!(steps[1].changed_lines > 0);
+    }
+
+    #[test]
+    fn build_pass_trace_merges_changed_and_ran_no_change_entries() {
+        let trace = r#"
+BISECT: running pass (1) loop-vectorize on foo
+BISECT: running pass (2) sroa on foo
+*** IR Dump At Start ***
+define i32 @foo() !dbg !14 {
+entry:
+  %0 = add i32 1, 2, !dbg !9
+  ret i32 %0, !dbg !10
+}
+!9 = !DILocation(line: 10, column: 3, scope: !14)
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1)
+*** IR Dump After LoopVectorizePass on foo ***
+define i32 @foo() !dbg !14 {
+entry:
+  %0 = add i32 1, 4, !dbg !9
+  ret i32 %0, !dbg !10
+}
+!9 = !DILocation(line: 10, column: 3, scope: !14)
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1)
+*** IR Dump After SROAPass on foo omitted because no change ***
+"#;
+
+        let remarks = vec![RemarkEntry {
+            kind: RemarkKind::Passed,
+            pass: "loop-vectorize".to_string(),
+            name: "Vectorized".to_string(),
+            file: None,
+            line: None,
+            function: Some("foo".to_string()),
+            message: Some("vectorized loop".to_string()),
+        }];
+        let steps = build_fast_analysis_steps(trace, "foo", &remarks, Some("line10\nline11\n"));
+        let timeline = build_pass_trace(trace, "foo", &steps, &remarks);
+
+        assert_eq!(timeline.len(), 2);
+        assert!(timeline[0].status.changed());
+        assert!(!timeline[1].status.changed());
+        assert_eq!(timeline[0].analysis_step_index, Some(1));
+        assert_eq!(timeline[1].analysis_step_index, None);
+        assert_eq!(timeline[0].remark_indices, vec![0]);
+    }
+
+    #[test]
+    fn build_pass_trace_filters_out_other_function_targets_marked_filtered_out() {
+        let trace = r#"
+BISECT: running pass (84) loop-simplify on min
+*** IR Dump After LoopSimplifyPass on min filtered out ***
+*** IR Dump At Start ***
+define i32 @foo() !dbg !14 {
+entry:
+  ret i32 0, !dbg !10
+}
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1)
+*** IR Dump After LICMPass on foo ***
+define i32 @foo() !dbg !14 {
+entry:
+  ret i32 1, !dbg !10
+}
+!10 = !DILocation(line: 11, column: 3, scope: !14)
+!14 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1)
+"#;
+
+        let steps = build_fast_analysis_steps(trace, "foo", &[], Some("line11\n"));
+        let timeline = build_pass_trace(trace, "foo", &steps, &[]);
+
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].pass_key, "licm");
     }
 
     #[test]

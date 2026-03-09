@@ -16,6 +16,25 @@ pub struct IrSnapshot {
     pub snapshot: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct TracePassRecord {
+    pub raw_index: usize,
+    pub pass: String,
+    pub pass_occurrence: usize,
+    pub target: String,
+    pub changed: bool,
+    pub log_line: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BisectPassRecord {
+    pub order_index: usize,
+    pub pass: String,
+    pub pass_occurrence: usize,
+    pub target: String,
+    pub log_line: String,
+}
+
 pub fn parse_opt_remarks(path: &Path) -> AppResult<Vec<RemarkEntry>> {
     let content = fs::read_to_string(path)?;
     parse_opt_remarks_from_str(&content)
@@ -41,8 +60,6 @@ pub fn parse_opt_remarks_from_str(content: &str) -> AppResult<Vec<RemarkEntry>> 
     }
 
     let file_line_re = Regex::new(r"File:\s*'([^']+)'.*Line:\s*([0-9]+)")?;
-    let message_re = Regex::new(r"String:\s*(.+)$")?;
-
     let mut entries = Vec::new();
     for block in blocks {
         let lines = block.lines().collect::<Vec<_>>();
@@ -57,6 +74,8 @@ pub fn parse_opt_remarks_from_str(content: &str) -> AppResult<Vec<RemarkEntry>> 
         let mut line: Option<u32> = None;
         let mut function: Option<String> = None;
         let mut message: Option<String> = None;
+        let mut args_started = false;
+        let mut arg_parts = Vec::new();
 
         for raw_line in &lines {
             let l = raw_line.trim();
@@ -79,18 +98,16 @@ pub fn parse_opt_remarks_from_str(content: &str) -> AppResult<Vec<RemarkEntry>> 
                 line = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
                 continue;
             }
-            if message.is_none()
-                && let Some(caps) = message_re.captures(l)
-            {
-                let mut text = caps
-                    .get(1)
-                    .map(|m| m.as_str().trim().to_string())
-                    .unwrap_or_default();
-                if text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2 {
-                    text = text[1..text.len() - 1].to_string();
-                }
-                message = Some(text);
+            if l == "Args:" {
+                args_started = true;
+                continue;
             }
+            if args_started && let Some(value) = parse_yaml_scalar_value(l) {
+                arg_parts.push(value);
+            }
+        }
+        if !arg_parts.is_empty() {
+            message = Some(arg_parts.join(""));
         }
 
         entries.push(RemarkEntry {
@@ -189,6 +206,91 @@ pub fn parse_ir_snapshots_from_trace(build_trace: &str) -> Vec<IrSnapshot> {
     snapshots
 }
 
+pub fn parse_trace_pass_records(build_trace: &str) -> Vec<TracePassRecord> {
+    let after_re = Regex::new(r"^\*\*\* IR Dump After (.+?) on (.+?) \*\*\*$")
+        .expect("valid ir dump after regex");
+    let no_change_re = Regex::new(r"^\*\*\* IR Dump After .+ omitted because no change \*\*\*$")
+        .expect("valid ir no-change regex");
+
+    let mut raw_after_index = 0usize;
+    let mut pass_occurrence_by_key = HashMap::<String, usize>::new();
+    let mut records = Vec::new();
+
+    for line in build_trace.lines() {
+        let header = line.trim();
+        let Some(caps) = after_re.captures(header) else {
+            continue;
+        };
+
+        raw_after_index = raw_after_index.saturating_add(1);
+        let pass = caps
+            .get(1)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| String::from("(unknown-pass)"));
+        let target = caps
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| String::from("(unknown-target)"));
+        let pass_key = normalize_pass_key(&pass);
+        let pass_occurrence = {
+            let next = pass_occurrence_by_key.get(&pass_key).copied().unwrap_or(0) + 1;
+            pass_occurrence_by_key.insert(pass_key, next);
+            next
+        };
+        records.push(TracePassRecord {
+            raw_index: raw_after_index,
+            pass,
+            pass_occurrence,
+            target,
+            changed: !no_change_re.is_match(header),
+            log_line: header.to_string(),
+        });
+    }
+
+    records
+}
+
+pub fn parse_bisect_pass_records(build_trace: &str) -> Vec<BisectPassRecord> {
+    let bisect_re = Regex::new(r"^BISECT:\s+running pass \((\d+)\)\s+(.+?)\s+on\s+(.+?)\s*$")
+        .expect("valid bisect running regex");
+    let mut pass_occurrence_by_key = HashMap::<String, usize>::new();
+    let mut records = Vec::new();
+
+    for line in build_trace.lines() {
+        let trimmed = line.trim();
+        let Some(caps) = bisect_re.captures(trimmed) else {
+            continue;
+        };
+        let order_index = caps
+            .get(1)
+            .and_then(|m| m.as_str().parse::<usize>().ok())
+            .unwrap_or(0);
+        let pass = caps
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| String::from("(unknown-pass)"));
+        let target = caps
+            .get(3)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_else(|| String::from("(unknown-target)"));
+        let pass_key = normalize_pass_key(&pass);
+        let pass_occurrence = {
+            let next = pass_occurrence_by_key.get(&pass_key).copied().unwrap_or(0) + 1;
+            pass_occurrence_by_key.insert(pass_key, next);
+            next
+        };
+        records.push(BisectPassRecord {
+            order_index,
+            pass,
+            pass_occurrence,
+            target,
+            log_line: trimmed.to_string(),
+        });
+    }
+
+    records
+}
+
 pub fn parse_dbg_locations(module_ir: &str) -> HashMap<u32, DbgLocation> {
     let re =
         Regex::new(r"!(\d+) = !DILocation\(line: (\d+),.*?scope: !(\d+)(?:.*?(inlinedAt))?.*?\)")
@@ -224,6 +326,31 @@ pub fn normalize_pass_key(name: &str) -> String {
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect()
+}
+
+fn parse_yaml_scalar_value(line: &str) -> Option<String> {
+    let content = line
+        .trim_start()
+        .strip_prefix("- ")
+        .unwrap_or(line.trim_start());
+    let (_, raw_value) = content.split_once(':')?;
+    let value = raw_value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(decode_yaml_scalar(value))
+}
+
+fn decode_yaml_scalar(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0] as char;
+        let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
+        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn resolve_scope_names(module_ir: &str) -> HashMap<u32, String> {
@@ -304,6 +431,7 @@ fn parse_kind(header: &str) -> RemarkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::model::RemarkKind;
 
     #[test]
     fn parses_dbg_locations_from_module_ir() {
@@ -319,5 +447,59 @@ mod tests {
             locs.get(&10).and_then(|v| v.inlined_from.as_deref()),
             Some("inner")
         );
+    }
+
+    #[test]
+    fn parses_full_message_from_remark_args() {
+        let yaml = r#"--- !Passed
+Pass:            loop-vectorize
+Name:            Vectorized
+Function:        foo
+Args:
+  - String:          'vectorized '
+  - String:          'loop (vectorization width: '
+  - VectorizationFactor: '4'
+  - String:          ', interleaved count: '
+  - InterleaveCount: '4'
+  - String:          ')'
+..."#;
+
+        let remarks = parse_opt_remarks_from_str(yaml).expect("yaml should parse");
+        assert_eq!(remarks.len(), 1);
+        assert_eq!(remarks[0].kind, RemarkKind::Passed);
+        assert_eq!(
+            remarks[0].message.as_deref(),
+            Some("vectorized loop (vectorization width: 4, interleaved count: 4)")
+        );
+    }
+
+    #[test]
+    fn parses_trace_records_for_changed_and_no_change_passes() {
+        let trace = r#"
+*** IR Dump After LICMPass on loop %L1 in function foo ***
+define void @foo() { ret void }
+*** IR Dump After SROAPass on foo omitted because no change ***
+"#;
+
+        let records = parse_trace_pass_records(trace);
+        assert_eq!(records.len(), 2);
+        assert!(records[0].changed);
+        assert!(!records[1].changed);
+        assert_eq!(records[0].pass_occurrence, 1);
+        assert_eq!(records[1].pass_occurrence, 1);
+    }
+
+    #[test]
+    fn parses_bisect_running_pass_records() {
+        let trace = r#"
+BISECT: running pass (31) loop-vectorize on foo
+BISECT: running pass (32) loop-vectorize on foo
+"#;
+
+        let records = parse_bisect_pass_records(trace);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].order_index, 31);
+        assert_eq!(records[0].pass_occurrence, 1);
+        assert_eq!(records[1].pass_occurrence, 2);
     }
 }
