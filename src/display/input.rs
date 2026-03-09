@@ -13,9 +13,6 @@ pub enum UserAction {
     RotateCodeViewMode,     // Tab
     RotateCodeViewModePrev, // Shift-Tab
     ShowCSource,            // 'c'
-    Run,                    // 'r' → BuildAndRun
-    Analyze,                // 'a' → AnalyzeFast
-    ClearSession,           // 'C'
     CopyDetailToClipboard,  // 'y'
     ToggleSideBySideDiff,   // 'd'
     Backspace,              // Backspace
@@ -25,10 +22,7 @@ pub enum UserAction {
 pub fn map_key_event(key: KeyEvent) -> UserAction {
     match key.code {
         KeyCode::Char('q') => UserAction::Quit,
-        KeyCode::Char('r') => UserAction::Run,
-        KeyCode::Char('a') => UserAction::Analyze,
         KeyCode::Char('c') => UserAction::ShowCSource,
-        KeyCode::Char('C') => UserAction::ClearSession,
         KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
         KeyCode::Char('d') => UserAction::ToggleSideBySideDiff,
         KeyCode::Char(ch) => UserAction::TextChar(ch),
@@ -77,15 +71,9 @@ mod tests {
             UserAction::RotateCodeViewModePrev
         );
 
-        assert_eq!(map_key_event(key(KeyCode::Char('a'))), UserAction::Analyze);
-        assert_eq!(map_key_event(key(KeyCode::Char('r'))), UserAction::Run);
         assert_eq!(
             map_key_event(key(KeyCode::Char('c'))),
             UserAction::ShowCSource
-        );
-        assert_eq!(
-            map_key_event(key(KeyCode::Char('C'))),
-            UserAction::ClearSession
         );
         assert_eq!(
             map_key_event(key(KeyCode::Char('y'))),

@@ -65,7 +65,6 @@ pub struct BenchmarkItem {
     pub name: String,
     pub category: String,
     pub data_type: String,
-    pub run_options: Vec<String>,
     pub available_functions: Vec<BenchmarkFunction>,
     pub source_code: String,
 }
@@ -90,12 +89,6 @@ pub enum OptimizationLevel {
     O3,
     Os,
     Oz,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuildPurpose {
-    Runtime,
-    Analysis,
 }
 
 impl OptimizationLevel {
@@ -310,13 +303,6 @@ impl CompilerConfig {
         flags
     }
 
-    pub fn c_flags_for(&self, purpose: BuildPurpose) -> Vec<String> {
-        match purpose {
-            BuildPurpose::Runtime => self.runtime_c_flags(),
-            BuildPurpose::Analysis => self.analysis_c_flags(),
-        }
-    }
-
     pub fn label(&self) -> String {
         format!(
             "{} lv:{} slp:{} fm:{}",
@@ -369,26 +355,16 @@ fn on_off(enabled: bool) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    BuildAndRun,
     AnalyzeFast,
 }
 
 impl fmt::Display for JobKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
-            Self::BuildAndRun => "Build+Run",
             Self::AnalyzeFast => "Analyze",
         };
         write!(f, "{text}")
     }
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub struct LoopResult {
-    pub loop_id: String,
-    pub time_sec: f64,
-    pub checksum: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,7 +590,6 @@ pub struct RunSession {
     pub selected_function_loop_id: String,
     pub selected_function_symbol: String,
     pub run_mode: FunctionRunMode,
-    pub loop_results: Vec<LoopResult>,
     pub remarks: Vec<RemarkEntry>,
     pub analysis_steps: Vec<AnalysisStep>,
     pub analysis_state: AnalysisState,
@@ -639,7 +614,6 @@ impl RunSession {
             selected_function_loop_id,
             selected_function_symbol,
             run_mode,
-            loop_results: Vec::new(),
             remarks: Vec::new(),
             analysis_steps: Vec::new(),
             analysis_state: AnalysisState::None,

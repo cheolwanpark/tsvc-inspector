@@ -15,7 +15,6 @@ pub fn build_benchmark_catalog(raw_benchmarks: Vec<RawBenchmark>) -> Vec<Benchma
                 name: raw.name,
                 category: raw.category,
                 data_type: raw.data_type,
-                run_options: raw.run_options,
                 available_functions,
                 source_code,
             }

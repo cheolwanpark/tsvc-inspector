@@ -108,7 +108,12 @@ fn run_app(
                 action if app.is_function_modal_open() => match action {
                     UserAction::MoveUp => app.function_modal_move_up(),
                     UserAction::MoveDown => app.function_modal_move_down(),
-                    UserAction::Confirm => app.confirm_function_selection(),
+                    UserAction::Confirm => {
+                        let entered_detail = app.confirm_function_selection();
+                        if entered_detail {
+                            maybe_spawn_analysis(app, config, job_tx);
+                        }
+                    }
                     UserAction::BackToBenchmarkList => app.close_function_select_modal(),
                     _ => {}
                 },
@@ -144,11 +149,6 @@ fn run_app(
                         UserAction::MoveRight => app.list_move_right(),
                         UserAction::Confirm => app.open_function_select_modal(),
                         UserAction::ShowCSource => app.open_config_modal(),
-                        UserAction::Run | UserAction::Analyze => {
-                            app.set_status_message(
-                                "Select function and open detail page to run or analyze",
-                            );
-                        }
                         _ => {}
                     },
                     AppPage::BenchmarkDetail => match action {
@@ -171,13 +171,6 @@ fn run_app(
                             if app.is_code_view_focused() {
                                 app.show_c_source_mode();
                             }
-                        }
-                        UserAction::ClearSession => app.clear_session(),
-                        UserAction::Run => {
-                            maybe_spawn_job(app, config, job_tx, JobKind::BuildAndRun);
-                        }
-                        UserAction::Analyze => {
-                            maybe_spawn_job(app, config, job_tx, JobKind::AnalyzeFast);
                         }
                         UserAction::CopyDetailToClipboard => copy_detail_snapshot(app),
                         UserAction::ToggleSideBySideDiff => app.toggle_side_by_side_diff(),
@@ -204,11 +197,10 @@ fn copy_detail_snapshot(app: &mut AppState) {
     }
 }
 
-fn maybe_spawn_job(
+fn maybe_spawn_analysis(
     app: &mut AppState,
     config: &runner::RunnerConfig,
     job_tx: &Sender<JobEvent>,
-    kind: JobKind,
 ) {
     if app.is_job_running() {
         app.set_status_message("A job is already running");
@@ -231,115 +223,60 @@ fn maybe_spawn_job(
 
     std::thread::spawn(move || {
         let _ = tx.send(JobEvent::Started {
-            kind,
+            kind: JobKind::AnalyzeFast,
             benchmark: benchmark.name.clone(),
             compiler_config: compiler_config.clone(),
             selected_function: selected_function.clone(),
             run_mode,
         });
 
-        match kind {
-            JobKind::BuildAndRun => {
-                let exec_result = runner::execute_runtime_job(
-                    &cfg,
-                    &benchmark,
-                    &compiler_config,
+        let exec_result = runner::execute_analysis_fast(
+            &cfg,
+            &benchmark,
+            &compiler_config,
+            &selected_function.symbol,
+            |line| {
+                let _ = tx.send(JobEvent::LogLine(line));
+            },
+        );
+        match exec_result {
+            Ok(raw) => {
+                let parsed_remarks = parse_remarks_with_log(raw.remark_file, &tx);
+                let remarks = filtering::filter_remarks_for_selected_function(
+                    parsed_remarks,
+                    &selected_function,
+                );
+                let analysis_steps = analysis::build_fast_analysis_steps(
+                    &raw.build_trace,
                     &selected_function.symbol,
+                    &remarks,
+                    raw.source_file_content.as_deref(),
+                );
+                if analysis_steps.is_empty() {
+                    let _ = tx.send(JobEvent::Finished(Err(format!(
+                        "no function-level IR steps found for '{}'",
+                        selected_function.symbol
+                    ))));
+                    return;
+                }
+
+                let summary = RemarksSummary::from_entries(&remarks);
+                let outcome = JobOutcome {
+                    kind: JobKind::AnalyzeFast,
+                    benchmark: benchmark.name.clone(),
+                    compiler_config: compiler_config.clone(),
+                    selected_function: selected_function.clone(),
                     run_mode,
-                    |line| {
-                        let _ = tx.send(JobEvent::LogLine(line));
+                    data: JobOutcomeData::Analysis {
+                        analysis_steps,
+                        remarks,
+                        remarks_summary: summary,
                     },
-                );
-                match exec_result {
-                    Ok(raw) => {
-                        let parsed_loop_results = parser::parse_tsvc_stdout(&raw.run_stdout);
-                        let parsed_remarks = parse_remarks_with_log(raw.remark_file, &tx);
-                        let loop_results = filtering::filter_loop_results_for_selected_function(
-                            parsed_loop_results,
-                            &selected_function,
-                        );
-                        let remarks = filtering::filter_remarks_for_selected_function(
-                            parsed_remarks,
-                            &selected_function,
-                        );
-                        if loop_results.is_empty() {
-                            let _ = tx.send(JobEvent::Finished(Err(format!(
-                                "selected function '{}' was not found in run output",
-                                selected_function.loop_id
-                            ))));
-                            return;
-                        }
-
-                        let summary = RemarksSummary::from_entries(&remarks);
-                        let outcome = JobOutcome {
-                            kind,
-                            benchmark: benchmark.name.clone(),
-                            compiler_config: compiler_config.clone(),
-                            selected_function: selected_function.clone(),
-                            run_mode,
-                            data: JobOutcomeData::Runtime {
-                                loop_results,
-                                remarks,
-                                remarks_summary: summary,
-                            },
-                        };
-                        let _ = tx.send(JobEvent::Finished(Ok(outcome)));
-                    }
-                    Err(err) => {
-                        let _ = tx.send(JobEvent::Finished(Err(format!("{err:#}"))));
-                    }
-                }
+                };
+                let _ = tx.send(JobEvent::Finished(Ok(outcome)));
             }
-            JobKind::AnalyzeFast => {
-                let exec_result = runner::execute_analysis_fast(
-                    &cfg,
-                    &benchmark,
-                    &compiler_config,
-                    &selected_function.symbol,
-                    |line| {
-                        let _ = tx.send(JobEvent::LogLine(line));
-                    },
-                );
-                match exec_result {
-                    Ok(raw) => {
-                        let parsed_remarks = parse_remarks_with_log(raw.remark_file, &tx);
-                        let remarks = filtering::filter_remarks_for_selected_function(
-                            parsed_remarks,
-                            &selected_function,
-                        );
-                        let analysis_steps = analysis::build_fast_analysis_steps(
-                            &raw.build_trace,
-                            &selected_function.symbol,
-                            &remarks,
-                            raw.source_file_content.as_deref(),
-                        );
-                        if analysis_steps.is_empty() {
-                            let _ = tx.send(JobEvent::Finished(Err(format!(
-                                "no function-level IR steps found for '{}'",
-                                selected_function.symbol
-                            ))));
-                            return;
-                        }
-
-                        let summary = RemarksSummary::from_entries(&remarks);
-                        let outcome = JobOutcome {
-                            kind,
-                            benchmark: benchmark.name.clone(),
-                            compiler_config: compiler_config.clone(),
-                            selected_function: selected_function.clone(),
-                            run_mode,
-                            data: JobOutcomeData::Analysis {
-                                analysis_steps,
-                                remarks,
-                                remarks_summary: summary,
-                            },
-                        };
-                        let _ = tx.send(JobEvent::Finished(Ok(outcome)));
-                    }
-                    Err(err) => {
-                        let _ = tx.send(JobEvent::Finished(Err(format!("{err:#}"))));
-                    }
-                }
+            Err(err) => {
+                let _ = tx.send(JobEvent::Finished(Err(format!("{err:#}"))));
             }
         }
     });

@@ -131,9 +131,6 @@ fn render_config_modal(frame: &mut Frame, app: &AppState) {
     frame.render_widget(guide, guide_area);
 
     let preview_text = Text::from(vec![
-        Line::from("Runtime C Flags"),
-        Line::from(app.config_runtime_flags_preview()),
-        Line::from(""),
         Line::from("Analysis C Flags"),
         Line::from(app.config_analysis_flags_preview()),
     ]);
@@ -338,7 +335,8 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
 
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
-            Paragraph::new("Press 'a' to analyze").block(Block::bordered().title(title)),
+            Paragraph::new("Analysis will start when you enter detail.")
+                .block(Block::bordered().title(title)),
             area,
         );
         return;
@@ -355,7 +353,7 @@ fn render_pass_selector_panel(frame: &mut Frame, app: &AppState, area: ratatui::
     let stages = AppState::ordered_stages_with_counts(session);
     if stages.is_empty() {
         frame.render_widget(
-            Paragraph::new("Press 'a' to analyze").block(Block::bordered().title(title)),
+            Paragraph::new("Waiting for analysis passes...").block(Block::bordered().title(title)),
             area,
         );
         return;
@@ -436,7 +434,9 @@ fn line_attribute_lines(app: &AppState) -> Vec<Line<'static>> {
     }
 
     let Some(session) = app.active_session_for_selected_benchmark() else {
-        return vec![Line::from("Run analysis to inspect LLVM attributes.")];
+        return vec![Line::from(
+            "Analysis results are required to inspect LLVM attributes.",
+        )];
     };
     let Some(step) = app.selected_step_in_stage(session) else {
         return vec![Line::from("Select a pass to inspect LLVM attributes.")];
@@ -648,7 +648,7 @@ fn render_ir_diff_panel(
 ) {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
-            Paragraph::new("No analysis").block(Block::bordered().title(title)),
+            Paragraph::new("Waiting for analysis...").block(Block::bordered().title(title)),
             area,
         );
         return;
@@ -656,7 +656,7 @@ fn render_ir_diff_panel(
 
     let Some(step) = app.selected_step_in_stage(session) else {
         let hint = match session.analysis_state {
-            AnalysisState::None => "Press 'a' to analyze",
+            AnalysisState::None => "Waiting for analysis...",
             AnalysisState::Running => "\u{27f3} Analyzing...",
             AnalysisState::Ready => "Select a pass",
             AnalysisState::Failed => "Analysis failed",
@@ -753,7 +753,7 @@ fn render_ir_post_panel(
 ) {
     let Some(session) = app.active_session_for_selected_benchmark() else {
         frame.render_widget(
-            Paragraph::new("No analysis").block(Block::bordered().title(title)),
+            Paragraph::new("Waiting for analysis...").block(Block::bordered().title(title)),
             area,
         );
         return;
@@ -761,7 +761,7 @@ fn render_ir_post_panel(
 
     let Some(step) = app.selected_step_in_stage(session) else {
         let hint = match session.analysis_state {
-            AnalysisState::None => "Press 'a' to analyze",
+            AnalysisState::None => "Waiting for analysis...",
             AnalysisState::Running => "\u{27f3} Analyzing...",
             AnalysisState::Ready => "Select a pass",
             AnalysisState::Failed => "Analysis failed",
@@ -922,7 +922,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} c C view \u{00b7} d side-by-side diff \u{00b7} C clear \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy";
+    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} c C view \u{00b7} d side-by-side diff \u{00b7} y copy";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),

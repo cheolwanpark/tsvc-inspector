@@ -27,10 +27,10 @@ The application is structured as a `lib + bin` crate:
 - `src/core/error.rs`: common `AppResult` alias
 
 - `src/data/repo.rs`: TSVC root resolution, fallback clone behavior, function-run mode configuration
-- `src/data/runner.rs`: native clang build/run/analysis command wrappers and artifact discovery
-- `src/data/parser.rs`: raw text/yaml parsing (`tsvc stdout`, `remarks`, `IR snapshots`, `dbg maps`)
+- `src/data/runner.rs`: native clang analysis command wrappers and artifact discovery
+- `src/data/parser.rs`: raw text/yaml parsing (`remarks`, `IR snapshots`, `dbg maps`)
 - `src/data/discovery.rs`: raw benchmark discovery and source loading
-- `src/data/manifest.rs`: benchmark manifest and run options
+- `src/data/manifest.rs`: benchmark manifest
 - `src/data/tsvc_patch.rs`: fallback root patching for real-selective function filtering
 
 - `src/transform/catalog.rs`: build benchmark catalog from raw discovery output
@@ -64,7 +64,7 @@ If logic is about:
 
 ### Pages and Flow
 - Pages: `Benchmark List` -> `Benchmark Detail`
-- `Enter` on list opens `Select Function` modal first, and function confirm opens detail directly
+- `Enter` on list opens `Select Function` modal first, and function confirm opens detail and immediately starts analysis
 - `c` on list opens optional global `Configuration` modal (live-apply)
 - Session scope: `benchmark + selected function + config_id`
 
@@ -105,10 +105,8 @@ If logic is about:
   - Code view focus + `C` -> scroll source view
 - `Esc`: return to list
 - Actions:
-  - `a`: run analysis
-  - `r`: run build+run
+  - analysis starts automatically on detail entry
   - `y`: copy detail snapshot
-  - `c`: clear session
 
 Minimum terminal size: `100x30`.
 
@@ -127,12 +125,12 @@ Minimum terminal size: `100x30`.
   - it parses inline attributes and resolves `attributes #N = { ... }` group references
   - it does not attempt `C` line attribute mapping
 
-## Function-Selective Run Modes
+## Function-Selective Analysis Modes
 
 - `real-selective`: app-managed fallback root where patch succeeds
 - `output-filter`: external root or patch failure
 
-Both modes must preserve selected-function scoped output in UI/session behavior.
+Both modes must preserve selected-function scoped analysis output in UI/session behavior.
 
 ## Development Commands
 

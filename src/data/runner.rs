@@ -7,7 +7,7 @@ use anyhow::{Context, anyhow};
 use regex::Regex;
 
 use crate::core::error::AppResult;
-use crate::core::model::{BenchmarkItem, BuildPurpose, CompilerConfig, FunctionRunMode};
+use crate::core::model::{BenchmarkItem, CompilerConfig};
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
@@ -18,67 +18,10 @@ pub struct RunnerConfig {
 }
 
 #[derive(Debug)]
-pub struct RuntimeJobRawOutput {
-    pub run_stdout: String,
-    pub remark_file: Option<PathBuf>,
-}
-
-#[derive(Debug)]
 pub struct AnalysisFastRawOutput {
     pub build_trace: String,
     pub remark_file: Option<PathBuf>,
     pub source_file_content: Option<String>,
-}
-
-pub fn execute_runtime_job<F>(
-    config: &RunnerConfig,
-    benchmark: &BenchmarkItem,
-    compiler_config: &CompilerConfig,
-    selected_function_symbol: &str,
-    run_mode: FunctionRunMode,
-    mut log: F,
-) -> AppResult<RuntimeJobRawOutput>
-where
-    F: FnMut(String),
-{
-    fs::create_dir_all(&config.build_root)
-        .with_context(|| format!("create build root {}", config.build_root.display()))?;
-
-    let build_dir = build_dir_path(config, compiler_config, BuildPurpose::Runtime);
-    let _ = run_build(
-        config,
-        &build_dir,
-        benchmark,
-        compiler_config,
-        BuildPurpose::Runtime,
-        None,
-        &mut log,
-    )?;
-
-    let binary = benchmark_binary_path(&build_dir, &benchmark.name);
-    if !binary.exists() {
-        return Err(anyhow!(
-            "target binary not found: {} (build failed)",
-            binary.display()
-        ));
-    }
-
-    let mut run = Command::new(&binary);
-    run.args(&benchmark.run_options);
-    if run_mode == FunctionRunMode::RealSelective {
-        log(format!(
-            "env | TSVC_TUI_FUNCTION_FILTER={selected_function_symbol}"
-        ));
-        run.env("TSVC_TUI_FUNCTION_FILTER", selected_function_symbol);
-    }
-    let output = capture_command(&mut run, &mut log)?;
-    let run_stdout = output.stdout;
-
-    let remark_file = locate_remark_file(&build_dir, &benchmark.name);
-    Ok(RuntimeJobRawOutput {
-        run_stdout,
-        remark_file,
-    })
 }
 
 pub fn execute_analysis_fast<F>(
@@ -94,13 +37,12 @@ where
     fs::create_dir_all(&config.build_root)
         .with_context(|| format!("create build root {}", config.build_root.display()))?;
 
-    let build_dir = build_dir_path(config, compiler_config, BuildPurpose::Analysis);
+    let build_dir = build_dir_path(config, compiler_config);
     let build_capture = run_build(
         config,
         &build_dir,
         benchmark,
         compiler_config,
-        BuildPurpose::Analysis,
         Some(selected_function_symbol),
         &mut log,
     )?;
@@ -121,19 +63,11 @@ where
     })
 }
 
-fn build_dir_path(
-    config: &RunnerConfig,
-    compiler_config: &CompilerConfig,
-    purpose: BuildPurpose,
-) -> PathBuf {
-    let purpose_dir = match purpose {
-        BuildPurpose::Runtime => "run",
-        BuildPurpose::Analysis => "analysis",
-    };
+fn build_dir_path(config: &RunnerConfig, compiler_config: &CompilerConfig) -> PathBuf {
     config
         .build_root
         .join("build-tsvc-native")
-        .join(purpose_dir)
+        .join("analysis")
         .join(compiler_config.config_id())
 }
 
@@ -142,7 +76,6 @@ fn run_build<F>(
     build_dir: &Path,
     benchmark: &BenchmarkItem,
     compiler_config: &CompilerConfig,
-    purpose: BuildPurpose,
     selected_function_symbol: Option<&str>,
     log: &mut F,
 ) -> AppResult<CommandCapture>
@@ -175,7 +108,7 @@ where
     let mut combined_stderr = String::new();
 
     let runtime_flags = compiler_config.runtime_c_flags();
-    let compile_tsc_flags = compile_tsc_flags(compiler_config, purpose, selected_function_symbol);
+    let compile_tsc_flags = compile_tsc_flags(compiler_config, selected_function_symbol);
     let baseline = baseline_flags();
     let common_runtime = merge_flags(&runtime_flags, &baseline);
     let common_tsc = merge_flags(&compile_tsc_flags, &baseline);
@@ -271,14 +204,9 @@ fn baseline_flags() -> [&'static str; 4] {
 
 fn compile_tsc_flags(
     compiler_config: &CompilerConfig,
-    purpose: BuildPurpose,
     selected_function_symbol: Option<&str>,
 ) -> Vec<String> {
-    let mut flags = compiler_config.c_flags_for(purpose);
-    if purpose != BuildPurpose::Analysis {
-        return flags;
-    }
-
+    let mut flags = compiler_config.analysis_c_flags();
     let Some(symbol) = selected_function_symbol
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -422,10 +350,6 @@ fn shell_escape(text: &OsStr) -> String {
     }
 }
 
-pub fn benchmark_binary_path(build_dir: &Path, benchmark: &str) -> PathBuf {
-    target_dir(build_dir, benchmark).join(benchmark)
-}
-
 fn locate_remark_file(build_dir: &Path, benchmark: &str) -> Option<PathBuf> {
     let target_dir = target_dir(build_dir, benchmark);
     let primary = target_dir.join("tsc.c.opt.yaml");
@@ -493,12 +417,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn benchmark_path_contains_target_name() {
-        let p = benchmark_binary_path(Path::new("/tmp/build"), "InductionVariable-dbl");
-        assert!(p.ends_with("InductionVariable-dbl/InductionVariable-dbl"));
-    }
-
-    #[test]
     fn render_command_with_native_clang() {
         let mut compile = Command::new("clang");
         compile
@@ -545,14 +463,14 @@ mod tests {
             build_root: PathBuf::from("/tmp/build"),
             jobs: 1,
         };
-        let run_dir = build_dir_path(&runner, &config, BuildPurpose::Runtime);
-        assert!(run_dir.ends_with(format!("build-tsvc-native/run/{}", config.config_id())));
+        let build_dir = build_dir_path(&runner, &config);
+        assert!(build_dir.ends_with(format!("build-tsvc-native/analysis/{}", config.config_id())));
     }
 
     #[test]
     fn compile_tsc_flags_scopes_print_changed_to_selected_function() {
         let config = CompilerConfig::default();
-        let flags = compile_tsc_flags(&config, BuildPurpose::Analysis, Some("s161"));
+        let flags = compile_tsc_flags(&config, Some("s161"));
         assert!(flags.iter().any(|flag| flag == "-print-changed"));
         assert!(flags.iter().any(|flag| flag == "-filter-print-funcs=s161"));
     }

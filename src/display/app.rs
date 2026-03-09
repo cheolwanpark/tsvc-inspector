@@ -4,8 +4,8 @@ use ratatui::style::Color;
 
 use crate::core::model::{
     AnalysisStage, AnalysisState, AnalysisStep, AppPage, BenchmarkFunction, BenchmarkItem,
-    CompilerConfig, FunctionRunMode, IrLine, JobKind, LoopResult, RemarkEntry, RemarksSummary,
-    RunSession, SessionStatus,
+    CompilerConfig, FunctionRunMode, IrLine, JobKind, RemarkEntry, RemarksSummary, RunSession,
+    SessionStatus,
 };
 use crate::transform::session::{
     DetailSnapshotInput, build_detail_snapshot, extract_vf_from_remarks, has_vectorizer_ir_changes,
@@ -37,11 +37,6 @@ pub struct JobOutcome {
 
 #[derive(Debug)]
 pub enum JobOutcomeData {
-    Runtime {
-        loop_results: Vec<LoopResult>,
-        remarks: Vec<RemarkEntry>,
-        remarks_summary: RemarksSummary,
-    },
     Analysis {
         analysis_steps: Vec<AnalysisStep>,
         remarks: Vec<RemarkEntry>,
@@ -373,14 +368,14 @@ impl AppState {
         self.function_modal_selected_idx = (self.function_modal_selected_idx + 1).min(max_idx);
     }
 
-    pub fn confirm_function_selection(&mut self) {
+    pub fn confirm_function_selection(&mut self) -> bool {
         let Some(benchmark) = self.selected_benchmark().cloned() else {
             self.status_message = String::from("No benchmark selected");
-            return;
+            return false;
         };
         if benchmark.available_functions.is_empty() {
             self.status_message = String::from("No functions discovered for selected benchmark");
-            return;
+            return false;
         }
 
         let max_idx = benchmark.available_functions.len() - 1;
@@ -395,6 +390,7 @@ impl AppState {
             function.loop_id, function.symbol
         );
         self.open_selected_benchmark_page();
+        self.page == AppPage::BenchmarkDetail
     }
 
     pub fn select_prev(&mut self) {
@@ -530,15 +526,6 @@ impl AppState {
                     self.config_draft.extra_llvm_flags.clone()
                 }
             }
-        }
-    }
-
-    pub fn config_runtime_flags_preview(&self) -> String {
-        let flags = self.config_draft.runtime_c_flags();
-        if flags.is_empty() {
-            String::from("(none)")
-        } else {
-            flags.join(" ")
         }
     }
 
@@ -709,30 +696,6 @@ impl AppState {
             ConfigRow::ExtraCFlags | ConfigRow::ExtraLlvmFlags => {}
         }
         self.status_message = format!("Config: {}", self.config_draft.label());
-    }
-
-    pub fn clear_session(&mut self) {
-        let Some(benchmark) = self.selected_benchmark() else {
-            self.status_message = String::from("No benchmark selected");
-            return;
-        };
-        let Some(function) = self.selected_function_for_selected_benchmark() else {
-            self.status_message = String::from("Select a function first");
-            return;
-        };
-        let config_id = self.current_compiler_config().config_id();
-        let key = session_key(&benchmark.name, &function.symbol, &config_id);
-
-        if self.sessions_by_key.remove(&key).is_some() {
-            self.reset_ir_navigation();
-            self.selected_pass_by_stage.clear();
-            self.detail_focus = DetailFocus::Selector;
-            self.side_by_side_diff_open = false;
-            self.side_by_side_diff_scroll = 0;
-            self.status_message = String::from("Session cleared");
-        } else {
-            self.status_message = String::from("No session to clear");
-        }
     }
 
     pub fn set_status_message(&mut self, msg: impl Into<String>) {
@@ -1041,7 +1004,8 @@ impl AppState {
         }
 
         let Some(session) = self.active_session_for_selected_benchmark() else {
-            self.status_message = String::from("Run analysis to open side-by-side diff");
+            self.status_message =
+                String::from("Analysis results are required for side-by-side diff");
             return;
         };
         let Some(step) = self.selected_step_in_stage(session) else {
@@ -1338,15 +1302,10 @@ impl AppState {
         session.run_mode = run_mode;
         session.status = SessionStatus::Running;
         session.logs.clear();
-        if matches!(kind, JobKind::AnalyzeFast) {
-            session.remarks.clear();
-            session.remarks_summary = RemarksSummary::default();
-            session.analysis_steps.clear();
-        }
-        session.analysis_state = match kind {
-            JobKind::AnalyzeFast => AnalysisState::Running,
-            _ => session.analysis_state,
-        };
+        session.remarks.clear();
+        session.remarks_summary = RemarksSummary::default();
+        session.analysis_steps.clear();
+        session.analysis_state = AnalysisState::Running;
         self.sessions_by_key.insert(key, session);
 
         self.reset_ir_navigation();
@@ -1395,7 +1354,7 @@ impl AppState {
                 match result {
                     Ok(outcome) => {
                         let JobOutcome {
-                            kind,
+                            kind: _,
                             benchmark,
                             compiler_config,
                             selected_function,
@@ -1421,21 +1380,6 @@ impl AppState {
                         session.selected_function_symbol = selected_function.symbol.clone();
                         session.run_mode = run_mode;
                         match data {
-                            JobOutcomeData::Runtime {
-                                loop_results,
-                                remarks,
-                                remarks_summary,
-                            } => {
-                                session.loop_results = loop_results;
-                                session.remarks = remarks;
-                                session.remarks_summary = remarks_summary;
-                                // After a runtime job, keep analysis state if steps exist
-                                if !session.analysis_steps.is_empty() {
-                                    session.analysis_state = AnalysisState::Ready;
-                                } else {
-                                    session.analysis_state = AnalysisState::None;
-                                }
-                            }
                             JobOutcomeData::Analysis {
                                 analysis_steps,
                                 remarks,
@@ -1459,22 +1403,14 @@ impl AppState {
                         self.sessions_by_key.insert(key, session);
 
                         // Keep the detail selector on a valid pass for the currently viewed session.
-                        if matches!(kind, JobKind::AnalyzeFast)
-                            && self
-                                .selected_benchmark()
-                                .is_some_and(|b| b.name == benchmark)
+                        if self
+                            .selected_benchmark()
+                            .is_some_and(|b| b.name == benchmark)
                             && self
                                 .selected_function_for_selected_benchmark()
                                 .is_some_and(|f| f.symbol == selected_function.symbol)
                         {
                             self.ensure_valid_pass_selection_for_active_session();
-                        }
-
-                        if !matches!(kind, JobKind::AnalyzeFast) {
-                            self.status_message = format!(
-                                "Completed: {} [{}] ({})",
-                                benchmark, selected_function.loop_id, compiler_config
-                            );
                         }
                     }
                     Err(error) => {
@@ -1519,7 +1455,6 @@ mod tests {
             name: name.to_string(),
             category: String::from("Category"),
             data_type: String::from("dbl"),
-            run_options: vec![String::from("100"), String::from("5")],
             available_functions: vec![
                 BenchmarkFunction {
                     loop_id: String::from("S161"),
@@ -1946,7 +1881,7 @@ int s161(void) {
             AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
         app.open_function_select_modal();
         assert!(app.is_function_modal_open());
-        app.confirm_function_selection();
+        assert!(app.confirm_function_selection());
         assert_eq!(app.page, AppPage::BenchmarkDetail);
         assert_eq!(app.selected_function_loop_id(), Some("S161"));
     }
@@ -1958,48 +1893,6 @@ int s161(void) {
         app.open_selected_benchmark_page();
         assert_eq!(app.page, AppPage::BenchmarkList);
         assert!(app.status_message.contains("Select a function first"));
-    }
-
-    #[test]
-    fn sessions_are_scoped_per_function_and_config() {
-        let mut app =
-            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
-        app.selected_function_by_benchmark.insert(
-            String::from("A"),
-            BenchmarkFunction {
-                loop_id: String::from("S161"),
-                symbol: String::from("s161"),
-            },
-        );
-        let config_a = CompilerConfig::default();
-        let config_b = CompilerConfig {
-            enable_loop_vectorize: false,
-            ..CompilerConfig::default()
-        };
-        app.sessions_by_key.insert(
-            session_key("A", "s161", &config_a.config_id()),
-            RunSession::new_running(
-                config_a.clone(),
-                String::from("A"),
-                String::from("S161"),
-                String::from("s161"),
-                FunctionRunMode::OutputFilter,
-            ),
-        );
-        app.sessions_by_key.insert(
-            session_key("A", "s161", &config_b.config_id()),
-            RunSession::new_running(
-                config_b.clone(),
-                String::from("A"),
-                String::from("S161"),
-                String::from("s161"),
-                FunctionRunMode::OutputFilter,
-            ),
-        );
-
-        app.config_draft = config_a.clone();
-        app.clear_session();
-        assert_eq!(app.sessions_by_key.len(), 1);
     }
 
     #[test]
@@ -2397,7 +2290,7 @@ int s161(void) {
         app.toggle_side_by_side_diff();
 
         assert!(!app.is_side_by_side_diff_open());
-        assert!(app.status_message.contains("Run analysis"));
+        assert!(app.status_message.contains("Analysis results are required"));
     }
 
     #[test]

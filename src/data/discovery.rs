@@ -4,14 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 
 use crate::core::error::AppResult;
-use crate::data::manifest::BENCHMARK_MANIFEST;
+use crate::data::manifest::BENCHMARK_NAMES;
 
 #[derive(Clone, Debug)]
 pub struct RawBenchmark {
     pub name: String,
     pub category: String,
     pub data_type: String,
-    pub run_options: Vec<String>,
     pub benchmark_dir: PathBuf,
     pub tsc_source: String,
     pub tsc_inc_source: Option<String>,
@@ -30,8 +29,8 @@ pub fn discover_raw_benchmarks(tsvc_root: &Path) -> AppResult<Vec<RawBenchmark>>
     let tsc_inc_path = tsvc_dir.join("tsc.inc");
     let shared_tsc_inc = fs::read_to_string(&tsc_inc_path).ok();
 
-    for manifest in BENCHMARK_MANIFEST {
-        let benchmark_dir = tsvc_dir.join(manifest.name);
+    for name in BENCHMARK_NAMES {
+        let benchmark_dir = tsvc_dir.join(name);
         if !benchmark_dir.is_dir() {
             continue;
         }
@@ -40,16 +39,11 @@ pub fn discover_raw_benchmarks(tsvc_root: &Path) -> AppResult<Vec<RawBenchmark>>
         let tsc_source = fs::read_to_string(&tsc_source_path)
             .with_context(|| format!("read {}", tsc_source_path.display()))?;
 
-        let (category, data_type) = split_category_type(manifest.name);
+        let (category, data_type) = split_category_type(name);
         benchmarks.push(RawBenchmark {
-            name: manifest.name.to_string(),
+            name: (*name).to_string(),
             category,
             data_type,
-            run_options: manifest
-                .run_options
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
             benchmark_dir,
             tsc_source,
             tsc_inc_source: shared_tsc_inc.clone(),

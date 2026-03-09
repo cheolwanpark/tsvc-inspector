@@ -1,18 +1,4 @@
-use crate::core::model::{BenchmarkFunction, LoopResult, RemarkEntry};
-
-pub fn filter_loop_results_for_selected_function(
-    loop_results: Vec<LoopResult>,
-    selected_function: &BenchmarkFunction,
-) -> Vec<LoopResult> {
-    loop_results
-        .into_iter()
-        .filter(|entry| {
-            entry
-                .loop_id
-                .eq_ignore_ascii_case(&selected_function.loop_id)
-        })
-        .collect::<Vec<_>>()
-}
+use crate::core::model::{BenchmarkFunction, RemarkEntry};
 
 pub fn filter_remarks_for_selected_function(
     remarks: Vec<RemarkEntry>,

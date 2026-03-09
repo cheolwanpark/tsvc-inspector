@@ -5,7 +5,7 @@ use std::path::Path;
 use regex::Regex;
 
 use crate::core::error::AppResult;
-use crate::core::model::{DbgLocation, LoopResult, RemarkEntry, RemarkKind};
+use crate::core::model::{DbgLocation, RemarkEntry, RemarkKind};
 
 #[derive(Clone, Debug)]
 pub struct IrSnapshot {
@@ -14,46 +14,6 @@ pub struct IrSnapshot {
     pub pass_occurrence: usize,
     pub target: String,
     pub snapshot: String,
-}
-
-pub fn parse_tsvc_stdout(stdout: &str) -> Vec<LoopResult> {
-    let row_re = Regex::new(r"^\s*([A-Za-z0-9]+)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$")
-        .expect("valid TSVC output row regex");
-    let mut in_table = false;
-    let mut rows = Vec::new();
-
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Loop") && trimmed.contains("Time") {
-            in_table = true;
-            continue;
-        }
-        if !in_table || trimmed.is_empty() {
-            continue;
-        }
-
-        if let Some(caps) = row_re.captures(trimmed) {
-            let loop_id = caps
-                .get(1)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let time_sec = caps
-                .get(2)
-                .and_then(|m| m.as_str().parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let checksum = caps
-                .get(3)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            rows.push(LoopResult {
-                loop_id,
-                time_sec,
-                checksum,
-            });
-        }
-    }
-
-    rows
 }
 
 pub fn parse_opt_remarks(path: &Path) -> AppResult<Vec<RemarkEntry>> {
@@ -344,22 +304,6 @@ fn parse_kind(header: &str) -> RemarkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_tsvc_rows() {
-        let text = r#"
-Running each loop 100 times...
-
-Loop    Time(Sec)       Checksum
-S121    0.00            32007.271623919
-S122    1.25            32164.490281733
-"#;
-        let rows = parse_tsvc_stdout(text);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].loop_id, "S121");
-        assert!((rows[1].time_sec - 1.25).abs() < f64::EPSILON);
-        assert_eq!(rows[1].checksum, "32164.490281733");
-    }
 
     #[test]
     fn parses_dbg_locations_from_module_ir() {
