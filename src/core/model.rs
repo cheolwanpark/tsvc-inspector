@@ -218,6 +218,7 @@ pub struct CompilerConfig {
     pub enable_loop_vectorize: bool,
     pub enable_slp_vectorize: bool,
     pub fast_math: bool,
+    pub no_inlining: bool,
     pub march_native: bool,
     pub unroll_loops: bool,
     pub force_vector_width: ForceVectorWidth,
@@ -235,6 +236,7 @@ impl Default for CompilerConfig {
             enable_loop_vectorize: true,
             enable_slp_vectorize: true,
             fast_math: false,
+            no_inlining: false,
             march_native: false,
             unroll_loops: true,
             force_vector_width: ForceVectorWidth::Auto,
@@ -258,6 +260,9 @@ impl CompilerConfig {
         }
         if self.fast_math {
             flags.push(String::from("-ffast-math"));
+        }
+        if self.no_inlining {
+            flags.push(String::from("-fno-inline"));
         }
         if self.march_native {
             flags.push(String::from("-march=native"));
@@ -324,11 +329,12 @@ impl CompilerConfig {
 
     pub fn canonical_key(&self) -> String {
         format!(
-            "opt={}|lv={}|slp={}|fm={}|march={}|unroll={}|vw={}|vi={}|interchange={}|distribute={}|extra_c={}|extra_llvm={}",
+            "opt={}|lv={}|slp={}|fm={}|ni={}|march={}|unroll={}|vw={}|vi={}|interchange={}|distribute={}|extra_c={}|extra_llvm={}",
             self.opt_level.flag(),
             self.enable_loop_vectorize as u8,
             self.enable_slp_vectorize as u8,
             self.fast_math as u8,
+            self.no_inlining as u8,
             self.march_native as u8,
             self.unroll_loops as u8,
             self.force_vector_width,
@@ -691,6 +697,16 @@ mod tests {
         };
         let flags = cfg.runtime_c_flags();
         assert!(flags.iter().any(|f| f == "-ffast-math"));
+    }
+
+    #[test]
+    fn runtime_flags_disable_inlining_when_requested() {
+        let cfg = CompilerConfig {
+            no_inlining: true,
+            ..CompilerConfig::default()
+        };
+        let flags = cfg.runtime_c_flags();
+        assert!(flags.iter().any(|f| f == "-fno-inline"));
     }
 
     #[test]

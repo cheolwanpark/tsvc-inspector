@@ -116,8 +116,6 @@ fn run_app(
                     match action {
                         UserAction::MoveUp => app.config_move_up(),
                         UserAction::MoveDown => app.config_move_down(),
-                        UserAction::MoveLeft => app.config_modal_focus_left(),
-                        UserAction::MoveRight => app.config_modal_focus_right(),
                         UserAction::Confirm => app.config_confirm(),
                         UserAction::BackToBenchmarkList => app.close_config_modal(),
                         UserAction::Backspace => app.config_backspace(),

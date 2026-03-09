@@ -12,7 +12,7 @@ use crate::core::model::{
     AnalysisState, AnalysisStep, AppPage, IrAttribute, IrAttributeOrigin, RemarkEntry, RemarkKind,
     RunSession,
 };
-use crate::display::app::{AppState, CodeViewMode, ConfigModalFocus, ConfigRow};
+use crate::display::app::{AppState, CodeViewMode, ConfigRow};
 use crate::display::syntax::{self, StyledChunk, SyntaxLang};
 use crate::transform::session::has_vectorizer_ir_changes;
 
@@ -104,13 +104,8 @@ fn render_config_modal(frame: &mut Frame, app: &AppState) {
         .position(|entry| *entry == Some(app.config_selected_row))
         .unwrap_or(0);
 
-    let left_title = if app.config_modal_focus == ConfigModalFocus::Rows {
-        "Configuration [Focus]"
-    } else {
-        "Configuration"
-    };
     let list = List::new(items)
-        .block(Block::bordered().title(left_title))
+        .block(Block::bordered().title("Configuration"))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -125,13 +120,8 @@ fn render_config_modal(frame: &mut Frame, app: &AppState) {
     let [guide_area, preview_area] = right_rows.areas(right);
 
     let selected_row = app.config_selected_row_kind();
-    let guide_title = if app.config_modal_focus == ConfigModalFocus::Preview {
-        "Option Guide [Focus]"
-    } else {
-        "Option Guide"
-    };
     let guide = Paragraph::new(Text::from(config_help_lines(app, selected_row)))
-        .block(Block::bordered().title(guide_title))
+        .block(Block::bordered().title("Option Guide"))
         .wrap(Wrap { trim: false });
     frame.render_widget(guide, guide_area);
 
@@ -150,7 +140,7 @@ fn render_config_modal(frame: &mut Frame, app: &AppState) {
     let hints = if app.is_config_text_editing() {
         "type text · backspace delete · enter finish · esc cancel edit"
     } else {
-        "←→ section · ↑↓ row · enter toggle/edit · esc close"
+        "↑↓ row · enter toggle/edit · esc close"
     };
     let footer = Paragraph::new(Text::from(vec![
         Line::from("Config Modal"),
@@ -176,6 +166,11 @@ fn config_help_lines(app: &AppState, row: ConfigRow) -> Vec<Line<'static>> {
             "What: Enables -ffast-math (FP reassociation, no NaN/Inf guards).",
             "Why: FP reassociation enables reduction vectorization for sums/products.",
             "Tip: Try on for reduction loops that fail to vectorize with strict FP.",
+        ],
+        ConfigRow::NoInlining => vec![
+            "What: Disables standard inlining with -fno-inline.",
+            "Why: Keeps call boundaries visible so pass effects are easier to inspect per function.",
+            "Tip: Use this when inlining hides the kernel shape before vectorization analysis.",
         ],
         ConfigRow::LoopVectorize => vec![
             "What: Enables/disables loop vectorization (-fno-vectorize when off).",

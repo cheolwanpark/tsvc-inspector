@@ -130,28 +130,10 @@ impl CodeViewMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConfigModalFocus {
-    Rows,
-    Preview,
-}
-
-impl ConfigModalFocus {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Rows => Self::Preview,
-            Self::Preview => Self::Rows,
-        }
-    }
-
-    pub fn prev(self) -> Self {
-        self.next()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigRow {
     OptLevel,
     FastMath,
+    NoInlining,
     LoopVectorize,
     SlpVectorize,
     ForceVecWidth,
@@ -165,9 +147,10 @@ pub enum ConfigRow {
 }
 
 impl ConfigRow {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OptLevel,
         Self::FastMath,
+        Self::NoInlining,
         Self::LoopVectorize,
         Self::SlpVectorize,
         Self::ForceVecWidth,
@@ -184,6 +167,7 @@ impl ConfigRow {
         match self {
             Self::OptLevel => "Optimization",
             Self::FastMath => "Fast Math",
+            Self::NoInlining => "No Inlining",
             Self::LoopVectorize => "Loop Vectorize",
             Self::SlpVectorize => "SLP Vectorize",
             Self::ForceVecWidth => "Force Vec Width",
@@ -199,7 +183,7 @@ impl ConfigRow {
 
     pub fn group(self) -> &'static str {
         match self {
-            Self::OptLevel | Self::FastMath => "Optimization",
+            Self::OptLevel | Self::FastMath | Self::NoInlining => "Optimization",
             Self::LoopVectorize
             | Self::SlpVectorize
             | Self::ForceVecWidth
@@ -224,7 +208,6 @@ pub struct AppState {
     pub selected_idx: usize,
     pub config_draft: CompilerConfig,
     pub config_modal_open: bool,
-    pub config_modal_focus: ConfigModalFocus,
     pub config_selected_row: usize,
     pub config_editing_text: bool,
     pub page: AppPage,
@@ -260,7 +243,6 @@ impl AppState {
             selected_idx: 0,
             config_draft: CompilerConfig::default(),
             config_modal_open: false,
-            config_modal_focus: ConfigModalFocus::Rows,
             config_selected_row: 0,
             config_editing_text: false,
             page: AppPage::BenchmarkList,
@@ -488,7 +470,6 @@ impl AppState {
             return;
         }
         self.config_modal_open = true;
-        self.config_modal_focus = ConfigModalFocus::Rows;
         self.config_editing_text = false;
         self.status_message = String::from("Configuration modal opened");
     }
@@ -504,28 +485,6 @@ impl AppState {
 
     pub fn is_config_modal_open(&self) -> bool {
         self.config_modal_open
-    }
-
-    pub fn config_modal_focus_left(&mut self) {
-        if self.config_editing_text {
-            return;
-        }
-        self.config_modal_focus = self.config_modal_focus.prev();
-        self.status_message = match self.config_modal_focus {
-            ConfigModalFocus::Rows => String::from("Config focus: options"),
-            ConfigModalFocus::Preview => String::from("Config focus: preview"),
-        };
-    }
-
-    pub fn config_modal_focus_right(&mut self) {
-        if self.config_editing_text {
-            return;
-        }
-        self.config_modal_focus = self.config_modal_focus.next();
-        self.status_message = match self.config_modal_focus {
-            ConfigModalFocus::Rows => String::from("Config focus: options"),
-            ConfigModalFocus::Preview => String::from("Config focus: preview"),
-        };
     }
 
     pub fn config_rows(&self) -> &'static [ConfigRow] {
@@ -544,6 +503,7 @@ impl AppState {
         match row {
             ConfigRow::OptLevel => self.config_draft.opt_level.to_string(),
             ConfigRow::FastMath => bool_text(self.config_draft.fast_math),
+            ConfigRow::NoInlining => bool_text(self.config_draft.no_inlining),
             ConfigRow::LoopVectorize => bool_text(self.config_draft.enable_loop_vectorize),
             ConfigRow::SlpVectorize => bool_text(self.config_draft.enable_slp_vectorize),
             ConfigRow::ForceVecWidth => self.config_draft.force_vector_width.to_string(),
@@ -588,14 +548,14 @@ impl AppState {
     }
 
     pub fn config_move_up(&mut self) {
-        if self.config_editing_text || self.config_modal_focus != ConfigModalFocus::Rows {
+        if self.config_editing_text {
             return;
         }
         self.config_selected_row = self.config_selected_row.saturating_sub(1);
     }
 
     pub fn config_move_down(&mut self) {
-        if self.config_editing_text || self.config_modal_focus != ConfigModalFocus::Rows {
+        if self.config_editing_text {
             return;
         }
         let max_idx = ConfigRow::selectable_count() - 1;
@@ -603,9 +563,6 @@ impl AppState {
     }
 
     pub fn config_confirm(&mut self) {
-        if self.config_modal_focus != ConfigModalFocus::Rows && !self.config_editing_text {
-            return;
-        }
         let row = self.config_selected_row_kind();
         if self.config_editing_text {
             self.config_editing_text = false;
@@ -695,6 +652,9 @@ impl AppState {
             }
             ConfigRow::FastMath => {
                 self.config_draft.fast_math = !self.config_draft.fast_math;
+            }
+            ConfigRow::NoInlining => {
+                self.config_draft.no_inlining = !self.config_draft.no_inlining;
             }
             ConfigRow::LoopVectorize => {
                 self.config_draft.enable_loop_vectorize = !self.config_draft.enable_loop_vectorize;
@@ -2144,7 +2104,10 @@ int s161(void) {
         app.open_config_modal();
         assert!(app.is_config_modal_open());
 
-        app.config_selected_row = 10; // ExtraCFlags
+        app.config_selected_row = ConfigRow::ALL
+            .iter()
+            .position(|row| *row == ConfigRow::ExtraCFlags)
+            .unwrap();
         app.config_confirm();
         assert!(app.is_config_text_editing());
         app.config_push_char('-');
@@ -2155,6 +2118,21 @@ int s161(void) {
 
         assert_eq!(app.config_draft.extra_c_flags, "-g");
         assert!(!app.is_config_text_editing());
+    }
+
+    #[test]
+    fn config_modal_toggles_no_inlining() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_config_modal();
+        app.config_selected_row = ConfigRow::ALL
+            .iter()
+            .position(|row| *row == ConfigRow::NoInlining)
+            .unwrap();
+
+        app.config_confirm();
+
+        assert!(app.config_draft.no_inlining);
     }
 
     #[test]
