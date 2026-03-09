@@ -225,6 +225,8 @@ pub struct AppState {
     pub ir_post_selected_line: usize,
     pub source_detail_scroll: u16,
     pub detail_code_viewport_lines: u16,
+    pub side_by_side_diff_open: bool,
+    pub side_by_side_diff_scroll: u16,
     pub function_modal_open: bool,
     pub function_modal_selected_idx: usize,
     pub function_run_mode: FunctionRunMode,
@@ -260,6 +262,8 @@ impl AppState {
             ir_post_selected_line: 0,
             source_detail_scroll: 0,
             detail_code_viewport_lines: 1,
+            side_by_side_diff_open: false,
+            side_by_side_diff_scroll: 0,
             function_modal_open: false,
             function_modal_selected_idx: 0,
             function_run_mode,
@@ -630,11 +634,15 @@ impl AppState {
         self.detail_focus = DetailFocus::Selector;
         self.code_view_mode = CodeViewMode::IrDiff;
         self.last_ir_code_view_mode = CodeViewMode::IrDiff;
+        self.side_by_side_diff_open = false;
+        self.side_by_side_diff_scroll = 0;
         self.ensure_valid_pass_selection_for_active_session();
         self.reset_ir_navigation();
     }
 
     pub fn back_to_benchmark_list(&mut self) {
+        self.side_by_side_diff_open = false;
+        self.side_by_side_diff_scroll = 0;
         self.page = AppPage::BenchmarkList;
     }
 
@@ -719,6 +727,8 @@ impl AppState {
             self.reset_ir_navigation();
             self.selected_pass_by_stage.clear();
             self.detail_focus = DetailFocus::Selector;
+            self.side_by_side_diff_open = false;
+            self.side_by_side_diff_scroll = 0;
             self.status_message = String::from("Session cleared");
         } else {
             self.status_message = String::from("No session to clear");
@@ -1019,6 +1029,52 @@ impl AppState {
         self.detail_focus == DetailFocus::CodeView
     }
 
+    pub fn is_side_by_side_diff_open(&self) -> bool {
+        self.side_by_side_diff_open
+    }
+
+    pub fn toggle_side_by_side_diff(&mut self) {
+        if self.side_by_side_diff_open {
+            self.close_side_by_side_diff();
+            self.status_message = String::from("Side-by-side diff closed");
+            return;
+        }
+
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            self.status_message = String::from("Run analysis to open side-by-side diff");
+            return;
+        };
+        let Some(step) = self.selected_step_in_stage(session) else {
+            self.status_message = String::from("Select a pass to open side-by-side diff");
+            return;
+        };
+        if step.ir_lines.is_empty() {
+            self.status_message = String::from("No IR diff available for side-by-side view");
+            return;
+        }
+
+        self.side_by_side_diff_open = true;
+        self.side_by_side_diff_scroll = 0;
+        self.status_message = String::from("Side-by-side diff opened");
+    }
+
+    pub fn close_side_by_side_diff(&mut self) {
+        self.side_by_side_diff_open = false;
+        self.side_by_side_diff_scroll = 0;
+    }
+
+    pub fn side_by_side_diff_scroll_up(&mut self) {
+        self.side_by_side_diff_scroll = self.side_by_side_diff_scroll.saturating_sub(1);
+    }
+
+    pub fn side_by_side_diff_scroll_down(&mut self) {
+        let max_scroll = self.max_side_by_side_diff_scroll();
+        self.side_by_side_diff_scroll = self
+            .side_by_side_diff_scroll
+            .saturating_add(1)
+            .min(max_scroll);
+    }
+
     pub fn detail_move_left(&mut self) {
         self.detail_focus = DetailFocus::Selector;
     }
@@ -1088,6 +1144,10 @@ impl AppState {
     }
 
     pub fn detail_move_up(&mut self) {
+        if self.side_by_side_diff_open {
+            self.side_by_side_diff_scroll_up();
+            return;
+        }
         match self.detail_focus {
             DetailFocus::Selector => self.select_prev_pass(),
             DetailFocus::CodeView => {
@@ -1101,6 +1161,10 @@ impl AppState {
     }
 
     pub fn detail_move_down(&mut self) {
+        if self.side_by_side_diff_open {
+            self.side_by_side_diff_scroll_down();
+            return;
+        }
         match self.detail_focus {
             DetailFocus::Selector => self.select_next_pass(),
             DetailFocus::CodeView => {
@@ -1158,6 +1222,17 @@ impl AppState {
             return 0;
         };
         let max = source.lines().count().saturating_sub(1);
+        max.min(u16::MAX as usize) as u16
+    }
+
+    fn max_side_by_side_diff_scroll(&self) -> u16 {
+        let Some(session) = self.active_session_for_selected_benchmark() else {
+            return 0;
+        };
+        let Some(step) = self.selected_step_in_stage(session) else {
+            return 0;
+        };
+        let max = step.ir_lines.len().saturating_sub(1);
         max.min(u16::MAX as usize) as u16
     }
 
@@ -2310,5 +2385,80 @@ int s161(void) {
 
         app.rotate_code_view_mode_next();
         assert_eq!(app.code_view_mode, CodeViewMode::IrDiff);
+    }
+
+    #[test]
+    fn side_by_side_diff_requires_analysis_step() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        app.toggle_side_by_side_diff();
+
+        assert!(!app.is_side_by_side_diff_open());
+        assert!(app.status_message.contains("Run analysis"));
+    }
+
+    #[test]
+    fn side_by_side_diff_toggles_open_and_closed() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
+        step.ir_lines = vec![
+            IrLine {
+                tag: ChangeTag::Delete,
+                text: String::from("old"),
+                is_source_annotation: false,
+                details: Default::default(),
+            },
+            IrLine {
+                tag: ChangeTag::Insert,
+                text: String::from("new"),
+                is_source_annotation: false,
+                details: Default::default(),
+            },
+        ];
+        step.source_line_map = vec![None; step.ir_lines.len()];
+        attach_ready_session(&mut app, step, vec![]);
+
+        app.toggle_side_by_side_diff();
+        assert!(app.is_side_by_side_diff_open());
+        assert_eq!(app.side_by_side_diff_scroll, 0);
+
+        app.toggle_side_by_side_diff();
+        assert!(!app.is_side_by_side_diff_open());
+        assert_eq!(app.side_by_side_diff_scroll, 0);
+    }
+
+    #[test]
+    fn side_by_side_diff_scrolls_with_detail_navigation() {
+        let mut app =
+            AppState::new_with_run_mode(vec![benchmark("A")], FunctionRunMode::OutputFilter);
+        app.open_function_select_modal();
+        app.confirm_function_selection();
+
+        let mut step = make_step(AnalysisStage::Vectorize, "loopvectorize", 0);
+        step.ir_lines = (0..4)
+            .map(|idx| IrLine {
+                tag: ChangeTag::Equal,
+                text: format!("line {idx}"),
+                is_source_annotation: false,
+                details: Default::default(),
+            })
+            .collect();
+        step.source_line_map = vec![None; step.ir_lines.len()];
+        attach_ready_session(&mut app, step, vec![]);
+
+        app.toggle_side_by_side_diff();
+        app.detail_move_down();
+        app.detail_move_down();
+        app.detail_move_up();
+
+        assert!(app.is_side_by_side_diff_open());
+        assert_eq!(app.side_by_side_diff_scroll, 1);
     }
 }

@@ -27,6 +27,11 @@ const IR_DELETE_SELECTED_BG: Color = Color::Rgb(118, 42, 42);
 const SOURCE_ANNOTATION_FG: Color = Color::Rgb(200, 160, 80);
 const DETAIL_ATTR_BAR_HEIGHT: u16 = 7;
 
+struct SideBySideDiffRow<'a> {
+    left: Option<&'a crate::core::model::IrLine>,
+    right: Option<&'a crate::core::model::IrLine>,
+}
+
 pub fn render(frame: &mut Frame, app: &mut AppState) {
     match app.page {
         AppPage::BenchmarkList => render_benchmark_list_page(frame, app),
@@ -272,6 +277,9 @@ fn render_benchmark_detail_page(frame: &mut Frame, app: &mut AppState) {
     render_code_view_panel(frame, app, code_area);
     render_line_attributes_bar(frame, app, attr_area);
     render_detail_footer(frame, app, footer_area);
+    if app.is_side_by_side_diff_open() {
+        render_side_by_side_diff_modal(frame, app);
+    }
 }
 
 fn render_list_header(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
@@ -914,7 +922,7 @@ fn render_list_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::
 }
 
 fn render_detail_footer(frame: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
-    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} c C view \u{00b7} C clear \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy";
+    let hints = "\u{2190}\u{2192} section \u{00b7} \u{2191}\u{2193} pass/cursor \u{00b7} tab/s-tab IR mode \u{00b7} c C view \u{00b7} d side-by-side diff \u{00b7} C clear \u{00b7} a analyze \u{00b7} r run \u{00b7} y copy";
     let text = Text::from(vec![
         Line::from(hints),
         Line::from(format!("Status: {}", app.status_message)),
@@ -960,6 +968,57 @@ fn render_function_select_modal(frame: &mut Frame, app: &AppState) {
     let hint = Paragraph::new("\u{2191}\u{2193} move | enter open detail | esc cancel")
         .block(Block::bordered().title("Modal"));
     frame.render_widget(hint, hint_area);
+}
+
+fn render_side_by_side_diff_modal(frame: &mut Frame, app: &AppState) {
+    let Some(session) = app.active_session_for_selected_benchmark() else {
+        return;
+    };
+    let Some(step) = app.selected_step_in_stage(session) else {
+        return;
+    };
+
+    let rows = build_side_by_side_diff_rows(step);
+    let area = centered_rect(frame.area(), 94, 86);
+    frame.render_widget(Clear, area);
+
+    let vertical = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]);
+    let [content_area, footer_area] = vertical.areas(area);
+    let horizontal = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
+    let [left_area, right_area] = horizontal.areas(content_area);
+
+    let mut left_line_no = 0usize;
+    let mut right_line_no = 0usize;
+    let left_lines: Vec<Line> = rows
+        .iter()
+        .map(|row| render_side_by_side_cell(row.left, &mut left_line_no))
+        .collect();
+    let right_lines: Vec<Line> = rows
+        .iter()
+        .map(|row| render_side_by_side_cell(row.right, &mut right_line_no))
+        .collect();
+
+    let left = Paragraph::new(Text::from(left_lines))
+        .block(Block::bordered().title("Before"))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
+        .scroll((app.side_by_side_diff_scroll, 0));
+    frame.render_widget(left, left_area);
+
+    let right = Paragraph::new(Text::from(right_lines))
+        .block(Block::bordered().title("After"))
+        .style(Style::default().bg(CODE_BG).fg(CODE_TEXT_FG))
+        .scroll((app.side_by_side_diff_scroll, 0));
+    frame.render_widget(right, right_area);
+
+    let hint = Paragraph::new(Text::from(vec![
+        Line::from(format!(
+            "Side-by-Side Diff · {}",
+            pass_display_name(&step.pass_key)
+        )),
+        Line::from("\u{2191}\u{2193} scroll · d close · esc close"),
+    ]))
+    .block(Block::bordered().title("Modal"));
+    frame.render_widget(hint, footer_area);
 }
 
 fn centered_rect(
@@ -1032,6 +1091,82 @@ fn append_highlighted_spans(
             style_with_overlay(Style::default()),
         ));
     }
+}
+
+fn build_side_by_side_diff_rows(step: &AnalysisStep) -> Vec<SideBySideDiffRow<'_>> {
+    let mut rows = Vec::new();
+    let mut pending_left = Vec::new();
+    let mut pending_right = Vec::new();
+
+    for ir_line in &step.ir_lines {
+        match ir_line.tag {
+            ChangeTag::Equal => {
+                flush_side_by_side_block(&mut rows, &mut pending_left, &mut pending_right);
+                rows.push(SideBySideDiffRow {
+                    left: Some(ir_line),
+                    right: Some(ir_line),
+                });
+            }
+            ChangeTag::Delete => pending_left.push(ir_line),
+            ChangeTag::Insert => pending_right.push(ir_line),
+        }
+    }
+
+    flush_side_by_side_block(&mut rows, &mut pending_left, &mut pending_right);
+    rows
+}
+
+fn flush_side_by_side_block<'a>(
+    rows: &mut Vec<SideBySideDiffRow<'a>>,
+    pending_left: &mut Vec<&'a crate::core::model::IrLine>,
+    pending_right: &mut Vec<&'a crate::core::model::IrLine>,
+) {
+    let block_len = pending_left.len().max(pending_right.len());
+    for idx in 0..block_len {
+        rows.push(SideBySideDiffRow {
+            left: pending_left.get(idx).copied(),
+            right: pending_right.get(idx).copied(),
+        });
+    }
+    pending_left.clear();
+    pending_right.clear();
+}
+
+fn render_side_by_side_cell(
+    ir_line: Option<&crate::core::model::IrLine>,
+    line_no: &mut usize,
+) -> Line<'static> {
+    let empty_style = Style::default().bg(CODE_BG).fg(CODE_TEXT_FG);
+    let Some(ir_line) = ir_line else {
+        return Line::from(Span::styled("      |".to_string(), empty_style));
+    };
+
+    let (prefix, style) = if ir_line.is_source_annotation {
+        let bg = match ir_line.tag {
+            ChangeTag::Insert => IR_INSERT_BG,
+            ChangeTag::Delete => IR_DELETE_BG,
+            ChangeTag::Equal => CODE_BG,
+        };
+        (
+            String::from(" src  | "),
+            Style::default()
+                .fg(SOURCE_ANNOTATION_FG)
+                .bg(bg)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else {
+        *line_no += 1;
+        (
+            format!("{:>5} | ", *line_no),
+            match ir_line.tag {
+                ChangeTag::Insert => Style::default().fg(Color::White).bg(IR_INSERT_BG),
+                ChangeTag::Delete => Style::default().fg(Color::White).bg(IR_DELETE_BG),
+                ChangeTag::Equal => empty_style,
+            },
+        )
+    };
+
+    Line::from(Span::styled(format!("{prefix}{}", ir_line.text), style))
 }
 
 // --- Helper functions ---
@@ -1139,5 +1274,80 @@ fn color_diff_line(line: &str) -> Line<'_> {
         ))
     } else {
         Line::from(line.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::{AnalysisSource, AnalysisStage, IrLine, IrLineDetails};
+
+    fn step_with_lines(lines: Vec<IrLine>) -> AnalysisStep {
+        AnalysisStep {
+            visible_index: 0,
+            raw_index: 1,
+            pass: String::from("LoopVectorizePass"),
+            pass_key: String::from("loopvectorize"),
+            pass_occurrence: 1,
+            stage: AnalysisStage::Vectorize,
+            target_raw: String::from("s161"),
+            target_function: Some(String::from("s161")),
+            changed_lines: 2,
+            diff_text: String::new(),
+            ir_lines: lines,
+            source_line_map: vec![],
+            remark_indices: vec![],
+            source: AnalysisSource::TraceFast,
+        }
+    }
+
+    fn ir_line(tag: ChangeTag, text: &str) -> IrLine {
+        IrLine {
+            tag,
+            text: text.to_string(),
+            is_source_annotation: false,
+            details: IrLineDetails::default(),
+        }
+    }
+
+    #[test]
+    fn side_by_side_rows_pair_deleted_and_inserted_blocks() {
+        let step = step_with_lines(vec![
+            ir_line(ChangeTag::Equal, "header"),
+            ir_line(ChangeTag::Delete, "old1"),
+            ir_line(ChangeTag::Delete, "old2"),
+            ir_line(ChangeTag::Insert, "new1"),
+            ir_line(ChangeTag::Equal, "tail"),
+        ]);
+
+        let rows = build_side_by_side_diff_rows(&step);
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].left.map(|line| line.text.as_str()), Some("header"));
+        assert_eq!(rows[0].right.map(|line| line.text.as_str()), Some("header"));
+        assert_eq!(rows[1].left.map(|line| line.text.as_str()), Some("old1"));
+        assert_eq!(rows[1].right.map(|line| line.text.as_str()), Some("new1"));
+        assert_eq!(rows[2].left.map(|line| line.text.as_str()), Some("old2"));
+        assert_eq!(rows[2].right.map(|line| line.text.as_str()), None);
+        assert_eq!(rows[3].left.map(|line| line.text.as_str()), Some("tail"));
+        assert_eq!(rows[3].right.map(|line| line.text.as_str()), Some("tail"));
+    }
+
+    #[test]
+    fn side_by_side_rows_keep_equal_annotations_in_both_columns() {
+        let mut annotation = ir_line(ChangeTag::Equal, ";; for.body");
+        annotation.is_source_annotation = true;
+        let step = step_with_lines(vec![annotation]);
+
+        let rows = build_side_by_side_diff_rows(&step);
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].left.expect("left annotation").is_source_annotation);
+        assert!(
+            rows[0]
+                .right
+                .expect("right annotation")
+                .is_source_annotation
+        );
     }
 }

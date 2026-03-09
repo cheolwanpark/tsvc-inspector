@@ -112,6 +112,19 @@ fn run_app(
                     UserAction::BackToBenchmarkList => app.close_function_select_modal(),
                     _ => {}
                 },
+                action
+                    if app.page == AppPage::BenchmarkDetail && app.is_side_by_side_diff_open() =>
+                {
+                    match action {
+                        UserAction::MoveUp => app.side_by_side_diff_scroll_up(),
+                        UserAction::MoveDown => app.side_by_side_diff_scroll_down(),
+                        UserAction::BackToBenchmarkList | UserAction::ToggleSideBySideDiff => {
+                            app.close_side_by_side_diff();
+                            app.set_status_message("Side-by-side diff closed");
+                        }
+                        _ => {}
+                    }
+                }
                 action if app.page == AppPage::BenchmarkList && app.is_config_modal_open() => {
                     match action {
                         UserAction::MoveUp => app.config_move_up(),
@@ -167,6 +180,7 @@ fn run_app(
                             maybe_spawn_job(app, config, job_tx, JobKind::AnalyzeFast);
                         }
                         UserAction::CopyDetailToClipboard => copy_detail_snapshot(app),
+                        UserAction::ToggleSideBySideDiff => app.toggle_side_by_side_diff(),
                         _ => {}
                     },
                 },

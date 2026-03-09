@@ -17,6 +17,7 @@ pub enum UserAction {
     Analyze,                // 'a' → AnalyzeFast
     ClearSession,           // 'C'
     CopyDetailToClipboard,  // 'y'
+    ToggleSideBySideDiff,   // 'd'
     Backspace,              // Backspace
     TextChar(char),         // Generic text input for config modal
 }
@@ -29,6 +30,7 @@ pub fn map_key_event(key: KeyEvent) -> UserAction {
         KeyCode::Char('c') => UserAction::ShowCSource,
         KeyCode::Char('C') => UserAction::ClearSession,
         KeyCode::Char('y') => UserAction::CopyDetailToClipboard,
+        KeyCode::Char('d') => UserAction::ToggleSideBySideDiff,
         KeyCode::Char(ch) => UserAction::TextChar(ch),
         KeyCode::Up => UserAction::MoveUp,
         KeyCode::Down => UserAction::MoveDown,
@@ -88,6 +90,10 @@ mod tests {
         assert_eq!(
             map_key_event(key(KeyCode::Char('y'))),
             UserAction::CopyDetailToClipboard
+        );
+        assert_eq!(
+            map_key_event(key(KeyCode::Char('d'))),
+            UserAction::ToggleSideBySideDiff
         );
         assert_eq!(
             map_key_event(key(KeyCode::Char('o'))),
